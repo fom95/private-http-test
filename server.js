@@ -32,7 +32,9 @@ async function startTelegram() {
 
     connected = true;
 
-    console.log("Connected to Telegram.");
+    console.log(
+        "Connected to Telegram."
+    );
 }
 
 app.use(express.static("."));
@@ -120,7 +122,8 @@ app.get("/api/messages", async (req, res) => {
                 mediaType = "audio";
             }
             else if (message.media) {
-                mediaType = message.media.className ||
+                mediaType =
+                    message.media.className ||
                     message.media.constructor?.name ||
                     "media";
             }
@@ -161,6 +164,136 @@ app.get("/api/messages", async (req, res) => {
                 error?.message ||
                 String(error)
         });
+    }
+});
+
+app.get("/media/:chat/:message", async (req, res) => {
+    try {
+        const chatIndex =
+            Number(req.params.chat);
+
+        const messageId =
+            Number(req.params.message);
+
+        if (
+            !Number.isInteger(chatIndex) ||
+            chatIndex < 0 ||
+            !Number.isInteger(messageId) ||
+            messageId <= 0
+        ) {
+            return res.status(400).send(
+                "Invalid chat or message."
+            );
+        }
+
+        const dialogs =
+            await client.getDialogs({});
+
+        const dialog =
+            dialogs[chatIndex];
+
+        if (!dialog) {
+            return res.status(404).send(
+                "Chat not found."
+            );
+        }
+
+        const messages =
+            await client.getMessages(
+                dialog,
+                {
+                    ids: messageId
+                }
+            );
+
+        const message =
+            messages[0];
+
+        if (!message) {
+            return res.status(404).send(
+                "Message not found."
+            );
+        }
+
+        if (!message.media) {
+            return res.status(400).send(
+                "Message does not contain media."
+            );
+        }
+
+        if (!message.document) {
+            return res.status(400).send(
+                "This first test only supports Telegram documents."
+            );
+        }
+
+        const document =
+            message.document;
+
+        const mimeType =
+            document.mimeType ||
+            "application/octet-stream";
+
+        res.status(200);
+
+        res.setHeader(
+            "Content-Type",
+            mimeType
+        );
+
+        if (document.size !== undefined) {
+            res.setHeader(
+                "Content-Length",
+                String(document.size)
+            );
+        }
+
+        res.setHeader(
+            "Accept-Ranges",
+            "bytes"
+        );
+
+        console.log(
+            `Streaming message ${messageId}: ` +
+            `${document.size} bytes`
+        );
+
+        for await (
+            const chunk of client.iterDownload({
+                file: message.media,
+                chunkSize: 512 * 1024
+            })
+        ) {
+            if (!res.write(
+                Buffer.from(chunk)
+            )) {
+                await new Promise(
+                    resolve =>
+                        res.once(
+                            "drain",
+                            resolve
+                        )
+                );
+            }
+        }
+
+        res.end();
+    }
+    catch (error) {
+        console.error(
+            "Media request failed:",
+            error
+        );
+
+        if (!res.headersSent) {
+            res.status(500).send(
+                error?.message ||
+                String(error)
+            );
+        }
+        else {
+            res.destroy(error);
+        }
     }
 });
 

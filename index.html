@@ -2,22 +2,341 @@
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Telegram HTTP Test</title>
-</head>
-<body>
-    <h1>Telegram HTTP Test</h1>
-    <p id="status">Testing...</p>
 
-    <script>
-        fetch("https://YOUR-RENDER-URL/")
-            .then(response => response.text())
-            .then(text => {
-                document.getElementById("status").textContent = text;
-            })
-            .catch(error => {
-                document.getElementById("status").textContent =
-                    "Error: " + error;
-            });
-    </script>
+    <title>Telegram HTTP Test</title>
+
+    <style>
+        body {
+            font-family: sans-serif;
+            margin: 30px;
+            max-width: 900px;
+        }
+
+        select {
+            width: 100%;
+            padding: 8px;
+            margin: 6px 0 20px;
+        }
+
+        #status {
+            margin-bottom: 20px;
+        }
+
+        #messageInfo {
+            white-space: pre-wrap;
+            background: #eee;
+            padding: 15px;
+            min-height: 100px;
+        }
+
+        option {
+            font-family: monospace;
+        }
+    </style>
+</head>
+
+<body>
+
+<h1>Telegram HTTP Test</h1>
+
+<div id="status">
+    Loading chats...
+</div>
+
+<label for="chatSelect">
+    Chat:
+</label>
+
+<select id="chatSelect">
+    <option value="">
+        Loading...
+    </option>
+</select>
+
+<label for="messageSelect">
+    Message:
+</label>
+
+<select id="messageSelect" disabled>
+    <option value="">
+        Select a chat first
+    </option>
+</select>
+
+<h2>Selected message</h2>
+
+<div id="messageInfo">
+    No message selected.
+</div>
+
+<script>
+
+const chatSelect =
+    document.getElementById(
+        "chatSelect"
+    );
+
+const messageSelect =
+    document.getElementById(
+        "messageSelect"
+    );
+
+const status =
+    document.getElementById(
+        "status"
+    );
+
+const messageInfo =
+    document.getElementById(
+        "messageInfo"
+    );
+
+let chats = [];
+let messages = [];
+
+async function loadChats() {
+
+    status.textContent =
+        "Loading Telegram chats...";
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/chats"
+            );
+
+        if (!response.ok) {
+            throw new Error(
+                `HTTP ${response.status}`
+            );
+        }
+
+        chats =
+            await response.json();
+
+        chatSelect.innerHTML = "";
+
+        for (
+            const chat of chats
+        ) {
+
+            const option =
+                document.createElement(
+                    "option"
+                );
+
+            option.value =
+                chat.index;
+
+            option.textContent =
+                `${chat.title} [${chat.id}]`;
+
+            chatSelect.appendChild(
+                option
+            );
+        }
+
+        status.textContent =
+            `Loaded ${chats.length} chats.`;
+
+        if (chats.length) {
+            await loadMessages(
+                chats[0].index
+            );
+        }
+
+    }
+    catch (error) {
+
+        console.error(error);
+
+        status.textContent =
+            "Failed to load chats: " +
+            error.message;
+    }
+}
+
+async function loadMessages(
+    chatIndex
+) {
+
+    messageSelect.disabled =
+        true;
+
+    messageSelect.innerHTML =
+        "<option>Loading...</option>";
+
+    messageInfo.textContent =
+        "Loading messages...";
+
+    try {
+
+        const response =
+            await fetch(
+                `/api/messages?chat=${encodeURIComponent(chatIndex)}`
+            );
+
+        if (!response.ok) {
+            throw new Error(
+                `HTTP ${response.status}`
+            );
+        }
+
+        const result =
+            await response.json();
+
+        messages =
+            result.messages;
+
+        messageSelect.innerHTML = "";
+
+        for (
+            const message of messages
+        ) {
+
+            const option =
+                document.createElement(
+                    "option"
+                );
+
+            option.value =
+                message.id;
+
+            const date =
+                message.date
+                    ? new Date(
+                        message.date
+                    ).toLocaleString()
+                    : "Unknown date";
+
+            let description =
+                message.text
+                    .replace(/\s+/g, " ")
+                    .trim();
+
+            if (!description) {
+                description =
+                    "[no text]";
+            }
+
+            if (
+                description.length > 80
+            ) {
+                description =
+                    description.slice(
+                        0,
+                        80
+                    ) + "...";
+            }
+
+            if (
+                message.mediaType
+            ) {
+                description =
+                    `[${message.mediaType}] ` +
+                    description;
+            }
+
+            option.textContent =
+                `${message.id} | ${date} | ${description}`;
+
+            messageSelect.appendChild(
+                option
+            );
+        }
+
+        messageSelect.disabled =
+            messages.length === 0;
+
+        if (messages.length) {
+            showMessage(
+                messages[0].id
+            );
+        }
+        else {
+            messageInfo.textContent =
+                "No messages found.";
+        }
+
+        status.textContent =
+            `Loaded ${messages.length} recent messages.`;
+
+    }
+    catch (error) {
+
+        console.error(error);
+
+        messageSelect.innerHTML =
+            "<option>Failed to load</option>";
+
+        messageInfo.textContent =
+            error.message;
+
+    }
+
+}
+
+function showMessage(
+    messageId
+) {
+
+    const message =
+        messages.find(
+            item =>
+                String(item.id) ===
+                String(messageId)
+        );
+
+    if (!message) {
+        return;
+    }
+
+    const chat =
+        chats.find(
+            item =>
+                String(item.index) ===
+                String(chatSelect.value)
+        );
+
+    messageInfo.textContent =
+        [
+            `Chat: ${chat?.title || ""}`,
+            `Chat ID: ${chat?.id || ""}`,
+            `Message ID: ${message.id}`,
+            `Date: ${message.date || ""}`,
+            `Media: ${message.mediaType || "none"}`,
+            `Has media: ${message.hasMedia}`,
+            "",
+            message.text || "[no text]"
+        ].join("\n");
+}
+
+chatSelect.addEventListener(
+    "change",
+    () => {
+        loadMessages(
+            Number(
+                chatSelect.value
+            )
+        );
+    }
+);
+
+messageSelect.addEventListener(
+    "change",
+    () => {
+        showMessage(
+            Number(
+                messageSelect.value
+            )
+        );
+    }
+);
+
+loadChats();
+
+</script>
+
 </body>
 </html>

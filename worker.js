@@ -116,12 +116,18 @@ const PAGE = `<!DOCTYPE html>
         display: none;
     }
 
-    #chatInfo {
+    #chatInfo,
+    #messageInfo {
         margin-top: 20px;
         padding: 15px;
         background: #1c1c1c;
         border-radius: 5px;
         display: none;
+    }
+
+    pre {
+        white-space: pre-wrap;
+        word-break: break-word;
     }
 </style>
 </head>
@@ -150,6 +156,8 @@ const PAGE = `<!DOCTYPE html>
     </option>
 </select>
 
+<div id="messageInfo"></div>
+
 <div id="status"></div>
 
 <div id="error"></div>
@@ -164,11 +172,16 @@ const messageSelect =
 const chatInfo =
     document.getElementById("chatInfo");
 
+const messageInfo =
+    document.getElementById("messageInfo");
+
 const status =
     document.getElementById("status");
 
 const errorBox =
     document.getElementById("error");
+
+let currentMessages = [];
 
 async function loadChats() {
 
@@ -240,9 +253,123 @@ async function loadChats() {
     }
 }
 
+async function loadMessages(chatId) {
+
+    try {
+
+        status.textContent =
+            "Loading messages...";
+
+        errorBox.style.display =
+            "none";
+
+        messageSelect.disabled =
+            true;
+
+        messageSelect.innerHTML =
+            '<option value="">Loading messages...</option>';
+
+        messageInfo.style.display =
+            "none";
+
+        const response =
+            await fetch(
+                "/api/messages?chatId=" +
+                encodeURIComponent(chatId)
+            );
+
+        if (!response.ok) {
+
+            const text =
+                await response.text();
+
+            throw new Error(
+                "HTTP " +
+                response.status +
+                "\\n\\n" +
+                text
+            );
+        }
+
+        currentMessages =
+            await response.json();
+
+        messageSelect.innerHTML =
+            '<option value="">Select a message...</option>';
+
+        for (const message of currentMessages) {
+
+            const option =
+                document.createElement("option");
+
+            option.value =
+                message.id;
+
+            let label =
+                "#" +
+                message.id;
+
+            if (message.media) {
+                label +=
+                    " [" +
+                    message.media.type +
+                    "]";
+            }
+
+            if (message.text) {
+
+                const text =
+                    message.text
+                        .replace(/\\s+/g, " ")
+                        .trim();
+
+                if (text) {
+
+                    label +=
+                        " " +
+                        text.slice(0, 100);
+                }
+            }
+
+            option.textContent =
+                label;
+
+            messageSelect.appendChild(
+                option
+            );
+        }
+
+        messageSelect.disabled =
+            false;
+
+        status.textContent =
+            currentMessages.length +
+            " messages loaded.";
+
+    } catch (error) {
+
+        messageSelect.disabled =
+            true;
+
+        messageSelect.innerHTML =
+            '<option value="">Failed to load messages</option>';
+
+        status.textContent =
+            "Failed to load messages.";
+
+        errorBox.textContent =
+            error.stack ||
+            error.message ||
+            String(error);
+
+        errorBox.style.display =
+            "block";
+    }
+}
+
 chatSelect.addEventListener(
     "change",
-    () => {
+    async () => {
 
         const selected =
             chatSelect.options[
@@ -260,6 +387,9 @@ chatSelect.addEventListener(
             messageSelect.innerHTML =
                 '<option value="">Messages will appear here</option>';
 
+            messageInfo.style.display =
+                "none";
+
             return;
         }
 
@@ -272,16 +402,62 @@ chatSelect.addEventListener(
             "<br><strong>Name:</strong> " +
             selected.textContent;
 
-        messageSelect.disabled =
-            true;
-
-        messageSelect.innerHTML =
-            '<option value="">Messages will appear here</option>';
-
-        status.textContent =
-            "Chat selected. Message loading will be added next.";
+        await loadMessages(
+            chatSelect.value
+        );
     }
 );
+
+messageSelect.addEventListener(
+    "change",
+    () => {
+
+        if (!messageSelect.value) {
+
+            messageInfo.style.display =
+                "none";
+
+            return;
+        }
+
+        const message =
+            currentMessages.find(
+                item =>
+                    String(item.id) ===
+                    String(messageSelect.value)
+            );
+
+        if (!message) {
+            return;
+        }
+
+        messageInfo.style.display =
+            "block";
+
+        messageInfo.innerHTML =
+            "<strong>Message ID:</strong> " +
+            message.id +
+            "<br><strong>Date:</strong> " +
+            (message.date || "Unknown") +
+            "<br><strong>Media:</strong> " +
+            (message.media
+                ? message.media.type
+                : "None") +
+            "<br><br><strong>Text:</strong>" +
+            "<pre>" +
+            escapeHtml(message.text || "") +
+            "</pre>";
+    }
+);
+
+function escapeHtml(value) {
+    return value
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
 
 loadChats();
 </script>
@@ -340,6 +516,87 @@ export default {
                     }));
 
                 return json(chats);
+            }
+
+            if (url.pathname === "/api/messages") {
+
+                const chatId =
+                    url.searchParams.get(
+                        "chatId"
+                    );
+
+                if (!chatId) {
+
+                    return json(
+                        {
+                            error:
+                                "Missing chatId"
+                        },
+                        400
+                    );
+                }
+
+                const client =
+                    await getTelegramClient(env);
+
+                const dialogs =
+                    await client.getDialogs({});
+
+                const dialog =
+                    dialogs.find(
+                        item =>
+                            String(item.id) ===
+                            String(chatId)
+                    );
+
+                if (!dialog) {
+
+                    return json(
+                        {
+                            error:
+                                "Chat not found"
+                        },
+                        404
+                    );
+                }
+
+                const messages = [];
+
+                for await (
+                    const message of
+                    client.iterMessages(
+                        dialog
+                    )
+                ) {
+
+                    messages.push({
+                        id:
+                            message.id,
+
+                        date:
+                            message.date
+                                ? message.date.toISOString()
+                                : null,
+
+                        text:
+                            message.message ||
+                            "",
+
+                        media:
+                            message.media
+                                ? {
+                                    type:
+                                        message.media.className ||
+                                        message.media.constructor?.name ||
+                                        null
+                                }
+                                : null
+                    });
+                }
+
+                return json(
+                    messages
+                );
             }
 
             return new Response(

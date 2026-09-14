@@ -450,18 +450,59 @@ app.get(
                     );
             
                     const chunks = [];
-            
-                    for await (
-                        const chunk of client.iterDownload({
-                            file: location,
-                            offset: bigInt(0),
-                            limit: 512 * 1024,
-                            chunkSize: 512 * 1024
-                        })
-                    ) {
+
+                    let offset = 0n;
+                    
+                    while (true) {
+                    
+                        const result =
+                            await client.invoke({
+                                _: "upload.getFile",
+                    
+                                precise: true,
+                    
+                                location,
+                    
+                                offset,
+                    
+                                limit: 512 * 1024,
+                    
+                                cdn_supported: true
+                            });
+                    
+                        if (
+                            result?._ !==
+                            "upload.file"
+                        ) {
+                            throw new Error(
+                                "Telegram returned an unexpected thumbnail response."
+                            );
+                        }
+                    
+                        const bytes =
+                            Buffer.from(
+                                result.bytes
+                            );
+                    
+                        if (!bytes.length) {
+                            break;
+                        }
+                    
                         chunks.push(
-                            Buffer.from(chunk)
+                            bytes
                         );
+                    
+                        offset +=
+                            BigInt(
+                                bytes.length
+                            );
+                    
+                        if (
+                            bytes.length <
+                            512 * 1024
+                        ) {
+                            break;
+                        }
                     }
             
                     const total =

@@ -428,98 +428,49 @@ app.get(
                         );
                     }
             
-                    const location = {
-                        _: "inputDocumentFileLocation",
-            
-                        id:
-                            document.id,
-            
-                        access_hash:
-                            document.accessHash,
-            
-                        file_reference:
-                            document.fileReference,
-            
-                        thumb_size:
-                            thumbnail.type || ""
-                    };
-            
+                    const location =
+                        new Api.InputDocumentFileLocation({
+                            id:
+                                document.id,
+                    
+                            accessHash:
+                                document.accessHash,
+                    
+                            fileReference:
+                                document.fileReference,
+                    
+                            thumbSize:
+                                thumbnail.type || ""
+                        });
+                    
                     console.log(
                         `Streaming thumbnail ${messageId}: ` +
                         `${thumbnail.w || 0}x${thumbnail.h || 0}`
                     );
-            
+                    
                     const chunks = [];
-
-                    let offset = 0n;
                     
-                    while (true) {
+                    for await (
+                        const chunk of client.iterDownload({
+                            file:
+                                location,
                     
-                        const result =
-                            await client.invoke(
-                                new Api.upload.GetFile({
-                                    precise: true,
+                            offset:
+                                bigInt(0),
                     
-                                    location:
-                                        new Api.InputDocumentFileLocation({
-                                            id:
-                                                document.id,
+                            limit:
+                                thumbnail.size ||
+                                512 * 1024,
                     
-                                            accessHash:
-                                                document.accessHash,
-                    
-                                            fileReference:
-                                                document.fileReference,
-                    
-                                            thumbSize:
-                                                thumbnail.type || ""
-                                        }),
-                    
-                                    offset,
-                    
-                                    limit:
-                                        512 * 1024,
-                    
-                                    cdnSupported:
-                                        true
-                                })
-                            );
-                    
-                        if (
-                            result?.className !==
-                            "upload.file"
-                        ) {
-                            throw new Error(
-                                "Telegram returned an unexpected thumbnail response."
-                            );
-                        }
-                    
-                        const bytes =
-                            Buffer.from(
-                                result.bytes
-                            );
-                    
-                        if (!bytes.length) {
-                            break;
-                        }
-                    
+                            chunkSize:
+                                512 * 1024
+                        })
+                    ) {
                         chunks.push(
-                            bytes
+                            Buffer.from(chunk)
                         );
-                    
-                        offset +=
-                            BigInt(
-                                bytes.length
-                            );
-                    
-                        if (
-                            bytes.length <
-                            512 * 1024
-                        ) {
-                            break;
-                        }
                     }
-            
+                    
                     const total =
                         chunks.reduce(
                             (sum, chunk) =>

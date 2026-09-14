@@ -370,44 +370,32 @@ app.get(
             if (
                 req.query.thumb === "1"
             ) {
-
-                console.log(
-                    "Telegram document thumbnail data:",
-                    {
-                        documentKeys:
-                            Object.keys(document || {}),
-                        thumbs:
-                            document.thumbs,
-                        rawDocument:
-                            document
-                    }
-                );
-                
+            
                 const thumbs =
                     Array.isArray(
                         document.thumbs
                     )
                         ? document.thumbs
                         : [];
-
+            
                 const usableThumbs =
                     thumbs.filter(
                         thumb =>
                             thumb &&
                             (
-                                thumb._ ===
-                                    "photoSize" ||
-                                thumb._ ===
-                                    "photoCachedSize"
+                                thumb.className ===
+                                    "PhotoSize" ||
+                                thumb.className ===
+                                    "PhotoCachedSize"
                             )
                     );
-
+            
                 if (!usableThumbs.length) {
                     return res.status(404).send(
                         "Telegram document has no usable thumbnail."
                     );
                 }
-
+            
                 const thumbnail =
                     usableThumbs
                         .slice()
@@ -422,147 +410,103 @@ app.get(
                                     (b.h || 0)
                                 )
                         )[0];
-
+            
                 /*
-                 * Cached thumbnails already contain
-                 * their complete bytes.
+                 * PhotoSize thumbnails must be downloaded through
+                 * inputDocumentFileLocation.
                  */
                 if (
-                    thumbnail._ ===
-                        "photoCachedSize"
+                    thumbnail.className ===
+                        "PhotoSize"
                 ) {
-
+            
                     if (
-                        !thumbnail.bytes ||
-                        !thumbnail.bytes.byteLength
+                        !document.fileReference
                     ) {
-                        return res.status(404).send(
-                            "Telegram cached thumbnail contains no data."
+                        return res.status(500).send(
+                            "Telegram document has no file reference."
                         );
                     }
-
-                    const buffer =
-                        Buffer.from(
-                            thumbnail.bytes
+            
+                    const location = {
+                        _: "inputDocumentFileLocation",
+            
+                        id:
+                            document.id,
+            
+                        access_hash:
+                            document.accessHash,
+            
+                        file_reference:
+                            document.fileReference,
+            
+                        thumb_size:
+                            thumbnail.type || ""
+                    };
+            
+                    console.log(
+                        `Streaming thumbnail ${messageId}: ` +
+                        `${thumbnail.w || 0}x${thumbnail.h || 0}`
+                    );
+            
+                    const chunks = [];
+            
+                    for await (
+                        const chunk of client.iterDownload({
+                            file: location,
+                            offset: bigInt(0),
+                            limit: 512 * 1024,
+                            chunkSize: 512 * 1024
+                        })
+                    ) {
+                        chunks.push(
+                            Buffer.from(chunk)
                         );
-
+                    }
+            
+                    const total =
+                        chunks.reduce(
+                            (sum, chunk) =>
+                                sum + chunk.length,
+                            0
+                        );
+            
+                    if (!total) {
+                        return res.status(404).send(
+                            "Telegram returned an empty thumbnail."
+                        );
+                    }
+            
+                    const buffer =
+                        Buffer.concat(
+                            chunks,
+                            total
+                        );
+            
                     res.status(200);
-
+            
                     res.setHeader(
                         "Content-Type",
                         "image/jpeg"
                     );
-
+            
                     res.setHeader(
                         "Content-Length",
                         String(buffer.length)
                     );
-
+            
                     res.setHeader(
                         "Cache-Control",
                         "public, max-age=31536000, immutable"
                     );
-
-                    res.setHeader(
-                        "Accept-Ranges",
-                        "bytes"
-                    );
-
+            
                     return res.end(
                         buffer
                     );
                 }
-
-                if (
-                    !document.fileReference
-                ) {
-                    return res.status(500).send(
-                        "Telegram document has no file reference."
-                    );
-                }
-
-                const location = {
-                    _:
-                        "inputDocumentFileLocation",
-
-                    id:
-                        document.id,
-
-                    access_hash:
-                        document.accessHash ??
-                        document.access_hash,
-
-                    file_reference:
-                        document.fileReference ??
-                        document.file_reference,
-
-                    thumb_size:
-                        thumbnail.type || ""
-                };
-
-                console.log(
-                    `Streaming thumbnail ${messageId}: ` +
-                    `${thumbnail.w || 0}x${thumbnail.h || 0}`
-                );
-
-                const chunks = [];
-
-                for await (
-                    const chunk of client.iterDownload({
-                        file: location,
-                        offset: bigInt(0),
-                        limit: 512 * 1024,
-                        chunkSize: 512 * 1024
-                    })
-                ) {
-                    chunks.push(
-                        Buffer.from(chunk)
-                    );
-                }
-
-                const total =
-                    chunks.reduce(
-                        (sum, chunk) =>
-                            sum + chunk.length,
-                        0
-                    );
-
-                if (!total) {
-                    return res.status(404).send(
-                        "Telegram returned an empty thumbnail."
-                    );
-                }
-
-                const buffer =
-                    Buffer.concat(
-                        chunks,
-                        total
-                    );
-
-                res.status(200);
-
-                res.setHeader(
-                    "Content-Type",
-                    "image/jpeg"
-                );
-
-                res.setHeader(
-                    "Content-Length",
-                    String(buffer.length)
-                );
-
-                res.setHeader(
-                    "Cache-Control",
-                    "public, max-age=31536000, immutable"
-                );
-
-                res.setHeader(
-                    "Accept-Ranges",
-                    "bytes"
-                );
-
-                return res.end(
-                    buffer
+            
+                return res.status(404).send(
+                    "Unsupported Telegram thumbnail type."
                 );
             }
 

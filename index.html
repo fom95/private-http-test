@@ -145,7 +145,7 @@ async function loadChats() {
                 );
 
             option.value =
-                chat.index;
+                chat.id;
 
             option.textContent =
                 `${chat.title} [${chat.id}]`;
@@ -160,7 +160,7 @@ async function loadChats() {
 
         if (chats.length) {
             await loadMessages(
-                chats[0].index
+                chats[0].id
             );
         }
 
@@ -176,7 +176,7 @@ async function loadChats() {
 }
 
 async function loadMessages(
-    chatIndex
+    chatId
 ) {
 
     messageSelect.disabled =
@@ -192,7 +192,7 @@ async function loadMessages(
 
         const response =
             await fetch(
-                `/api/messages?chat=${encodeURIComponent(chatIndex)}`
+                `/api/messages?chatId=${encodeURIComponent(chatId)}`
             );
 
         if (!response.ok) {
@@ -312,7 +312,7 @@ function showMessage(
     const chat =
         chats.find(
             item =>
-                String(item.index) ===
+                String(item.id) ===
                 String(chatSelect.value)
         );
 
@@ -350,9 +350,11 @@ function showMessage(
     }
     else {
         openMedia.disabled = true;
+
         mediaLink.removeAttribute(
             "href"
         );
+
         mediaLink.textContent = "";
     }
 }
@@ -361,9 +363,7 @@ chatSelect.addEventListener(
     "change",
     () => {
         loadMessages(
-            Number(
-                chatSelect.value
-            )
+            chatSelect.value
         );
     }
 );
@@ -372,9 +372,7 @@ messageSelect.addEventListener(
     "change",
     () => {
         showMessage(
-            Number(
-                messageSelect.value
-            )
+            messageSelect.value
         );
     }
 );

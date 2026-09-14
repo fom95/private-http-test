@@ -69,6 +69,14 @@
     No message selected.
 </div>
 
+<button id="openMedia" disabled>
+    Open selected media
+</button>
+
+<p>
+    <a id="mediaLink" target="_blank"></a>
+</p>
+
 <script>
 
 const chatSelect =
@@ -89,6 +97,16 @@ const status =
 const messageInfo =
     document.getElementById(
         "messageInfo"
+    );
+
+const openMedia =
+    document.getElementById(
+        "openMedia"
+    );
+
+const mediaLink =
+    document.getElementById(
+        "mediaLink"
     );
 
 let chats = [];
@@ -280,7 +298,6 @@ async function loadMessages(
 function showMessage(
     messageId
 ) {
-
     const message =
         messages.find(
             item =>
@@ -310,6 +327,34 @@ function showMessage(
             "",
             message.text || "[no text]"
         ].join("\n");
+
+    const url =
+        `/media/${encodeURIComponent(
+            chatSelect.value
+        )}/${encodeURIComponent(
+            message.id
+        )}`;
+
+    if (message.hasMedia) {
+        openMedia.disabled = false;
+
+        mediaLink.href = url;
+        mediaLink.textContent = url;
+
+        openMedia.onclick = () => {
+            window.open(
+                url,
+                "_blank"
+            );
+        };
+    }
+    else {
+        openMedia.disabled = true;
+        mediaLink.removeAttribute(
+            "href"
+        );
+        mediaLink.textContent = "";
+    }
 }
 
 chatSelect.addEventListener(

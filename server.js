@@ -26,12 +26,10 @@ const client = new TelegramClient(
     }
 );
 
-let connected = false;
+const chatMap = new Map();
 
 async function startTelegram() {
     await client.connect();
-
-    connected = true;
 
     console.log(
         "Connected to Telegram."
@@ -45,15 +43,28 @@ app.get("/api/chats", async (req, res) => {
         const dialogs =
             await client.getDialogs({});
 
+        chatMap.clear();
+
         const chats = dialogs.map(
-            (dialog, index) => ({
-                index,
-                id: String(dialog.id),
-                title:
-                    dialog.title ||
-                    dialog.name ||
-                    "Untitled chat"
-            })
+            (dialog, index) => {
+
+                const id =
+                    String(dialog.id);
+
+                chatMap.set(
+                    id,
+                    dialog
+                );
+
+                return {
+                    index,
+                    id,
+                    title:
+                        dialog.title ||
+                        dialog.name ||
+                        "Untitled chat"
+                };
+            }
         );
 
         res.json(chats);
@@ -74,27 +85,22 @@ app.get("/api/chats", async (req, res) => {
 
 app.get("/api/messages", async (req, res) => {
     try {
-        const chatIndex =
-            Number(req.query.chat);
+        const chatId =
+            String(req.query.chatId);
 
-        if (
-            !Number.isInteger(chatIndex) ||
-            chatIndex < 0
-        ) {
+        if (!chatId) {
             return res.status(400).json({
                 error: "Invalid chat."
             });
         }
 
-        const dialogs =
-            await client.getDialogs({});
-
         const dialog =
-            dialogs[chatIndex];
+            chatMap.get(chatId);
 
         if (!dialog) {
             return res.status(404).json({
-                error: "Chat not found."
+                error:
+                    "Chat not found. Reload the chat list first."
             });
         }
 
@@ -144,7 +150,6 @@ app.get("/api/messages", async (req, res) => {
 
         res.json({
             chat: {
-                index: chatIndex,
                 id: String(dialog.id),
                 title:
                     dialog.title ||
@@ -168,134 +173,139 @@ app.get("/api/messages", async (req, res) => {
     }
 });
 
-app.get("/media/:chat/:message", async (req, res) => {
-    try {
-        const chatIndex = Number(req.params.chat);
-        const messageId = Number(req.params.message);
+app.get(
+    "/media/:chatId/:messageId",
+    async (req, res) => {
+        try {
+            const chatId =
+                String(req.params.chatId);
 
-        if (
-            !Number.isInteger(chatIndex) ||
-            chatIndex < 0 ||
-            !Number.isInteger(messageId) ||
-            messageId <= 0
-        ) {
-            return res.status(400).send(
-                "Invalid chat or message."
-            );
-        }
+            const messageId =
+                Number(req.params.messageId);
 
-        const dialogs = await client.getDialogs({});
-        const dialog = dialogs[chatIndex];
-
-        if (!dialog) {
-            return res.status(404).send(
-                "Chat not found."
-            );
-        }
-
-        const messages = await client.getMessages(
-            dialog,
-            {
-                ids: messageId
-            }
-        );
-
-        const message = messages[0];
-
-        if (!message) {
-            return res.status(404).send(
-                "Message not found."
-            );
-        }
-
-        if (!message.media) {
-            return res.status(400).send(
-                "Message does not contain media."
-            );
-        }
-
-        if (!message.document) {
-            return res.status(400).send(
-                "This test currently supports Telegram documents."
-            );
-        }
-
-        const document = message.document;
-
-        const fileSize = Number(document.size);
-
-        if (!Number.isSafeInteger(fileSize) || fileSize < 0) {
-            return res.status(500).send(
-                "Invalid Telegram file size."
-            );
-        }
-
-        const mimeType =
-            document.mimeType ||
-            "application/octet-stream";
-
-        const range = req.headers.range;
-
-        let start = 0;
-        let end = fileSize - 1;
-
-        if (range) {
-            const match =
-                /^bytes=(\d*)-(\d*)$/.exec(range);
-
-            if (!match) {
-                return res.status(416).send(
-                    "Invalid Range."
+            if (
+                !chatId ||
+                !Number.isSafeInteger(messageId) ||
+                messageId <= 0
+            ) {
+                return res.status(400).send(
+                    "Invalid chat or message."
                 );
             }
 
-            if (match[1] === "" && match[2] === "") {
-                return res.status(416).send(
-                    "Invalid Range."
+            const dialog =
+                chatMap.get(chatId);
+
+            if (!dialog) {
+                return res.status(404).send(
+                    "Chat not found. Reload the chat list first."
                 );
             }
 
-            if (match[1] === "") {
-                const suffixLength =
-                    Number(match[2]);
+            const messages =
+                await client.getMessages(
+                    dialog,
+                    {
+                        ids: messageId
+                    }
+                );
+
+            const message =
+                messages[0];
+
+            if (!message) {
+                return res.status(404).send(
+                    "Message not found."
+                );
+            }
+
+            if (!message.media) {
+                return res.status(400).send(
+                    "Message does not contain media."
+                );
+            }
+
+            if (!message.document) {
+                return res.status(400).send(
+                    "This test currently supports Telegram documents."
+                );
+            }
+
+            const document =
+                message.document;
+
+            const fileSize =
+                Number(document.size);
+
+            if (
+                !Number.isSafeInteger(fileSize) ||
+                fileSize < 0
+            ) {
+                return res.status(500).send(
+                    "Invalid Telegram file size."
+                );
+            }
+
+            const mimeType =
+                document.mimeType ||
+                "application/octet-stream";
+
+            const range =
+                req.headers.range;
+
+            let start = 0;
+            let end = fileSize - 1;
+
+            if (range) {
+                const match =
+                    /^bytes=(\d*)-(\d*)$/.exec(
+                        range
+                    );
+
+                if (!match) {
+                    return res.status(416).send(
+                        "Invalid Range."
+                    );
+                }
 
                 if (
-                    !Number.isSafeInteger(suffixLength) ||
-                    suffixLength <= 0
+                    match[1] === "" &&
+                    match[2] === ""
                 ) {
                     return res.status(416).send(
                         "Invalid Range."
                     );
                 }
 
-                start = Math.max(
-                    0,
-                    fileSize - suffixLength
-                );
-            }
-            else {
-                start = Number(match[1]);
-
-                if (
-                    !Number.isSafeInteger(start) ||
-                    start >= fileSize
-                ) {
-                    res.status(416);
-
-                    res.setHeader(
-                        "Content-Range",
-                        `bytes */${fileSize}`
-                    );
-
-                    return res.end();
-                }
-
-                if (match[2] !== "") {
-                    end = Number(match[2]);
+                if (match[1] === "") {
+                    const suffixLength =
+                        Number(match[2]);
 
                     if (
-                        !Number.isSafeInteger(end) ||
-                        end < start
+                        !Number.isSafeInteger(
+                            suffixLength
+                        ) ||
+                        suffixLength <= 0
+                    ) {
+                        return res.status(416).send(
+                            "Invalid Range."
+                        );
+                    }
+
+                    start = Math.max(
+                        0,
+                        fileSize - suffixLength
+                    );
+                }
+                else {
+                    start =
+                        Number(match[1]);
+
+                    if (
+                        !Number.isSafeInteger(
+                            start
+                        ) ||
+                        start >= fileSize
                     ) {
                         res.status(416);
 
@@ -307,90 +317,118 @@ app.get("/media/:chat/:message", async (req, res) => {
                         return res.end();
                     }
 
-                    end = Math.min(
-                        end,
-                        fileSize - 1
+                    if (match[2] !== "") {
+                        end =
+                            Number(match[2]);
+
+                        if (
+                            !Number.isSafeInteger(
+                                end
+                            ) ||
+                            end < start
+                        ) {
+                            res.status(416);
+
+                            res.setHeader(
+                                "Content-Range",
+                                `bytes */${fileSize}`
+                            );
+
+                            return res.end();
+                        }
+
+                        end = Math.min(
+                            end,
+                            fileSize - 1
+                        );
+                    }
+                }
+            }
+
+            const contentLength =
+                end - start + 1;
+
+            res.setHeader(
+                "Content-Type",
+                mimeType
+            );
+
+            res.setHeader(
+                "Accept-Ranges",
+                "bytes"
+            );
+
+            res.setHeader(
+                "Cache-Control",
+                "public, max-age=31536000, immutable"
+            );
+
+            if (range) {
+                res.status(206);
+
+                res.setHeader(
+                    "Content-Range",
+                    `bytes ${start}-${end}/${fileSize}`
+                );
+            }
+            else {
+                res.status(200);
+            }
+
+            res.setHeader(
+                "Content-Length",
+                String(contentLength)
+            );
+
+            console.log(
+                `Streaming ${messageId}: ` +
+                `${start}-${end} / ${fileSize}`
+            );
+
+            const chunkSize =
+                512 * 1024;
+
+            for await (
+                const chunk of client.iterDownload({
+                    file: message.media,
+                    offset: bigInt(start),
+                    limit: contentLength,
+                    chunkSize
+                })
+            ) {
+                if (!res.write(
+                    Buffer.from(chunk)
+                )) {
+                    await new Promise(
+                        resolve =>
+                            res.once(
+                                "drain",
+                                resolve
+                            )
                     );
                 }
             }
+
+            res.end();
         }
-
-        const contentLength =
-            end - start + 1;
-
-        res.setHeader(
-            "Content-Type",
-            mimeType
-        );
-
-        res.setHeader(
-            "Accept-Ranges",
-            "bytes"
-        );
-
-        res.setHeader(
-            "Cache-Control",
-            "public, max-age=31536000, immutable"
-        );
-
-        if (range) {
-            res.status(206);
-
-            res.setHeader(
-                "Content-Range",
-                `bytes ${start}-${end}/${fileSize}`
+        catch (error) {
+            console.error(
+                "Media request failed:",
+                error
             );
-        }
-        else {
-            res.status(200);
-        }
 
-        res.setHeader(
-            "Content-Length",
-            String(contentLength)
-        );
-
-        console.log(
-            `Streaming ${messageId}: ` +
-            `${start}-${end} / ${fileSize}`
-        );
-
-        const chunkSize = 512 * 1024;
-
-        for await (
-            const chunk of client.iterDownload({
-                file: message.media,
-                offset: bigInt(start),
-                limit: contentLength,
-                chunkSize
-            })
-        ) {
-            if (!res.write(Buffer.from(chunk))) {
-                await new Promise(resolve =>
-                    res.once("drain", resolve)
+            if (!res.headersSent) {
+                res.status(500).send(
+                    error?.message ||
+                    String(error)
                 );
             }
-        }
-
-        res.end();
-    }
-    catch (error) {
-        console.error(
-            "Media request failed:",
-            error
-        );
-
-        if (!res.headersSent) {
-            res.status(500).send(
-                error?.message ||
-                String(error)
-            );
-        }
-        else {
-            res.destroy(error);
+            else {
+                res.destroy(error);
+            }
         }
     }
-});
+);
 
 app.get("/", (req, res) => {
     res.sendFile(

@@ -275,6 +275,14 @@ async function loadChats() {
         const chats =
             JSON.parse(text);
 
+        if (!Array.isArray(chats)) {
+
+            throw new Error(
+                "Unexpected chats response:\\n\\n" +
+                text
+            );
+        }
+
         chatSelect.innerHTML =
             '<option value="">Select a chat...</option>';
 
@@ -342,7 +350,9 @@ async function loadMessages(chatId) {
         const response =
             await fetch(
                 "/api/messages?chatId=" +
-                encodeURIComponent(chatId)
+                encodeURIComponent(
+                    chatId
+                )
             );
 
         const text =
@@ -353,28 +363,25 @@ async function loadMessages(chatId) {
             throw new Error(
                 "HTTP " +
                 response.status +
-                "\n\n" +
-                text
-            );
-        }
-
-        const result =
-            JSON.parse(text);
-
-        if (
-            !result ||
-            result.stage !== "success" ||
-            !Array.isArray(result.messages)
-        ) {
-
-            throw new Error(
-                "Unexpected messages response:\n\n" +
+                "\\n\\n" +
                 text
             );
         }
 
         currentMessages =
-            result.messages;
+            JSON.parse(text);
+
+        if (
+            !Array.isArray(
+                currentMessages
+            )
+        ) {
+
+            throw new Error(
+                "Unexpected messages response:\\n\\n" +
+                text
+            );
+        }
 
         messageSelect.innerHTML =
             '<option value="">Select a message...</option>';
@@ -408,7 +415,7 @@ async function loadMessages(chatId) {
                 const messageText =
                     message.text
                         .replace(
-                            /\s+/g,
+                            /\\s+/g,
                             " "
                         )
                         .trim();
@@ -509,7 +516,7 @@ chatSelect.addEventListener(
             '<a href="/api/messages?chatId=' +
             encodeURIComponent(chatId) +
             '" target="_blank">' +
-            "Open messages diagnostic" +
+            "Open messages API" +
             "</a>";
 
         await loadMessages(
@@ -669,9 +676,6 @@ export default {
 
                     return json(
                         {
-                            stage:
-                                "validate-chat-id",
-
                             error:
                                 "Missing chatId"
                         },
@@ -679,164 +683,65 @@ export default {
                     );
                 }
 
-                let client;
+                const client =
+                    await getTelegramClient(
+                        env
+                    );
 
-                try {
+                const dialogs =
+                    await client.getDialogs(
+                        {}
+                    );
 
-                    client =
-                        await getTelegramClient(
-                            env
-                        );
-
-                } catch (error) {
-
-                    return json({
-                        stage:
-                            "getTelegramClient",
-
-                        error:
-                            errorInfo(
-                                error
+                const dialog =
+                    dialogs.find(
+                        item =>
+                            String(
+                                item.id
+                            ) ===
+                            String(
+                                chatId
                             )
-                    });
-                }
-
-                let dialogs;
-
-                try {
-
-                    dialogs =
-                        await client.getDialogs(
-                            {}
-                        );
-
-                } catch (error) {
-
-                    return json({
-                        stage:
-                            "getDialogs",
-
-                        chatId,
-
-                        error:
-                            errorInfo(
-                                error
-                            )
-                    });
-                }
-
-                let dialog;
-
-                try {
-
-                    dialog =
-                        dialogs.find(
-                            item =>
-                                String(
-                                    item.id
-                                ) ===
-                                String(
-                                    chatId
-                                )
-                        );
-
-                } catch (error) {
-
-                    return json({
-                        stage:
-                            "find-dialog",
-
-                        chatId,
-
-                        error:
-                            errorInfo(
-                                error
-                            )
-                    });
-                }
+                    );
 
                 if (!dialog) {
 
                     return json(
                         {
-                            stage:
-                                "find-dialog",
-
                             error:
                                 "Chat not found",
 
-                            chatId,
-
-                            dialogCount:
-                                dialogs.length
+                            chatId
                         },
                         404
                     );
                 }
 
-                let result;
-
-                try {
-
-                    result = {
-
-                        id:
-                            String(
-                                dialog.id
-                            ),
-
-                        title:
-                            dialog.title ??
-                            null,
-
-                        name:
-                            dialog.name ??
-                            null,
-
-                        unreadCount:
-                            Number(
-                                dialog.unreadCount ??
-                                0
-                            ),
-
-                        hasEntity:
-                            !!dialog.entity,
-
-                        entityClass:
-                            dialog.entity
-                                ?.className ??
-                            null,
-
-                        entityConstructor:
-                            dialog.entity
-                                ?.constructor
-                                ?.name ??
-                            null,
-
-                        hasInputEntity:
-                            !!dialog.inputEntity
-                    };
-
-                } catch (error) {
-
-                    return json({
-                        stage:
-                            "read-dialog",
-
-                        chatId,
-
-                        error:
-                            errorInfo(
-                                error
-                            )
-                    });
-                }
+                const entity =
+                    dialog.entity;
 
                 return json({
-                    stage:
-                        "success",
+                    id:
+                        dialog.id?.toString() ??
+                        null,
 
-                    result
+                    name:
+                        dialog.title ??
+                        dialog.name ??
+                        null,
+
+                    username:
+                        entity?.username ??
+                        null,
+
+                    type:
+                        entity?.className ??
+                        entity?.constructor?.name ??
+                        null,
+
+                    unreadCount:
+                        dialog.unreadCount ??
+                        0
                 });
             }
 
@@ -853,9 +758,6 @@ export default {
 
                     return json(
                         {
-                            stage:
-                                "validate-chat-id",
-
                             error:
                                 "Missing chatId"
                         },
@@ -863,240 +765,85 @@ export default {
                     );
                 }
 
-                let client;
+                const client =
+                    await getTelegramClient(
+                        env
+                    );
 
-                try {
+                const dialogs =
+                    await client.getDialogs(
+                        {}
+                    );
 
-                    client =
-                        await getTelegramClient(
-                            env
-                        );
-
-                } catch (error) {
-
-                    return json({
-                        stage:
-                            "getTelegramClient",
-
-                        chatId,
-
-                        error:
-                            errorInfo(
-                                error
+                const dialog =
+                    dialogs.find(
+                        item =>
+                            String(
+                                item.id
+                            ) ===
+                            String(
+                                chatId
                             )
-                    });
-                }
-
-                let dialogs;
-
-                try {
-
-                    dialogs =
-                        await client.getDialogs(
-                            {}
-                        );
-
-                } catch (error) {
-
-                    return json({
-                        stage:
-                            "getDialogs",
-
-                        chatId,
-
-                        error:
-                            errorInfo(
-                                error
-                            )
-                    });
-                }
-
-                let dialog;
-
-                try {
-
-                    dialog =
-                        dialogs.find(
-                            item =>
-                                String(
-                                    item.id
-                                ) ===
-                                String(
-                                    chatId
-                                )
-                        );
-
-                } catch (error) {
-
-                    return json({
-                        stage:
-                            "find-dialog",
-
-                        chatId,
-
-                        error:
-                            errorInfo(
-                                error
-                            )
-                    });
-                }
+                    );
 
                 if (!dialog) {
 
                     return json(
                         {
-                            stage:
-                                "find-dialog",
-
                             error:
                                 "Chat not found",
 
-                            chatId,
-
-                            dialogCount:
-                                dialogs.length
+                            chatId
                         },
                         404
                     );
                 }
 
-                let inputEntity;
+                const inputEntity =
+                    await client.getInputEntity(
+                        dialog
+                    );
 
-                try {
+                const messages =
+                    await client.getMessages(
+                        inputEntity,
+                        {
+                            limit: 10
+                        }
+                    );
 
-                    inputEntity =
-                        await client.getInputEntity(
-                            dialog
-                        );
+                const output =
+                    messages.map(
+                        message => ({
+                            id:
+                                String(
+                                    message.id
+                                ),
 
-                } catch (error) {
+                            date:
+                                message.date
+                                    ? new Date(
+                                        message.date
+                                    ).toISOString()
+                                    : null,
 
-                    return json({
-                        stage:
-                            "getInputEntity-dialog",
+                            text:
+                                message.message ??
+                                "",
 
-                        chatId,
+                            hasMedia:
+                                !!message.media,
 
-                        dialogId:
-                            String(
-                                dialog.id
-                            ),
+                            mediaType:
+                                message.media
+                                    ?.className ??
+                                null
+                        })
+                    );
 
-                        error:
-                            errorInfo(
-                                error
-                            )
-                    });
-                }
-
-                let messages;
-
-                try {
-
-                    messages =
-                        await client.getMessages(
-                            inputEntity,
-                            {
-                                limit: 10
-                            }
-                        );
-
-                } catch (error) {
-
-                    return json({
-                        stage:
-                            "getMessages",
-
-                        chatId,
-
-                        dialogId:
-                            String(
-                                dialog.id
-                            ),
-
-                        inputEntityClass:
-                            inputEntity
-                                ?.className ??
-                            null,
-
-                        inputEntityConstructor:
-                            inputEntity
-                                ?.constructor
-                                ?.name ??
-                            null,
-
-                        error:
-                            errorInfo(
-                                error
-                            )
-                    });
-                }
-
-                let output;
-
-                try {
-
-                    output =
-                        messages.map(
-                            message => ({
-                                id:
-                                    String(
-                                        message.id
-                                    ),
-
-                                date:
-                                    message.date
-                                        ? new Date(
-                                            message.date
-                                        ).toISOString()
-                                        : null,
-
-                                text:
-                                    message.message ??
-                                    "",
-
-                                hasMedia:
-                                    !!message.media,
-
-                                mediaType:
-                                    message.media
-                                        ?.className ??
-                                    null
-                            })
-                        );
-
-                } catch (error) {
-
-                    return json({
-                        stage:
-                            "serialize-messages",
-
-                        chatId,
-
-                        error:
-                            errorInfo(
-                                error
-                            )
-                    });
-                }
-
-                return json({
-                    stage:
-                        "success",
-
-                    chatId,
-
-                    inputEntityClass:
-                        inputEntity
-                            ?.className ??
-                        null,
-
-                    count:
-                        output.length,
-
-                    messages:
-                        output
-                });
+                return json(
+                    output
+                );
             }
 
             return new Response(
@@ -1113,15 +860,18 @@ export default {
 
         } catch (error) {
 
-            return json({
-                stage:
-                    "outer-worker-catch",
+            return json(
+                {
+                    stage:
+                        "outer-worker-catch",
 
-                error:
-                    errorInfo(
-                        error
-                    )
-            }, 500);
+                    error:
+                        errorInfo(
+                            error
+                        )
+                },
+                500
+            );
         }
     }
 };

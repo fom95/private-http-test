@@ -1,5 +1,6 @@
 const express = require("express");
 const { TelegramClient } = require("telegram");
+const bigInt = require("big-integer");
 const { StringSession } = require("telegram/sessions");
 
 const app = express();
@@ -359,7 +360,7 @@ app.get("/media/:chat/:message", async (req, res) => {
         for await (
             const chunk of client.iterDownload({
                 file: message.media,
-                offset: start,
+                offset: bigInt(start),
                 limit: contentLength,
                 chunkSize
             })

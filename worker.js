@@ -1,51 +1,32 @@
 import { TelegramClient } from "telegram";
 import { StringSession } from "telegram/sessions";
 
-let telegramClientPromise = null;
-
 async function getTelegramClient(env) {
 
-    if (!telegramClientPromise) {
+    const apiId =
+        Number(
+            await env.API_ID.get()
+        );
 
-        telegramClientPromise =
-            (async () => {
+    const apiHash =
+        await env.API_HASH.get();
 
-                const apiId =
-                    Number(
-                        await env.API_ID.get()
-                    );
+    const session =
+        await env.TELEGRAM_SESSION.get();
 
-                const apiHash =
-                    await env.API_HASH.get();
+    const client =
+        new TelegramClient(
+            new StringSession(session),
+            apiId,
+            apiHash,
+            {
+                connectionRetries: 5
+            }
+        );
 
-                const session =
-                    await env.TELEGRAM_SESSION.get();
+    await client.connect();
 
-                const client =
-                    new TelegramClient(
-                        new StringSession(session),
-                        apiId,
-                        apiHash,
-                        {
-                            connectionRetries: 5
-                        }
-                    );
-
-                await client.connect();
-
-                return client;
-
-            })().catch(error => {
-
-                telegramClientPromise =
-                    null;
-
-                throw error;
-
-            });
-    }
-
-    return telegramClientPromise;
+    return client;
 }
 
 function json(data, status = 200) {

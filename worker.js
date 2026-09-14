@@ -4,75 +4,127 @@ import { StringSession } from "telegram/sessions";
 let telegramClientPromise = null;
 
 async function getTelegramClient(env) {
+
     if (!telegramClientPromise) {
-        telegramClientPromise = (async () => {
-            const apiId =
-                Number(await env.API_ID.get());
 
-            const apiHash =
-                await env.API_HASH.get();
+        telegramClientPromise =
+            (async () => {
 
-            const session =
-                await env.TELEGRAM_SESSION.get();
+                const apiId =
+                    Number(
+                        await env.API_ID.get()
+                    );
 
-            const client =
-                new TelegramClient(
-                    new StringSession(session),
-                    apiId,
-                    apiHash,
-                    {
-                        connectionRetries: 5
-                    }
-                );
+                const apiHash =
+                    await env.API_HASH.get();
 
-            await client.connect();
+                const session =
+                    await env.TELEGRAM_SESSION.get();
 
-            return client;
-        })().catch(error => {
-            telegramClientPromise = null;
-            throw error;
-        });
+                const client =
+                    new TelegramClient(
+                        new StringSession(session),
+                        apiId,
+                        apiHash,
+                        {
+                            connectionRetries: 5
+                        }
+                    );
+
+                await client.connect();
+
+                return client;
+
+            })().catch(error => {
+
+                telegramClientPromise =
+                    null;
+
+                throw error;
+
+            });
     }
 
     return telegramClientPromise;
 }
 
 function json(data, status = 200) {
+
     return new Response(
-        JSON.stringify(data, null, 2),
+        JSON.stringify(
+            data,
+            null,
+            2
+        ),
         {
             status,
+
             headers: {
                 "Content-Type":
                     "application/json; charset=utf-8",
-                "Access-Control-Allow-Origin": "*"
+
+                "Access-Control-Allow-Origin":
+                    "*"
             }
         }
     );
 }
 
 function html(content, status = 200) {
+
     return new Response(
         content,
         {
             status,
+
             headers: {
                 "Content-Type":
                     "text/html; charset=utf-8",
-                "Access-Control-Allow-Origin": "*"
+
+                "Access-Control-Allow-Origin":
+                    "*"
             }
         }
     );
 }
 
+function errorInfo(error) {
+
+    return {
+        message:
+            error?.message ??
+            String(error),
+
+        name:
+            error?.name ??
+            null,
+
+        stack:
+            error?.stack ??
+            null,
+
+        constructor:
+            error?.constructor?.name ??
+            null
+    };
+}
+
 const PAGE = `<!DOCTYPE html>
 <html>
+
 <head>
+
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1"
+>
+
 <title>Telegram HTTP Test</title>
 
 <style>
+
 body {
     font-family: Arial, sans-serif;
     max-width: 900px;
@@ -133,25 +185,42 @@ pre {
     white-space: pre-wrap;
     word-break: break-word;
 }
+
 </style>
+
 </head>
 
 <body>
 
 <h1>Telegram HTTP Test</h1>
 
-<label for="chatSelect">Chat</label>
+<label for="chatSelect">
+    Chat
+</label>
 
 <select id="chatSelect">
-    <option value="">Loading chats...</option>
+
+    <option value="">
+        Loading chats...
+    </option>
+
 </select>
 
 <div id="chatInfo"></div>
 
-<label for="messageSelect">Message</label>
+<label for="messageSelect">
+    Message
+</label>
 
-<select id="messageSelect" disabled>
-    <option value="">Messages will appear here</option>
+<select
+    id="messageSelect"
+    disabled
+>
+
+    <option value="">
+        Messages will appear here
+    </option>
+
 </select>
 
 <div id="messageInfo"></div>
@@ -161,23 +230,36 @@ pre {
 <div id="error"></div>
 
 <script>
+
 const chatSelect =
-    document.getElementById("chatSelect");
+    document.getElementById(
+        "chatSelect"
+    );
 
 const messageSelect =
-    document.getElementById("messageSelect");
+    document.getElementById(
+        "messageSelect"
+    );
 
 const chatInfo =
-    document.getElementById("chatInfo");
+    document.getElementById(
+        "chatInfo"
+    );
 
 const messageInfo =
-    document.getElementById("messageInfo");
+    document.getElementById(
+        "messageInfo"
+    );
 
 const status =
-    document.getElementById("status");
+    document.getElementById(
+        "status"
+    );
 
 const errorBox =
-    document.getElementById("error");
+    document.getElementById(
+        "error"
+    );
 
 let currentMessages = [];
 
@@ -192,12 +274,15 @@ async function loadChats() {
             "none";
 
         const response =
-            await fetch("/api/chats");
+            await fetch(
+                "/api/chats"
+            );
 
         const text =
             await response.text();
 
         if (!response.ok) {
+
             throw new Error(
                 "HTTP " +
                 response.status +
@@ -212,10 +297,14 @@ async function loadChats() {
         chatSelect.innerHTML =
             '<option value="">Select a chat...</option>';
 
-        for (const chat of chats) {
+        for (
+            const chat of chats
+        ) {
 
             const option =
-                document.createElement("option");
+                document.createElement(
+                    "option"
+                );
 
             option.value =
                 chat.id;
@@ -272,13 +361,16 @@ async function loadMessages(chatId) {
         const response =
             await fetch(
                 "/api/messages?chatId=" +
-                encodeURIComponent(chatId)
+                encodeURIComponent(
+                    chatId
+                )
             );
 
         const text =
             await response.text();
 
         if (!response.ok) {
+
             throw new Error(
                 "HTTP " +
                 response.status +
@@ -293,10 +385,14 @@ async function loadMessages(chatId) {
         messageSelect.innerHTML =
             '<option value="">Select a message...</option>';
 
-        for (const message of currentMessages) {
+        for (
+            const message of currentMessages
+        ) {
 
             const option =
-                document.createElement("option");
+                document.createElement(
+                    "option"
+                );
 
             option.value =
                 message.id;
@@ -306,6 +402,7 @@ async function loadMessages(chatId) {
                 message.id;
 
             if (message.hasMedia) {
+
                 label +=
                     " [" +
                     message.mediaType +
@@ -314,15 +411,22 @@ async function loadMessages(chatId) {
 
             if (message.text) {
 
-                const text =
+                const messageText =
                     message.text
-                        .replace(/\\s+/g, " ")
+                        .replace(
+                            /\\s+/g,
+                            " "
+                        )
                         .trim();
 
-                if (text) {
+                if (messageText) {
+
                     label +=
                         " " +
-                        text.slice(0, 100);
+                        messageText.slice(
+                            0,
+                            100
+                        );
                 }
             }
 
@@ -366,11 +470,6 @@ chatSelect.addEventListener(
     "change",
     async () => {
 
-        const selected =
-            chatSelect.options[
-                chatSelect.selectedIndex
-            ];
-
         if (!chatSelect.value) {
 
             chatInfo.style.display =
@@ -391,6 +490,11 @@ chatSelect.addEventListener(
         const chatId =
             chatSelect.value;
 
+        const selected =
+            chatSelect.options[
+                chatSelect.selectedIndex
+            ];
+
         chatInfo.style.display =
             "block";
 
@@ -398,12 +502,20 @@ chatSelect.addEventListener(
             "<strong>Chat ID:</strong> " +
             escapeHtml(chatId) +
             "<br><strong>Name:</strong> " +
-            escapeHtml(selected.textContent) +
+            escapeHtml(
+                selected.textContent
+            ) +
             "<br><br>" +
             '<a href="/api/chat?chatId=' +
             encodeURIComponent(chatId) +
             '" target="_blank">' +
-            "Open chat API" +
+            "Open chat diagnostic" +
+            "</a>" +
+            "<br>" +
+            '<a href="/api/messages?chatId=' +
+            encodeURIComponent(chatId) +
+            '" target="_blank">' +
+            "Open messages diagnostic" +
             "</a>";
 
         await loadMessages(
@@ -428,7 +540,9 @@ messageSelect.addEventListener(
             currentMessages.find(
                 item =>
                     String(item.id) ===
-                    String(messageSelect.value)
+                    String(
+                        messageSelect.value
+                    )
             );
 
         if (!message) {
@@ -440,75 +554,117 @@ messageSelect.addEventListener(
 
         messageInfo.innerHTML =
             "<strong>Message ID:</strong> " +
-            message.id +
+            escapeHtml(message.id) +
             "<br><strong>Date:</strong> " +
-            (message.date || "Unknown") +
+            escapeHtml(
+                message.date ||
+                "Unknown"
+            ) +
             "<br><strong>Media:</strong> " +
-            (message.hasMedia
-                ? message.mediaType
-                : "None") +
+            escapeHtml(
+                message.hasMedia
+                    ? message.mediaType
+                    : "None"
+            ) +
             "<br><br><strong>Text:</strong>" +
             "<pre>" +
-            escapeHtml(message.text || "") +
+            escapeHtml(
+                message.text ||
+                ""
+            ) +
             "</pre>";
     }
 );
 
 function escapeHtml(value) {
+
     return String(value)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
+        .replace(
+            /&/g,
+            "&amp;"
+        )
+        .replace(
+            /</g,
+            "&lt;"
+        )
+        .replace(
+            />/g,
+            "&gt;"
+        )
+        .replace(
+            /"/g,
+            "&quot;"
+        )
+        .replace(
+            /'/g,
+            "&#039;"
+        );
 }
 
 loadChats();
+
 </script>
 
 </body>
+
 </html>`;
 
 export default {
+
     async fetch(request, env) {
 
         try {
 
             const url =
-                new URL(request.url);
+                new URL(
+                    request.url
+                );
 
             if (
                 url.pathname === "/" ||
                 url.pathname === "/index.html"
             ) {
+
                 return html(PAGE);
             }
 
-            if (url.pathname === "/api/chats") {
+            if (
+                url.pathname === "/api/chats"
+            ) {
 
                 const client =
-                    await getTelegramClient(env);
+                    await getTelegramClient(
+                        env
+                    );
 
                 const dialogs =
-                    await client.getDialogs({});
+                    await client.getDialogs(
+                        {}
+                    );
 
                 const chats =
-                    dialogs.map(dialog => ({
-                        id:
-                            dialog.id?.toString() ??
-                            null,
+                    dialogs.map(
+                        dialog => ({
+                            id:
+                                dialog.id?.toString() ??
+                                null,
 
-                        name:
-                            dialog.title ??
-                            dialog.name ??
-                            dialog.id?.toString() ??
-                            "Unknown"
-                    }));
+                            name:
+                                dialog.title ??
+                                dialog.name ??
+                                dialog.id?.toString() ??
+                                "Unknown"
+                        })
+                    );
 
-                return json(chats);
+                return json(
+                    chats
+                );
             }
 
-            if (url.pathname === "/api/chat") {
+            if (
+                url.pathname === "/api/chat"
+            ) {
 
                 const chatId =
                     url.searchParams.get(
@@ -519,6 +675,9 @@ export default {
 
                     return json(
                         {
+                            stage:
+                                "validate-chat-id",
+
                             error:
                                 "Missing chatId"
                         },
@@ -526,61 +685,170 @@ export default {
                     );
                 }
 
-                const client =
-                    await getTelegramClient(env);
+                let client;
 
-                const dialogs =
-                    await client.getDialogs({});
+                try {
 
-                const dialog =
-                    dialogs.find(
-                        item =>
-                            String(item.id) ===
-                            String(chatId)
-                    );
+                    client =
+                        await getTelegramClient(
+                            env
+                        );
+
+                } catch (error) {
+
+                    return json({
+                        stage:
+                            "getTelegramClient",
+
+                        error:
+                            errorInfo(
+                                error
+                            )
+                    });
+                }
+
+                let dialogs;
+
+                try {
+
+                    dialogs =
+                        await client.getDialogs(
+                            {}
+                        );
+
+                } catch (error) {
+
+                    return json({
+                        stage:
+                            "getDialogs",
+
+                        chatId,
+
+                        error:
+                            errorInfo(
+                                error
+                            )
+                    });
+                }
+
+                let dialog;
+
+                try {
+
+                    dialog =
+                        dialogs.find(
+                            item =>
+                                String(
+                                    item.id
+                                ) ===
+                                String(
+                                    chatId
+                                )
+                        );
+
+                } catch (error) {
+
+                    return json({
+                        stage:
+                            "find-dialog",
+
+                        chatId,
+
+                        error:
+                            errorInfo(
+                                error
+                            )
+                    });
+                }
 
                 if (!dialog) {
 
                     return json(
                         {
+                            stage:
+                                "find-dialog",
+
                             error:
                                 "Chat not found",
 
-                            chatId
+                            chatId,
+
+                            dialogCount:
+                                dialogs.length
                         },
                         404
                     );
                 }
 
-                const entity =
-                    dialog.entity;
+                let result;
+
+                try {
+
+                    result = {
+
+                        id:
+                            String(
+                                dialog.id
+                            ),
+
+                        title:
+                            dialog.title ??
+                            null,
+
+                        name:
+                            dialog.name ??
+                            null,
+
+                        unreadCount:
+                            Number(
+                                dialog.unreadCount ??
+                                0
+                            ),
+
+                        hasEntity:
+                            !!dialog.entity,
+
+                        entityClass:
+                            dialog.entity
+                                ?.className ??
+                            null,
+
+                        entityConstructor:
+                            dialog.entity
+                                ?.constructor
+                                ?.name ??
+                            null,
+
+                        hasInputEntity:
+                            !!dialog.inputEntity
+                    };
+
+                } catch (error) {
+
+                    return json({
+                        stage:
+                            "read-dialog",
+
+                        chatId,
+
+                        error:
+                            errorInfo(
+                                error
+                            )
+                    });
+                }
 
                 return json({
-                    id:
-                        dialog.id?.toString() ??
-                        null,
+                    stage:
+                        "success",
 
-                    name:
-                        dialog.title ??
-                        dialog.name ??
-                        null,
-
-                    username:
-                        entity?.username ??
-                        null,
-
-                    type:
-                        entity?.className ??
-                        entity?.constructor?.name ??
-                        null,
-
-                    unreadCount:
-                        dialog.unreadCount ??
-                        0
+                    result
                 });
             }
 
-            if (url.pathname === "/api/messages") {
+            if (
+                url.pathname === "/api/messages"
+            ) {
 
                 const chatId =
                     url.searchParams.get(
@@ -591,6 +859,9 @@ export default {
 
                     return json(
                         {
+                            stage:
+                                "validate-chat-id",
+
                             error:
                                 "Missing chatId"
                         },
@@ -598,16 +869,239 @@ export default {
                     );
                 }
 
-                const client =
-                    await getTelegramClient(env);
+                let client;
+
+                try {
+
+                    client =
+                        await getTelegramClient(
+                            env
+                        );
+
+                } catch (error) {
+
+                    return json({
+                        stage:
+                            "getTelegramClient",
+
+                        chatId,
+
+                        error:
+                            errorInfo(
+                                error
+                            )
+                    });
+                }
+
+                let dialogs;
+
+                try {
+
+                    dialogs =
+                        await client.getDialogs(
+                            {}
+                        );
+
+                } catch (error) {
+
+                    return json({
+                        stage:
+                            "getDialogs",
+
+                        chatId,
+
+                        error:
+                            errorInfo(
+                                error
+                            )
+                    });
+                }
+
+                let dialog;
+
+                try {
+
+                    dialog =
+                        dialogs.find(
+                            item =>
+                                String(
+                                    item.id
+                                ) ===
+                                String(
+                                    chatId
+                                )
+                        );
+
+                } catch (error) {
+
+                    return json({
+                        stage:
+                            "find-dialog",
+
+                        chatId,
+
+                        error:
+                            errorInfo(
+                                error
+                            )
+                    });
+                }
+
+                if (!dialog) {
+
+                    return json(
+                        {
+                            stage:
+                                "find-dialog",
+
+                            error:
+                                "Chat not found",
+
+                            chatId,
+
+                            dialogCount:
+                                dialogs.length
+                        },
+                        404
+                    );
+                }
+
+                let inputEntity;
+
+                try {
+
+                    inputEntity =
+                        await client.getInputEntity(
+                            dialog
+                        );
+
+                } catch (error) {
+
+                    return json({
+                        stage:
+                            "getInputEntity-dialog",
+
+                        chatId,
+
+                        dialogId:
+                            String(
+                                dialog.id
+                            ),
+
+                        error:
+                            errorInfo(
+                                error
+                            )
+                    });
+                }
+
+                let messages;
+
+                try {
+
+                    messages =
+                        await client.getMessages(
+                            inputEntity,
+                            {
+                                limit: 10
+                            }
+                        );
+
+                } catch (error) {
+
+                    return json({
+                        stage:
+                            "getMessages",
+
+                        chatId,
+
+                        dialogId:
+                            String(
+                                dialog.id
+                            ),
+
+                        inputEntityClass:
+                            inputEntity
+                                ?.className ??
+                            null,
+
+                        inputEntityConstructor:
+                            inputEntity
+                                ?.constructor
+                                ?.name ??
+                            null,
+
+                        error:
+                            errorInfo(
+                                error
+                            )
+                    });
+                }
+
+                let output;
+
+                try {
+
+                    output =
+                        messages.map(
+                            message => ({
+                                id:
+                                    String(
+                                        message.id
+                                    ),
+
+                                date:
+                                    message.date
+                                        ? new Date(
+                                            message.date
+                                        ).toISOString()
+                                        : null,
+
+                                text:
+                                    message.message ??
+                                    "",
+
+                                hasMedia:
+                                    !!message.media,
+
+                                mediaType:
+                                    message.media
+                                        ?.className ??
+                                    null
+                            })
+                        );
+
+                } catch (error) {
+
+                    return json({
+                        stage:
+                            "serialize-messages",
+
+                        chatId,
+
+                        error:
+                            errorInfo(
+                                error
+                            )
+                    });
+                }
 
                 return json({
-                    diagnostic: true,
+                    stage:
+                        "success",
 
                     chatId,
 
-                    clientConnected:
-                        client.connected
+                    inputEntityClass:
+                        inputEntity
+                            ?.className ??
+                        null,
+
+                    count:
+                        output.length,
+
+                    messages:
+                        output
                 });
             }
 
@@ -615,30 +1109,25 @@ export default {
                 "Not found",
                 {
                     status: 404,
+
                     headers: {
-                        "Access-Control-Allow-Origin": "*"
+                        "Access-Control-Allow-Origin":
+                            "*"
                     }
                 }
             );
 
         } catch (error) {
 
-            return json(
-                {
-                    error:
-                        error?.message ||
-                        String(error),
+            return json({
+                stage:
+                    "outer-worker-catch",
 
-                    name:
-                        error?.name ||
-                        null,
-
-                    stack:
-                        error?.stack ||
-                        null
-                },
-                500
-            );
+                error:
+                    errorInfo(
+                        error
+                    )
+            }, 500);
         }
     }
 };

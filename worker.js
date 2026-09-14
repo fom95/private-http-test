@@ -342,9 +342,7 @@ async function loadMessages(chatId) {
         const response =
             await fetch(
                 "/api/messages?chatId=" +
-                encodeURIComponent(
-                    chatId
-                )
+                encodeURIComponent(chatId)
             );
 
         const text =
@@ -355,13 +353,28 @@ async function loadMessages(chatId) {
             throw new Error(
                 "HTTP " +
                 response.status +
-                "\\n\\n" +
+                "\n\n" +
+                text
+            );
+        }
+
+        const result =
+            JSON.parse(text);
+
+        if (
+            !result ||
+            result.stage !== "success" ||
+            !Array.isArray(result.messages)
+        ) {
+
+            throw new Error(
+                "Unexpected messages response:\n\n" +
                 text
             );
         }
 
         currentMessages =
-            JSON.parse(text);
+            result.messages;
 
         messageSelect.innerHTML =
             '<option value="">Select a message...</option>';
@@ -395,7 +408,7 @@ async function loadMessages(chatId) {
                 const messageText =
                     message.text
                         .replace(
-                            /\\s+/g,
+                            /\s+/g,
                             " "
                         )
                         .trim();

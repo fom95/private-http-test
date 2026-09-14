@@ -136,9 +136,7 @@ const PAGE = `<!DOCTYPE html>
 
 <h1>Telegram HTTP Test</h1>
 
-<label for="chatSelect">
-    Chat
-</label>
+<label for="chatSelect">Chat</label>
 
 <select id="chatSelect">
     <option value="">Loading chats...</option>
@@ -146,14 +144,10 @@ const PAGE = `<!DOCTYPE html>
 
 <div id="chatInfo"></div>
 
-<label for="messageSelect">
-    Message
-</label>
+<label for="messageSelect">Message</label>
 
 <select id="messageSelect" disabled>
-    <option value="">
-        Messages will appear here
-    </option>
+    <option value="">Messages will appear here</option>
 </select>
 
 <div id="messageInfo"></div>
@@ -196,11 +190,10 @@ async function loadChats() {
         const response =
             await fetch("/api/chats");
 
+        const text =
+            await response.text();
+
         if (!response.ok) {
-
-            const text =
-                await response.text();
-
             throw new Error(
                 "HTTP " +
                 response.status +
@@ -210,7 +203,7 @@ async function loadChats() {
         }
 
         const chats =
-            await response.json();
+            JSON.parse(text);
 
         chatSelect.innerHTML =
             '<option value="">Select a chat...</option>';
@@ -278,11 +271,10 @@ async function loadMessages(chatId) {
                 encodeURIComponent(chatId)
             );
 
+        const text =
+            await response.text();
+
         if (!response.ok) {
-
-            const text =
-                await response.text();
-
             throw new Error(
                 "HTTP " +
                 response.status +
@@ -292,7 +284,7 @@ async function loadMessages(chatId) {
         }
 
         currentMessages =
-            await response.json();
+            JSON.parse(text);
 
         messageSelect.innerHTML =
             '<option value="">Select a message...</option>';
@@ -324,7 +316,6 @@ async function loadMessages(chatId) {
                         .trim();
 
                 if (text) {
-
                     label +=
                         " " +
                         text.slice(0, 100);
@@ -554,7 +545,16 @@ export default {
                     return json(
                         {
                             error:
-                                "Chat not found"
+                                "Chat not found",
+
+                            requestedChatId:
+                                chatId,
+
+                            availableIds:
+                                dialogs.map(
+                                    item =>
+                                        String(item.id)
+                                )
                         },
                         404
                     );

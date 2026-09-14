@@ -371,6 +371,18 @@ app.get(
                 req.query.thumb === "1"
             ) {
 
+                console.log(
+                    "Telegram document thumbnail data:",
+                    {
+                        documentKeys:
+                            Object.keys(document || {}),
+                        thumbs:
+                            document.thumbs,
+                        rawDocument:
+                            document
+                    }
+                );
+                
                 const thumbs =
                     Array.isArray(
                         document.thumbs

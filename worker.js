@@ -1,8 +1,11 @@
+import { TelegramClient } from "telegram";
+import { StringSession } from "telegram/sessions";
+
 export default {
     async fetch(request, env) {
         try {
             const apiId =
-                await env.API_ID.get();
+                Number(await env.API_ID.get());
 
             const apiHash =
                 await env.API_HASH.get();
@@ -10,16 +13,27 @@ export default {
             const session =
                 await env.TELEGRAM_SESSION.get();
 
+            const client =
+                new TelegramClient(
+                    new StringSession(session),
+                    apiId,
+                    apiHash,
+                    {
+                        connectionRetries: 1
+                    }
+                );
+
+            await client.connect();
+
             return new Response(
                 JSON.stringify({
                     worker: true,
-                    apiId: !!apiId,
-                    apiHash: !!apiHash,
-                    session: !!session
+                    telegram: true
                 }),
                 {
                     headers: {
-                        "Content-Type": "application/json"
+                        "Content-Type":
+                            "application/json"
                     }
                 }
             );
@@ -27,6 +41,7 @@ export default {
         catch (error) {
             return new Response(
                 JSON.stringify({
+                    telegram: false,
                     error:
                         error?.message ||
                         String(error),
@@ -40,7 +55,8 @@ export default {
                 {
                     status: 500,
                     headers: {
-                        "Content-Type": "application/json"
+                        "Content-Type":
+                            "application/json"
                     }
                 }
             );

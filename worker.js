@@ -25,11 +25,26 @@ export default {
 
             await client.connect();
 
+            const dialogs =
+                await client.getDialogs({});
+
+            const chats =
+                dialogs.map(
+                    (dialog, index) => ({
+                        index,
+
+                        id:
+                            String(dialog.id),
+
+                        title:
+                            dialog.title ||
+                            dialog.name ||
+                            "Untitled chat"
+                    })
+                );
+
             return new Response(
-                JSON.stringify({
-                    worker: true,
-                    telegram: true
-                }),
+                JSON.stringify(chats),
                 {
                     headers: {
                         "Content-Type":
@@ -41,19 +56,21 @@ export default {
         catch (error) {
             return new Response(
                 JSON.stringify({
-                    telegram: false,
                     error:
                         error?.message ||
                         String(error),
+
                     name:
                         error?.name ||
                         null,
+
                     stack:
                         error?.stack ||
                         null
                 }),
                 {
                     status: 500,
+
                     headers: {
                         "Content-Type":
                             "application/json"

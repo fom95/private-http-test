@@ -169,11 +169,8 @@ app.get("/api/messages", async (req, res) => {
 
 app.get("/media/:chat/:message", async (req, res) => {
     try {
-        const chatIndex =
-            Number(req.params.chat);
-
-        const messageId =
-            Number(req.params.message);
+        const chatIndex = Number(req.params.chat);
+        const messageId = Number(req.params.message);
 
         if (
             !Number.isInteger(chatIndex) ||
@@ -186,11 +183,8 @@ app.get("/media/:chat/:message", async (req, res) => {
             );
         }
 
-        const dialogs =
-            await client.getDialogs({});
-
-        const dialog =
-            dialogs[chatIndex];
+        const dialogs = await client.getDialogs({});
+        const dialog = dialogs[chatIndex];
 
         if (!dialog) {
             return res.status(404).send(
@@ -198,16 +192,14 @@ app.get("/media/:chat/:message", async (req, res) => {
             );
         }
 
-        const messages =
-            await client.getMessages(
-                dialog,
-                {
-                    ids: messageId
-                }
-            );
+        const messages = await client.getMessages(
+            dialog,
+            {
+                ids: messageId
+            }
+        );
 
-        const message =
-            messages[0];
+        const message = messages[0];
 
         if (!message) {
             return res.status(404).send(
@@ -223,56 +215,158 @@ app.get("/media/:chat/:message", async (req, res) => {
 
         if (!message.document) {
             return res.status(400).send(
-                "This first test only supports Telegram documents."
+                "This test currently supports Telegram documents."
             );
         }
 
-        const document =
-            message.document;
+        const document = message.document;
+
+        const fileSize = Number(document.size);
+
+        if (!Number.isSafeInteger(fileSize) || fileSize < 0) {
+            return res.status(500).send(
+                "Invalid Telegram file size."
+            );
+        }
 
         const mimeType =
             document.mimeType ||
             "application/octet-stream";
 
-        res.status(200);
+        const range = req.headers.range;
+
+        let start = 0;
+        let end = fileSize - 1;
+
+        if (range) {
+            const match =
+                /^bytes=(\d*)-(\d*)$/.exec(range);
+
+            if (!match) {
+                return res.status(416).send(
+                    "Invalid Range."
+                );
+            }
+
+            if (match[1] === "" && match[2] === "") {
+                return res.status(416).send(
+                    "Invalid Range."
+                );
+            }
+
+            if (match[1] === "") {
+                const suffixLength =
+                    Number(match[2]);
+
+                if (
+                    !Number.isSafeInteger(suffixLength) ||
+                    suffixLength <= 0
+                ) {
+                    return res.status(416).send(
+                        "Invalid Range."
+                    );
+                }
+
+                start = Math.max(
+                    0,
+                    fileSize - suffixLength
+                );
+            }
+            else {
+                start = Number(match[1]);
+
+                if (
+                    !Number.isSafeInteger(start) ||
+                    start >= fileSize
+                ) {
+                    res.status(416);
+
+                    res.setHeader(
+                        "Content-Range",
+                        `bytes */${fileSize}`
+                    );
+
+                    return res.end();
+                }
+
+                if (match[2] !== "") {
+                    end = Number(match[2]);
+
+                    if (
+                        !Number.isSafeInteger(end) ||
+                        end < start
+                    ) {
+                        res.status(416);
+
+                        res.setHeader(
+                            "Content-Range",
+                            `bytes */${fileSize}`
+                        );
+
+                        return res.end();
+                    }
+
+                    end = Math.min(
+                        end,
+                        fileSize - 1
+                    );
+                }
+            }
+        }
+
+        const contentLength =
+            end - start + 1;
 
         res.setHeader(
             "Content-Type",
             mimeType
         );
 
-        if (document.size !== undefined) {
-            res.setHeader(
-                "Content-Length",
-                String(document.size)
-            );
-        }
-
         res.setHeader(
             "Accept-Ranges",
             "bytes"
         );
 
-        console.log(
-            `Streaming message ${messageId}: ` +
-            `${document.size} bytes`
+        res.setHeader(
+            "Cache-Control",
+            "public, max-age=31536000, immutable"
         );
+
+        if (range) {
+            res.status(206);
+
+            res.setHeader(
+                "Content-Range",
+                `bytes ${start}-${end}/${fileSize}`
+            );
+        }
+        else {
+            res.status(200);
+        }
+
+        res.setHeader(
+            "Content-Length",
+            String(contentLength)
+        );
+
+        console.log(
+            `Streaming ${messageId}: ` +
+            `${start}-${end} / ${fileSize}`
+        );
+
+        const chunkSize = 512 * 1024;
 
         for await (
             const chunk of client.iterDownload({
                 file: message.media,
-                chunkSize: 512 * 1024
+                offset: start,
+                limit: contentLength,
+                chunkSize
             })
         ) {
-            if (!res.write(
-                Buffer.from(chunk)
-            )) {
-                await new Promise(
-                    resolve =>
-                        res.once(
-                            "drain",
-                            resolve
-                        )
+            if (!res.write(Buffer.from(chunk))) {
+                await new Promise(resolve =>
+                    res.once("drain", resolve)
                 );
             }
         }

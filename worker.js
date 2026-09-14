@@ -1005,16 +1005,16 @@ export default {
                     "/media/"
                 )
             ) {
-
+            
                 const parts =
                     url.pathname
                         .split("/")
                         .filter(Boolean);
-
+            
                 if (
                     parts.length !== 3
                 ) {
-
+            
                     return new Response(
                         "Invalid media URL",
                         {
@@ -1022,22 +1022,22 @@ export default {
                         }
                     );
                 }
-
+            
                 const chatId =
                     decodeURIComponent(
                         parts[1]
                     );
-
+            
                 const messageId =
                     decodeURIComponent(
                         parts[2]
                     );
-
+            
                 if (
                     !chatId ||
                     !messageId
                 ) {
-
+            
                     return new Response(
                         "Missing chat or message ID",
                         {
@@ -1045,21 +1045,21 @@ export default {
                         }
                     );
                 }
-
+            
                 const client =
                     await getTelegramClient(
                         env
                     );
-
+            
                 const found =
                     await findTelegramMessage(
                         client,
                         chatId,
                         messageId
                     );
-
+            
                 if (!found) {
-
+            
                     return new Response(
                         "Chat not found",
                         {
@@ -1067,12 +1067,12 @@ export default {
                         }
                     );
                 }
-
+            
                 const message =
                     found.message;
-
+            
                 if (!message) {
-
+            
                     return new Response(
                         "Message not found",
                         {
@@ -1080,44 +1080,218 @@ export default {
                         }
                     );
                 }
-
-                if (
-                    !message.media ||
-                    !message.media.document
-                ) {
-
+            
+                const media =
+                    message.media;
+            
+                if (!media) {
+            
                     return new Response(
-                        "Message does not contain a Telegram document",
+                        "Message does not contain media",
                         {
                             status: 415
                         }
                     );
                 }
-
-                const document =
-                    message.media.document;
-
-                const size =
-                    Number(
-                        document.size
-                            .toString()
-                    );
-
+            
+                const isDocument =
+                    !!media.document;
+            
+                const isPhoto =
+                    !!media.photo;
+            
                 if (
-                    !Number.isSafeInteger(
-                        size
-                    ) ||
-                    size < 0
+                    !isDocument &&
+                    !isPhoto
                 ) {
-
+            
                     return new Response(
-                        "Unsupported file size",
+                        "Unsupported Telegram media type",
                         {
-                            status: 500
+                            status: 415
                         }
                     );
                 }
-
+            
+                let location;
+                let size;
+                let mimeType;
+            
+                if (isDocument) {
+            
+                    const document =
+                        media.document;
+            
+                    size =
+                        Number(
+                            document.size.toString()
+                        );
+            
+                    if (
+                        !Number.isSafeInteger(
+                            size
+                        ) ||
+                        size < 0
+                    ) {
+            
+                        return new Response(
+                            "Unsupported file size",
+                            {
+                                status: 500
+                            }
+                        );
+                    }
+            
+                    location =
+                        new Api.InputDocumentFileLocation({
+                            id:
+                                document.id,
+            
+                            accessHash:
+                                document.accessHash,
+            
+                            fileReference:
+                                document.fileReference,
+            
+                            thumbSize:
+                                ""
+                        });
+            
+                    mimeType =
+                        document.mimeType ||
+                        "application/octet-stream";
+            
+                } else {
+            
+                    const photo =
+                        media.photo;
+            
+                    const sizes =
+                        Array.isArray(
+                            photo.sizes
+                        )
+                            ? photo.sizes
+                            : [];
+            
+                    if (!sizes.length) {
+            
+                        return new Response(
+                            "Telegram photo has no downloadable sizes",
+                            {
+                                status: 500
+                            }
+                        );
+                    }
+            
+                    const downloadableSizes =
+                        sizes.filter(
+                            item =>
+                                item &&
+                                (
+                                    item.size != null ||
+                                    Array.isArray(
+                                        item.sizes
+                                    )
+                                )
+                        );
+            
+                    if (
+                        !downloadableSizes.length
+                    ) {
+            
+                        return new Response(
+                            "Telegram photo has no downloadable size",
+                            {
+                                status: 500
+                            }
+                        );
+                    }
+            
+                    const requestedThumb =
+                        url.searchParams.get(
+                            "thumb"
+                        );
+            
+                    let selectedSize;
+            
+                    if (requestedThumb === "1") {
+            
+                        selectedSize =
+                            downloadableSizes.find(
+                                item =>
+                                    item.type === "m"
+                            ) ||
+                            downloadableSizes.find(
+                                item =>
+                                    item.type === "x"
+                            ) ||
+                            downloadableSizes[
+                                0
+                            ];
+            
+                    } else {
+            
+                        selectedSize =
+                            downloadableSizes[
+                                downloadableSizes.length - 1
+                            ];
+                    }
+            
+                    let photoSize =
+                        selectedSize.size;
+            
+                    if (
+                        photoSize == null &&
+                        Array.isArray(
+                            selectedSize.sizes
+                        )
+                    ) {
+            
+                        photoSize =
+                            selectedSize.sizes[
+                                selectedSize.sizes.length - 1
+                            ];
+                    }
+            
+                    size =
+                        Number(
+                            photoSize
+                        );
+            
+                    if (
+                        !Number.isSafeInteger(
+                            size
+                        ) ||
+                        size < 0
+                    ) {
+            
+                        return new Response(
+                            "Unsupported Telegram photo size",
+                            {
+                                status: 500
+                            }
+                        );
+                    }
+            
+                    location =
+                        new Api.InputPhotoFileLocation({
+                            id:
+                                photo.id,
+            
+                            accessHash:
+                                photo.accessHash,
+            
+                            fileReference:
+                                photo.fileReference,
+            
+                            thumbSize:
+                                selectedSize.type
+                        });
+            
+                    mimeType =
+                        "image/jpeg";
+                }
+            
                 const range =
                     parseRange(
                         request.headers.get(
@@ -1125,19 +1299,19 @@ export default {
                         ),
                         size
                     );
-
+            
                 if (
                     request.headers.has(
                         "Range"
                     ) &&
                     !range
                 ) {
-
+            
                     return new Response(
                         null,
                         {
                             status: 416,
-
+            
                             headers: {
                                 "Content-Range":
                                     "bytes */" +
@@ -1146,117 +1320,101 @@ export default {
                         }
                     );
                 }
-
+            
                 const start =
                     range
                         ? range.start
                         : 0;
-
+            
                 const end =
                     range
                         ? range.end
                         : size - 1;
-
+            
                 const contentLength =
                     end -
                     start +
                     1;
-
-                const location =
-                    new Api.InputDocumentFileLocation({
-                        id:
-                            document.id,
-
-                        accessHash:
-                            document.accessHash,
-
-                        fileReference:
-                            document.fileReference,
-
-                        thumbSize:
-                            ""
-                    });
-
+            
                 const iter =
                     client.iterDownload({
                         file:
                             location,
-
+            
                         offset:
                             bigInt(
                                 start
                             ),
-
+            
                         limit:
                             bigInt(
                                 contentLength
                             ),
-
+            
                         requestSize:
                             512 * 1024
                     });
-
+            
                 const stream =
                     new ReadableStream({
-
+            
                         async start(
                             controller
                         ) {
-
+            
                             try {
-
+            
                                 for await (
                                     const chunk
                                     of iter
                                 ) {
-
+            
                                     controller.enqueue(
                                         new Uint8Array(
                                             chunk
                                         )
                                     );
                                 }
-
+            
                                 controller.close();
-
+            
                             } catch (error) {
-
+            
                                 controller.error(
                                     error
                                 );
                             }
                         }
-
+            
                     });
-
+            
                 const headers =
                     new Headers();
-
+            
                 headers.set(
                     "Content-Type",
-                    document.mimeType ||
-                    "application/octet-stream"
+                    mimeType
                 );
-
+            
                 headers.set(
                     "Accept-Ranges",
                     "bytes"
                 );
-
+            
                 headers.set(
                     "Content-Length",
                     String(
                         contentLength
                     )
                 );
-
+            
                 headers.set(
                     "Cache-Control",
                     "public, max-age=31536000, immutable"
                 );
-
+            
                 if (range) {
-
+            
                     headers.set(
                         "Content-Range",
                         "bytes " +
@@ -1267,7 +1425,7 @@ export default {
                         size
                     );
                 }
-
+            
                 return new Response(
                     stream,
                     {
@@ -1275,7 +1433,7 @@ export default {
                             range
                                 ? 206
                                 : 200,
-
+            
                         headers
                     }
                 );

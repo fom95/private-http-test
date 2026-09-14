@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Telegram HTTP Test</title>
+</head>
+<body>
+    <h1>Telegram HTTP Test</h1>
+    <p id="status">Testing...</p>
+
+    <script>
+        fetch("https://YOUR-RENDER-URL/")
+            .then(response => response.text())
+            .then(text => {
+                document.getElementById("status").textContent = text;
+            })
+            .catch(error => {
+                document.getElementById("status").textContent =
+                    "Error: " + error;
+            });
+    </script>
+</body>
+</html>

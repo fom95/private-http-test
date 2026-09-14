@@ -45,27 +45,28 @@ app.get("/api/chats", async (req, res) => {
 
         chatMap.clear();
 
-        const chats = dialogs.map(
-            (dialog, index) => {
+        const chats =
+            dialogs.map(
+                (dialog, index) => {
 
-                const id =
-                    String(dialog.id);
+                    const id =
+                        String(dialog.id);
 
-                chatMap.set(
-                    id,
-                    dialog
-                );
+                    chatMap.set(
+                        id,
+                        dialog
+                    );
 
-                return {
-                    index,
-                    id,
-                    title:
-                        dialog.title ||
-                        dialog.name ||
-                        "Untitled chat"
-                };
-            }
-        );
+                    return {
+                        index,
+                        id,
+                        title:
+                            dialog.title ||
+                            dialog.name ||
+                            "Untitled chat"
+                    };
+                }
+            );
 
         res.json(chats);
     }
@@ -173,19 +174,163 @@ app.get("/api/messages", async (req, res) => {
     }
 });
 
+async function getTelegramDocument(
+    dialog,
+    messageId
+) {
+    const messages =
+        await client.getMessages(
+            dialog,
+            {
+                ids: messageId
+            }
+        );
+
+    const message =
+        messages[0];
+
+    if (!message) {
+        throw new Error(
+            "Message not found."
+        );
+    }
+
+    if (!message.media) {
+        throw new Error(
+            "Message does not contain media."
+        );
+    }
+
+    if (!message.document) {
+        throw new Error(
+            "This test currently supports Telegram documents."
+        );
+    }
+
+    return {
+        message,
+        document:
+            message.document
+    };
+}
+
+async function downloadTelegramLocation(
+    location,
+    size
+) {
+    const chunks = [];
+
+    let offset = 0n;
+    let remaining = size;
+
+    const chunkSize =
+        512 * 1024;
+
+    while (remaining > 0) {
+
+        const limit =
+            Math.min(
+                chunkSize,
+                remaining
+            );
+
+        const downloaded = [];
+
+        for await (
+            const chunk of client.iterDownload({
+                file: location,
+                offset: bigInt(offset),
+                limit,
+                chunkSize
+            })
+        ) {
+            downloaded.push(
+                Buffer.from(chunk)
+            );
+        }
+
+        if (!downloaded.length) {
+            break;
+        }
+
+        let length = 0;
+
+        for (
+            const chunk of downloaded
+        ) {
+            length +=
+                chunk.length;
+        }
+
+        if (!length) {
+            break;
+        }
+
+        for (
+            const chunk of downloaded
+        ) {
+            chunks.push(chunk);
+        }
+
+        offset +=
+            BigInt(length);
+
+        remaining -=
+            length;
+
+        if (
+            length < limit
+        ) {
+            break;
+        }
+    }
+
+    const total =
+        chunks.reduce(
+            (sum, chunk) =>
+                sum + chunk.length,
+            0
+        );
+
+    const result =
+        Buffer.allocUnsafe(total);
+
+    let position = 0;
+
+    for (
+        const chunk of chunks
+    ) {
+        chunk.copy(
+            result,
+            position
+        );
+
+        position +=
+            chunk.length;
+    }
+
+    return result;
+}
+
 app.get(
     "/media/:chatId/:messageId",
     async (req, res) => {
+
         try {
+
             const chatId =
                 String(req.params.chatId);
 
             const messageId =
-                Number(req.params.messageId);
+                Number(
+                    req.params.messageId
+                );
 
             if (
                 !chatId ||
-                !Number.isSafeInteger(messageId) ||
+                !Number.isSafeInteger(
+                    messageId
+                ) ||
                 messageId <= 0
             ) {
                 return res.status(400).send(
@@ -202,43 +347,226 @@ app.get(
                 );
             }
 
-            const messages =
-                await client.getMessages(
+            const {
+                message,
+                document
+            } =
+                await getTelegramDocument(
                     dialog,
-                    {
-                        ids: messageId
+                    messageId
+                );
+
+            const mimeType =
+                document.mimeType ||
+                "application/octet-stream";
+
+            /*
+             * Thumbnail request.
+             *
+             * This deliberately does not use HTTP Range.
+             * Telegram's document thumbnail is a separate
+             * file location inside the document metadata.
+             */
+            if (
+                req.query.thumb === "1"
+            ) {
+
+                const thumbs =
+                    Array.isArray(
+                        document.thumbs
+                    )
+                        ? document.thumbs
+                        : [];
+
+                const usableThumbs =
+                    thumbs.filter(
+                        thumb =>
+                            thumb &&
+                            (
+                                thumb._ ===
+                                    "photoSize" ||
+                                thumb._ ===
+                                    "photoCachedSize"
+                            )
+                    );
+
+                if (!usableThumbs.length) {
+                    return res.status(404).send(
+                        "Telegram document has no usable thumbnail."
+                    );
+                }
+
+                const thumbnail =
+                    usableThumbs
+                        .slice()
+                        .sort(
+                            (a, b) =>
+                                (
+                                    (a.w || 0) *
+                                    (a.h || 0)
+                                ) -
+                                (
+                                    (b.w || 0) *
+                                    (b.h || 0)
+                                )
+                        )[0];
+
+                /*
+                 * Cached thumbnails already contain
+                 * their complete bytes.
+                 */
+                if (
+                    thumbnail._ ===
+                        "photoCachedSize"
+                ) {
+
+                    if (
+                        !thumbnail.bytes ||
+                        !thumbnail.bytes.byteLength
+                    ) {
+                        return res.status(404).send(
+                            "Telegram cached thumbnail contains no data."
+                        );
                     }
+
+                    const buffer =
+                        Buffer.from(
+                            thumbnail.bytes
+                        );
+
+                    res.status(200);
+
+                    res.setHeader(
+                        "Content-Type",
+                        "image/jpeg"
+                    );
+
+                    res.setHeader(
+                        "Content-Length",
+                        String(buffer.length)
+                    );
+
+                    res.setHeader(
+                        "Cache-Control",
+                        "public, max-age=31536000, immutable"
+                    );
+
+                    res.setHeader(
+                        "Accept-Ranges",
+                        "bytes"
+                    );
+
+                    return res.end(
+                        buffer
+                    );
+                }
+
+                if (
+                    !document.fileReference
+                ) {
+                    return res.status(500).send(
+                        "Telegram document has no file reference."
+                    );
+                }
+
+                const location = {
+                    _:
+                        "inputDocumentFileLocation",
+
+                    id:
+                        document.id,
+
+                    access_hash:
+                        document.accessHash ??
+                        document.access_hash,
+
+                    file_reference:
+                        document.fileReference ??
+                        document.file_reference,
+
+                    thumb_size:
+                        thumbnail.type || ""
+                };
+
+                console.log(
+                    `Streaming thumbnail ${messageId}: ` +
+                    `${thumbnail.w || 0}x${thumbnail.h || 0}`
                 );
 
-            const message =
-                messages[0];
+                const chunks = [];
 
-            if (!message) {
-                return res.status(404).send(
-                    "Message not found."
+                for await (
+                    const chunk of client.iterDownload({
+                        file: location,
+                        offset: bigInt(0),
+                        limit: 512 * 1024,
+                        chunkSize: 512 * 1024
+                    })
+                ) {
+                    chunks.push(
+                        Buffer.from(chunk)
+                    );
+                }
+
+                const total =
+                    chunks.reduce(
+                        (sum, chunk) =>
+                            sum + chunk.length,
+                        0
+                    );
+
+                if (!total) {
+                    return res.status(404).send(
+                        "Telegram returned an empty thumbnail."
+                    );
+                }
+
+                const buffer =
+                    Buffer.concat(
+                        chunks,
+                        total
+                    );
+
+                res.status(200);
+
+                res.setHeader(
+                    "Content-Type",
+                    "image/jpeg"
+                );
+
+                res.setHeader(
+                    "Content-Length",
+                    String(buffer.length)
+                );
+
+                res.setHeader(
+                    "Cache-Control",
+                    "public, max-age=31536000, immutable"
+                );
+
+                res.setHeader(
+                    "Accept-Ranges",
+                    "bytes"
+                );
+
+                return res.end(
+                    buffer
                 );
             }
 
-            if (!message.media) {
-                return res.status(400).send(
-                    "Message does not contain media."
-                );
-            }
-
-            if (!message.document) {
-                return res.status(400).send(
-                    "This test currently supports Telegram documents."
-                );
-            }
-
-            const document =
-                message.document;
+            /*
+             * Normal full-file request.
+             */
 
             const fileSize =
-                Number(document.size);
+                Number(
+                    document.size
+                );
 
             if (
-                !Number.isSafeInteger(fileSize) ||
+                !Number.isSafeInteger(
+                    fileSize
+                ) ||
                 fileSize < 0
             ) {
                 return res.status(500).send(
@@ -246,17 +574,15 @@ app.get(
                 );
             }
 
-            const mimeType =
-                document.mimeType ||
-                "application/octet-stream";
-
             const range =
                 req.headers.range;
 
             let start = 0;
-            let end = fileSize - 1;
+            let end =
+                fileSize - 1;
 
             if (range) {
+
                 const match =
                     /^bytes=(\d*)-(\d*)$/.exec(
                         range
@@ -277,9 +603,14 @@ app.get(
                     );
                 }
 
-                if (match[1] === "") {
+                if (
+                    match[1] === ""
+                ) {
+
                     const suffixLength =
-                        Number(match[2]);
+                        Number(
+                            match[2]
+                        );
 
                     if (
                         !Number.isSafeInteger(
@@ -292,14 +623,19 @@ app.get(
                         );
                     }
 
-                    start = Math.max(
-                        0,
-                        fileSize - suffixLength
-                    );
+                    start =
+                        Math.max(
+                            0,
+                            fileSize -
+                                suffixLength
+                        );
                 }
                 else {
+
                     start =
-                        Number(match[1]);
+                        Number(
+                            match[1]
+                        );
 
                     if (
                         !Number.isSafeInteger(
@@ -307,6 +643,7 @@ app.get(
                         ) ||
                         start >= fileSize
                     ) {
+
                         res.status(416);
 
                         res.setHeader(
@@ -317,9 +654,14 @@ app.get(
                         return res.end();
                     }
 
-                    if (match[2] !== "") {
+                    if (
+                        match[2] !== ""
+                    ) {
+
                         end =
-                            Number(match[2]);
+                            Number(
+                                match[2]
+                            );
 
                         if (
                             !Number.isSafeInteger(
@@ -327,6 +669,7 @@ app.get(
                             ) ||
                             end < start
                         ) {
+
                             res.status(416);
 
                             res.setHeader(
@@ -337,10 +680,11 @@ app.get(
                             return res.end();
                         }
 
-                        end = Math.min(
-                            end,
-                            fileSize - 1
-                        );
+                        end =
+                            Math.min(
+                                end,
+                                fileSize - 1
+                            );
                     }
                 }
             }
@@ -364,15 +708,19 @@ app.get(
             );
 
             if (range) {
+
                 res.status(206);
 
                 res.setHeader(
                     "Content-Range",
                     `bytes ${start}-${end}/${fileSize}`
                 );
+
             }
             else {
+
                 res.status(200);
+
             }
 
             res.setHeader(
@@ -396,9 +744,13 @@ app.get(
                     chunkSize
                 })
             ) {
-                if (!res.write(
-                    Buffer.from(chunk)
-                )) {
+
+                if (
+                    !res.write(
+                        Buffer.from(chunk)
+                    )
+                ) {
+
                     await new Promise(
                         resolve =>
                             res.once(
@@ -406,25 +758,33 @@ app.get(
                                 resolve
                             )
                     );
+
                 }
             }
 
             res.end();
         }
         catch (error) {
+
             console.error(
                 "Media request failed:",
                 error
             );
 
             if (!res.headersSent) {
+
                 res.status(500).send(
                     error?.message ||
                     String(error)
                 );
+
             }
             else {
-                res.destroy(error);
+
+                res.destroy(
+                    error
+                );
+
             }
         }
     }
@@ -438,17 +798,22 @@ app.get("/", (req, res) => {
 
 startTelegram()
     .then(() => {
+
         app.listen(
             PORT,
             "0.0.0.0",
             () => {
+
                 console.log(
                     `Server listening on port ${PORT}`
                 );
+
             }
         );
+
     })
     .catch(error => {
+
         console.error(
             "Startup failed:",
             error

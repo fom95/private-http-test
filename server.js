@@ -1,5 +1,5 @@
 const express = require("express");
-const { TelegramClient } = require("telegram");
+const { TelegramClient, Api } = require("telegram");
 const bigInt = require("big-integer");
 const { StringSession } = require("telegram/sessions");
 
@@ -456,22 +456,37 @@ app.get(
                     while (true) {
                     
                         const result =
-                            await client.invoke({
-                                _: "upload.getFile",
+                            await client.invoke(
+                                new Api.upload.GetFile({
+                                    precise: true,
                     
-                                precise: true,
+                                    location:
+                                        new Api.InputDocumentFileLocation({
+                                            id:
+                                                document.id,
                     
-                                location,
+                                            accessHash:
+                                                document.accessHash,
                     
-                                offset,
+                                            fileReference:
+                                                document.fileReference,
                     
-                                limit: 512 * 1024,
+                                            thumbSize:
+                                                thumbnail.type || ""
+                                        }),
                     
-                                cdn_supported: true
-                            });
+                                    offset,
+                    
+                                    limit:
+                                        512 * 1024,
+                    
+                                    cdnSupported:
+                                        true
+                                })
+                            );
                     
                         if (
-                            result?._ !==
+                            result?.className !==
                             "upload.file"
                         ) {
                             throw new Error(

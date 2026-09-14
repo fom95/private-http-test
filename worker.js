@@ -1,5 +1,6 @@
-import { TelegramClient } from "telegram";
+import { TelegramClient, Api } from "telegram";
 import { StringSession } from "telegram/sessions";
+import bigInt from "big-integer";
 
 async function getTelegramClient(env) {
 
@@ -86,6 +87,138 @@ function errorInfo(error) {
 
         constructor:
             error?.constructor?.name ??
+            null
+    };
+}
+
+function parseRange(rangeHeader, size) {
+
+    if (!rangeHeader) {
+        return null;
+    }
+
+    const match =
+        /^bytes=(\d*)-(\d*)$/i.exec(
+            rangeHeader.trim()
+        );
+
+    if (!match) {
+        return null;
+    }
+
+    let start;
+    let end;
+
+    if (match[1] === "") {
+
+        const suffixLength =
+            Number(match[2]);
+
+        if (
+            !Number.isSafeInteger(
+                suffixLength
+            ) ||
+            suffixLength <= 0
+        ) {
+            return null;
+        }
+
+        start =
+            Math.max(
+                0,
+                size - suffixLength
+            );
+
+        end =
+            size - 1;
+
+    } else {
+
+        start =
+            Number(match[1]);
+
+        if (
+            !Number.isSafeInteger(
+                start
+            ) ||
+            start < 0 ||
+            start >= size
+        ) {
+            return null;
+        }
+
+        if (match[2] === "") {
+
+            end =
+                size - 1;
+
+        } else {
+
+            end =
+                Number(match[2]);
+
+            if (
+                !Number.isSafeInteger(
+                    end
+                ) ||
+                end < start
+            ) {
+                return null;
+            }
+
+            end =
+                Math.min(
+                    end,
+                    size - 1
+                );
+        }
+    }
+
+    return {
+        start,
+        end
+    };
+}
+
+async function findTelegramMessage(
+    client,
+    chatId,
+    messageId
+) {
+
+    const dialogs =
+        await client.getDialogs(
+            {}
+        );
+
+    const dialog =
+        dialogs.find(
+            item =>
+                String(item.id) ===
+                String(chatId)
+        );
+
+    if (!dialog) {
+        return null;
+    }
+
+    const inputEntity =
+        await client.getInputEntity(
+            dialog
+        );
+
+    const messages =
+        await client.getMessages(
+            inputEntity,
+            {
+                ids: Number(messageId)
+            }
+        );
+
+    return {
+        dialog,
+        message:
+            messages?.[0] ??
             null
     };
 }
@@ -550,6 +683,26 @@ messageSelect.addEventListener(
             return;
         }
 
+        let mediaLink =
+            "";
+
+        if (message.hasMedia) {
+
+            mediaLink =
+                "<br><br>" +
+                '<a href="/media/' +
+                encodeURIComponent(
+                    chatSelect.value
+                ) +
+                "/" +
+                encodeURIComponent(
+                    message.id
+                ) +
+                '" target="_blank">' +
+                "Open media" +
+                "</a>";
+        }
+
         messageInfo.style.display =
             "block";
 
@@ -567,6 +720,7 @@ messageSelect.addEventListener(
                     ? message.mediaType
                     : "None"
             ) +
+            mediaLink +
             "<br><br><strong>Text:</strong>" +
             "<pre>" +
             escapeHtml(
@@ -843,6 +997,287 @@ export default {
 
                 return json(
                     output
+                );
+            }
+
+            if (
+                url.pathname.startsWith(
+                    "/media/"
+                )
+            ) {
+
+                const parts =
+                    url.pathname
+                        .split("/")
+                        .filter(Boolean);
+
+                if (
+                    parts.length !== 3
+                ) {
+
+                    return new Response(
+                        "Invalid media URL",
+                        {
+                            status: 400
+                        }
+                    );
+                }
+
+                const chatId =
+                    decodeURIComponent(
+                        parts[1]
+                    );
+
+                const messageId =
+                    decodeURIComponent(
+                        parts[2]
+                    );
+
+                if (
+                    !chatId ||
+                    !messageId
+                ) {
+
+                    return new Response(
+                        "Missing chat or message ID",
+                        {
+                            status: 400
+                        }
+                    );
+                }
+
+                const client =
+                    await getTelegramClient(
+                        env
+                    );
+
+                const found =
+                    await findTelegramMessage(
+                        client,
+                        chatId,
+                        messageId
+                    );
+
+                if (!found) {
+
+                    return new Response(
+                        "Chat not found",
+                        {
+                            status: 404
+                        }
+                    );
+                }
+
+                const message =
+                    found.message;
+
+                if (!message) {
+
+                    return new Response(
+                        "Message not found",
+                        {
+                            status: 404
+                        }
+                    );
+                }
+
+                if (
+                    !message.media ||
+                    !message.media.document
+                ) {
+
+                    return new Response(
+                        "Message does not contain a Telegram document",
+                        {
+                            status: 415
+                        }
+                    );
+                }
+
+                const document =
+                    message.media.document;
+
+                const size =
+                    Number(
+                        document.size
+                            .toString()
+                    );
+
+                if (
+                    !Number.isSafeInteger(
+                        size
+                    ) ||
+                    size < 0
+                ) {
+
+                    return new Response(
+                        "Unsupported file size",
+                        {
+                            status: 500
+                        }
+                    );
+                }
+
+                const range =
+                    parseRange(
+                        request.headers.get(
+                            "Range"
+                        ),
+                        size
+                    );
+
+                if (
+                    request.headers.has(
+                        "Range"
+                    ) &&
+                    !range
+                ) {
+
+                    return new Response(
+                        null,
+                        {
+                            status: 416,
+
+                            headers: {
+                                "Content-Range":
+                                    "bytes */" +
+                                    size
+                            }
+                        }
+                    );
+                }
+
+                const start =
+                    range
+                        ? range.start
+                        : 0;
+
+                const end =
+                    range
+                        ? range.end
+                        : size - 1;
+
+                const contentLength =
+                    end -
+                    start +
+                    1;
+
+                const location =
+                    new Api.InputDocumentFileLocation({
+                        id:
+                            document.id,
+
+                        accessHash:
+                            document.accessHash,
+
+                        fileReference:
+                            document.fileReference,
+
+                        thumbSize:
+                            ""
+                    });
+
+                const iter =
+                    client.iterDownload({
+                        file:
+                            location,
+
+                        offset:
+                            bigInt(
+                                start
+                            ),
+
+                        limit:
+                            bigInt(
+                                contentLength
+                            ),
+
+                        requestSize:
+                            512 * 1024
+                    });
+
+                const stream =
+                    new ReadableStream({
+
+                        async start(
+                            controller
+                        ) {
+
+                            try {
+
+                                for await (
+                                    const chunk
+                                    of iter
+                                ) {
+
+                                    controller.enqueue(
+                                        new Uint8Array(
+                                            chunk
+                                        )
+                                    );
+                                }
+
+                                controller.close();
+
+                            } catch (error) {
+
+                                controller.error(
+                                    error
+                                );
+                            }
+                        }
+
+                    });
+
+                const headers =
+                    new Headers();
+
+                headers.set(
+                    "Content-Type",
+                    document.mimeType ||
+                    "application/octet-stream"
+                );
+
+                headers.set(
+                    "Accept-Ranges",
+                    "bytes"
+                );
+
+                headers.set(
+                    "Content-Length",
+                    String(
+                        contentLength
+                    )
+                );
+
+                headers.set(
+                    "Cache-Control",
+                    "public, max-age=31536000, immutable"
+                );
+
+                if (range) {
+
+                    headers.set(
+                        "Content-Range",
+                        "bytes " +
+                        start +
+                        "-" +
+                        end +
+                        "/" +
+                        size
+                    );
+                }
+
+                return new Response(
+                    stream,
+                    {
+                        status:
+                            range
+                                ? 206
+                                : 200,
+
+                        headers
+                    }
                 );
             }
 

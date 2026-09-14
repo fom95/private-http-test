@@ -1,31 +1,49 @@
 export default {
     async fetch(request, env) {
+        try {
+            const apiId =
+                await env.API_ID.get();
 
-        const apiId =
-            await env.TELEGRAM_SECRETS
-                .get("API_ID");
+            const apiHash =
+                await env.API_HASH.get();
 
-        const apiHash =
-            await env.TELEGRAM_SECRETS
-                .get("API_HASH");
+            const session =
+                await env.TELEGRAM_SESSION.get();
 
-        const session =
-            await env.TELEGRAM_SECRETS
-                .get("TELEGRAM_SESSION");
-
-        return new Response(
-            JSON.stringify({
-                worker: true,
-                apiId: !!apiId,
-                apiHash: !!apiHash,
-                session: !!session
-            }),
-            {
-                headers: {
-                    "Content-Type":
-                        "application/json"
+            return new Response(
+                JSON.stringify({
+                    worker: true,
+                    apiId: !!apiId,
+                    apiHash: !!apiHash,
+                    session: !!session
+                }),
+                {
+                    headers: {
+                        "Content-Type": "application/json"
+                    }
                 }
-            }
-        );
+            );
+        }
+        catch (error) {
+            return new Response(
+                JSON.stringify({
+                    error:
+                        error?.message ||
+                        String(error),
+                    name:
+                        error?.name ||
+                        null,
+                    stack:
+                        error?.stack ||
+                        null
+                }),
+                {
+                    status: 500,
+                    headers: {
+                        "Content-Type": "application/json"
+                    }
+                }
+            );
+        }
     }
 };

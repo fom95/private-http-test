@@ -841,10 +841,10 @@ async function handleMediaRequest(
             "Range"
         );
 
-    let start =
+    let rangeStart =
         0;
 
-    let end =
+    let rangeEnd =
         fileSize - 1;
 
     let status =
@@ -878,7 +878,7 @@ async function handleMediaRequest(
             match[1]
         ) {
 
-            start =
+            rangeStart =
                 Number(
                     match[1]
                 );
@@ -888,14 +888,14 @@ async function handleMediaRequest(
             match[2]
         ) {
 
-            end =
+            rangeEnd =
                 Number(
                     match[2]
                 );
 
         } else {
 
-            end =
+            rangeEnd =
                 fileSize - 1;
         }
 
@@ -904,25 +904,31 @@ async function handleMediaRequest(
             match[2]
         ) {
 
-            const length =
+            const requestedLength =
                 Number(
                     match[2]
                 );
 
-            start =
+            rangeStart =
                 Math.max(
                     0,
                     fileSize -
-                    length
+                    requestedLength
                 );
 
-            end =
+            rangeEnd =
                 fileSize - 1;
         }
 
         if (
-            start > end ||
-            start >= fileSize
+            !Number.isSafeInteger(
+                rangeStart
+            ) ||
+            !Number.isSafeInteger(
+                rangeEnd
+            ) ||
+            rangeStart > rangeEnd ||
+            rangeStart >= fileSize
         ) {
 
             return new Response(
@@ -938,9 +944,9 @@ async function handleMediaRequest(
             );
         }
 
-        end =
+        rangeEnd =
             Math.min(
-                end,
+                rangeEnd,
                 fileSize - 1
             );
 
@@ -948,11 +954,11 @@ async function handleMediaRequest(
             206;
     }
 
-    const contentLength =
+    const responseLength =
         fileSize === 0
             ? 0
-            : end -
-              start +
+            : rangeEnd -
+              rangeStart +
               1;
 
     const headers =
@@ -971,7 +977,7 @@ async function handleMediaRequest(
     headers.set(
         "Content-Length",
         String(
-            contentLength
+            responseLength
         )
     );
 
@@ -986,7 +992,7 @@ async function handleMediaRequest(
 
         headers.set(
             "Content-Range",
-            `bytes ${start}-${end}/${fileSize}`
+            `bytes ${rangeStart}-${rangeEnd}/${fileSize}`
         );
     }
 
@@ -1009,12 +1015,15 @@ async function handleMediaRequest(
             fileId,
             {
                 offset:
-                    start,
+                    rangeStart,
 
                 signal:
                     request.signal
             }
         );
+
+    let bytesSent =
+        0;
 
     const stream =
         new ReadableStream({
@@ -1024,6 +1033,16 @@ async function handleMediaRequest(
             ) {
 
                 try {
+
+                    if (
+                        bytesSent >=
+                        responseLength
+                    ) {
+
+                        controller.close();
+
+                        return;
+                    }
 
                     const result =
                         await iterator.next();
@@ -1037,37 +1056,39 @@ async function handleMediaRequest(
                         return;
                     }
 
-                    const chunk =
+                    let chunk =
                         result.value;
 
                     const remaining =
-                        end -
-                        start +
-                        1;
+                        responseLength -
+                        bytesSent;
 
                     if (
                         chunk.byteLength >
                         remaining
                     ) {
 
-                        controller.enqueue(
+                        chunk =
                             chunk.slice(
                                 0,
                                 remaining
-                            )
-                        );
-
-                        controller.close();
-
-                        return;
+                            );
                     }
 
                     controller.enqueue(
                         chunk
                     );
 
-                    start +=
+                    bytesSent +=
                         chunk.byteLength;
+
+                    if (
+                        bytesSent >=
+                        responseLength
+                    ) {
+
+                        controller.close();
+                    }
 
                 } catch (
                     error

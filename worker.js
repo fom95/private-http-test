@@ -1534,18 +1534,43 @@ async function handleApi(
         url.pathname;
 
     if (path === "/api/chats") {
+        const start =
+            Date.now();
+
+        const clientStart =
+            Date.now();
+
         const client =
             await createClient(env);
 
+        const clientTime =
+            Date.now() -
+            clientStart;
+
         try {
+            const chatsStart =
+                Date.now();
+
             const chats =
                 await client.getChats({
                     from: "main",
                     limit: 100
                 });
 
+            const chatsTime =
+                Date.now() -
+                chatsStart;
+
             return json({
                 success: true,
+                timings: {
+                    createClient:
+                        `${clientTime} ms`,
+                    getChats:
+                        `${chatsTime} ms`,
+                    total:
+                        `${Date.now() - start} ms`
+                },
                 chats:
                     chats.map(item => {
                         const chat =
@@ -1729,7 +1754,7 @@ async function handleApi(
             });
         } finally {
             try {
-                await client.disconnect();
+                await client.disconnect(); 
             } catch {}
         }
     }
@@ -1860,7 +1885,7 @@ async function handleApi(
             });
         } finally {
             try {
-                await client.disconnect();
+                await client.disconnect(); 
             } catch {}
         }
     }

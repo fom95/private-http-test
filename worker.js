@@ -17,23 +17,85 @@ function json(data, status = 200, extraHeaders = {}) {
 }
 
 class CloudflareKVStorage {
-    constructor(kv, prefix = "mtkruto") {
+    constructor(kv, id = null, prefix = "mtkruto") {
         this.kv = kv;
+        this._id = id;
         this.prefix = prefix;
     }
 
-    key(parts) {
-        return this.prefix + ":" + parts.map(part => {
-            if (typeof part === "bigint") {
-                return "b:" + part.toString();
-            }
+    get supportsFiles() {
+        return false;
+    }
 
-            if (typeof part === "number") {
-                return "n:" + part;
-            }
+    get mustSerialize() {
+        return true;
+    }
 
-            return "s:" + encodeURIComponent(String(part));
-        }).join(":");
+    get isMemory() {
+        return false;
+    }
+
+    branch(id) {
+        const branchId =
+            this._id !== null
+                ? `${this._id}S__${id}`
+                : id;
+
+        return new CloudflareKVStorage(
+            this.kv,
+            branchId,
+            this.prefix
+        );
+    }
+
+    async initialize() {}
+
+    async close() {}
+
+    fixKey(key) {
+        if (this._id !== null) {
+            return ["__S" + this._id, ...key];
+        }
+
+        return key;
+    }
+
+    encodePart(part) {
+        if (typeof part === "bigint") {
+            return `b:${part}`;
+        }
+
+        if (typeof part === "number") {
+            return `n:${part}`;
+        }
+
+        return `s:${encodeURIComponent(part)}`;
+    }
+
+    decodePart(part) {
+        const type = part.slice(0, 2);
+        const value = part.slice(2);
+
+        if (type === "b:") {
+            return BigInt(value);
+        }
+
+        if (type === "n:") {
+            return Number(value);
+        }
+
+        if (type === "s:") {
+            return decodeURIComponent(value);
+        }
+
+        throw new Error(`Invalid MTKruto storage key part: ${part}`);
+    }
+
+    makeKey(key) {
+        return this.prefix + ":" +
+            this.fixKey(key)
+                .map(part => this.encodePart(part))
+                .join(":");
     }
 
     decodeKey(key) {
@@ -43,143 +105,107 @@ class CloudflareKVStorage {
             return null;
         }
 
-        return key.slice(prefix.length).split(":").map(part => {
-            const type = part.slice(0, 2);
-            const value = part.slice(2);
+        return key
+            .slice(prefix.length)
+            .split(":")
+            .map(part => this.decodePart(part));
+    }
 
-            if (type === "b:") {
-                return BigInt(value);
+    serialize(value) {
+        return JSON.stringify(value, (_, value) => {
+            if (typeof value === "bigint") {
+                return {
+                    __mtkruto_type: "bigint",
+                    value: value.toString()
+                };
             }
 
-            if (type === "n:") {
-                return Number(value);
+            if (value instanceof Uint8Array) {
+                return {
+                    __mtkruto_type: "uint8array",
+                    value: Array.from(value)
+                };
             }
 
-            if (type === "s:") {
-                return decodeURIComponent(value);
+            if (value instanceof ArrayBuffer) {
+                return {
+                    __mtkruto_type: "arraybuffer",
+                    value: Array.from(new Uint8Array(value))
+                };
             }
 
             return value;
         });
     }
 
-    branch(id) {
-        return new CloudflareKVStorage(
-            this.kv,
-            this.prefix + ":branch:" + encodeURIComponent(id)
-        );
-    }
-
-    async initialize() {}
-
-    async close() {}
-
-    get isMemory() {
-        return false;
-    }
-
-    get mustSerialize() {
-        return true;
-    }
-
-    get supportsFiles() {
-        return false;
-    }
-
-    async get(key) {
-        const value = await this.kv.get(this.key(key));
-    
-        if (value === null) {
-            return null;
-        }
-    
+    deserialize(value) {
         return JSON.parse(value, (_, value) => {
             if (
                 value &&
                 typeof value === "object" &&
-                "__mtkruto_bigint__" in value
+                value.__mtkruto_type === "bigint"
             ) {
-                return BigInt(value.__mtkruto_bigint__);
+                return BigInt(value.value);
             }
-    
+
+            if (
+                value &&
+                typeof value === "object" &&
+                value.__mtkruto_type === "uint8array"
+            ) {
+                return new Uint8Array(value.value);
+            }
+
+            if (
+                value &&
+                typeof value === "object" &&
+                value.__mtkruto_type === "arraybuffer"
+            ) {
+                return new Uint8Array(value.value).buffer;
+            }
+
             return value;
         });
     }
 
-    async set(key, value) {
-        await this.kv.put(
-            this.key(key),
-            JSON.stringify(value, (_, value) =>
-                typeof value === "bigint"
-                    ? { __mtkruto_bigint__: value.toString() }
-                    : value
-            )
-        );
-    }
+    async get(key) {
+        const value =
+            await this.kv.get(
+                this.makeKey(key)
+            );
 
-    async incr(key, by) {
-        const kvKey =
-            this.key(key);
-
-        const current =
-            await this.kv.get(kvKey);
-
-        let value =
-            current === null
-                ? 0
-                : Number(
-                    JSON.parse(current)
-                );
-
-        if (!Number.isFinite(value)) {
-            value = 0;
+        if (value === null) {
+            return null;
         }
 
-        value += by;
-
-        await this.kv.put(
-            kvKey,
-            JSON.stringify(value)
-        );
+        return this.deserialize(value);
     }
 
     async *getMany(filter, params = {}) {
         let prefix;
 
         if ("prefix" in filter) {
-            prefix =
-                this.key(filter.prefix);
+            prefix = this.makeKey(filter.prefix);
         } else {
-            prefix =
-                this.prefix + ":";
+            prefix = this.prefix + ":";
         }
 
-        let cursor = undefined;
+        let cursor;
 
         do {
             const result =
                 await this.kv.list({
                     prefix,
-                    limit:
-                        params.limit || 1000,
-                    ...(cursor
-                        ? { cursor }
-                        : {})
+                    limit: params.limit || 1000,
+                    ...(cursor ? { cursor } : {})
                 });
 
-            const keys =
-                result.keys || [];
-
             const names =
-                keys.map(
-                    item => item.name
-                );
+                result.keys.map(item => item.name);
 
             const values =
                 names.length
-                    ? await this.kv.get(
-                        names
-                    )
+                    ? await this.kv.get(names)
                     : new Map();
 
             for (const name of names) {
@@ -190,53 +216,69 @@ class CloudflareKVStorage {
                     continue;
                 }
 
-                if (
-                    "prefix" in filter &&
-                    decoded.length <
-                        filter.prefix.length
-                ) {
-                    continue;
-                }
-
-                if (
-                    "prefix" in filter &&
-                    !filter.prefix.every(
-                        (part, index) =>
-                            decoded[index] ===
-                            part
-                    )
-                ) {
-                    continue;
-                }
-
                 const value =
                     values.get(name);
-                
-                if (value !== null) {
-                    yield [
-                        decoded,
-                        JSON.parse(value, (_, value) => {
-                            if (
-                                value &&
-                                typeof value === "object" &&
-                                "__mtkruto_bigint__" in value
-                            ) {
-                                return BigInt(value.__mtkruto_bigint__);
-                            }
-                
-                            return value;
-                        })
-                    ];
+
+                if (value === null || value === undefined) {
+                    continue;
                 }
+
+                const fixed =
+                    this._id !== null
+                        ? decoded.slice(1)
+                        : decoded;
+
+                yield [
+                    fixed,
+                    this.deserialize(value)
+                ];
             }
 
             if (result.list_complete) {
                 break;
             }
 
-            cursor =
-                result.cursor;
+            cursor = result.cursor;
         } while (cursor);
+    }
+
+    async set(key, value) {
+        const kvKey =
+            this.makeKey(key);
+
+        if (value === null) {
+            await this.kv.delete(kvKey);
+            return;
+        }
+
+        await this.kv.put(
+            kvKey,
+            this.serialize(value)
+        );
+    }
+
+    async incr(key, by) {
+        const kvKey =
+            this.makeKey(key);
+
+        const current =
+            await this.kv.get(kvKey);
+
+        let value =
+            current === null
+                ? 0
+                : Number(
+                    this.deserialize(current)
+                );
+
+        if (!Number.isFinite(value)) {
+            value = 0;
+        }
+
+        await this.kv.put(
+            kvKey,
+            this.serialize(value + by)
+        );
     }
 }
 
@@ -250,7 +292,9 @@ async function createClient(env) {
     }
 
     if (!env.MTKRUTO_CACHE) {
-        throw new Error("MTKRUTO_CACHE KV binding is not configured.");
+        throw new Error(
+            "MTKRUTO_CACHE KV binding is not configured."
+        );
     }
 
     const storage =

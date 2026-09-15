@@ -87,20 +87,33 @@ class CloudflareKVStorage {
     }
 
     async get(key) {
-        return await this.kv.get(
-            this.key(key)
-        );
+        const value = await this.kv.get(this.key(key));
+    
+        if (value === null) {
+            return null;
+        }
+    
+        return JSON.parse(value, (_, value) => {
+            if (
+                value &&
+                typeof value === "object" &&
+                "__mtkruto_bigint__" in value
+            ) {
+                return BigInt(value.__mtkruto_bigint__);
+            }
+    
+            return value;
+        });
     }
 
     async set(key, value) {
-        const stored =
-            typeof value === "string"
-                ? value
-                : JSON.stringify(value);
-
         await this.kv.put(
             this.key(key),
-            stored
+            JSON.stringify(value, (_, value) =>
+                typeof value === "bigint"
+                    ? { __mtkruto_bigint__: value.toString() }
+                    : value
+            )
         );
     }
 
@@ -198,11 +211,21 @@ class CloudflareKVStorage {
 
                 const value =
                     values.get(name);
-
+                
                 if (value !== null) {
                     yield [
                         decoded,
-                        value
+                        JSON.parse(value, (_, value) => {
+                            if (
+                                value &&
+                                typeof value === "object" &&
+                                "__mtkruto_bigint__" in value
+                            ) {
+                                return BigInt(value.__mtkruto_bigint__);
+                            }
+                
+                            return value;
+                        })
                     ];
                 }
             }

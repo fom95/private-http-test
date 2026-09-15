@@ -225,61 +225,114 @@ async function getMessages(
     chatId
 ) {
 
-    const messages =
-        await client.getHistory(
-            chatId,
-            {
-                limit:
-                    100
-            }
-        );
+    try {
 
-    return messages.map(
-        message => {
+        const messages =
+            await client.getHistory(
+                chatId,
+                {
+                    limit:
+                        100
+                }
+            );
 
-            const media =
-                getMessageMediaInfo(
-                    message
-                );
+        return {
+            success:
+                true,
 
-            return {
-                id:
-                    String(
-                        message.id
-                    ),
+            chatId:
+                String(
+                    chatId
+                ),
 
-                date:
-                    message.date
-                        ? new Date(
-                            message.date *
-                            1000
-                        ).toISOString()
-                        : null,
+            count:
+                messages.length,
 
-                text:
-                    message.text ||
-                    "",
+            messages:
+                messages.map(
+                    message => {
 
-                hasMedia:
-                    media.hasMedia,
+                        const media =
+                            getMessageMediaInfo(
+                                message
+                            );
 
-                mediaType:
-                    media.type,
+                        return {
+                            id:
+                                String(
+                                    message.id
+                                ),
 
-                fileId:
-                    media.fileId,
+                            type:
+                                message.type ||
+                                null,
 
-                fileSize:
-                    media.fileSize,
+                            date:
+                                message.date
+                                    ? new Date(
+                                        message.date
+                                    ).toISOString()
+                                    : null,
 
-                fileName:
-                    media.fileName,
+                            text:
+                                message.text ||
+                                message.caption ||
+                                "",
 
-                mimeType:
-                    media.mimeType
-            };
-        }
-    );
+                            link:
+                                message.link ||
+                                null,
+
+                            hasMedia:
+                                media.hasMedia,
+
+                            mediaType:
+                                media.type,
+
+                            fileId:
+                                media.fileId,
+
+                            fileSize:
+                                media.fileSize,
+
+                            fileName:
+                                media.fileName,
+
+                            mimeType:
+                                media.mimeType
+                        };
+                    }
+                )
+        };
+
+    } catch (
+        error
+    ) {
+
+        return {
+            success:
+                false,
+
+            chatId:
+                String(
+                    chatId
+                ),
+
+            error:
+                error?.message ||
+                String(
+                    error
+                ),
+
+            name:
+                error?.name ||
+                null,
+
+            stack:
+                error?.stack ||
+                null
+        };
+    }
 }
 
 async function testDownload(
@@ -625,15 +678,15 @@ async function loadChats() {
         const chat
         of chats
     ) {
-
+    
         const option =
             document.createElement(
                 "option"
             );
-
+    
         option.value =
             chat.id;
-
+    
         option.textContent =
             chat.title +
             " [" +
@@ -641,8 +694,9 @@ async function loadChats() {
                 chat.type ||
                 "unknown"
             ) +
-            "]";
-
+            "] — ID: " +
+            chat.id;
+    
         chatSelect.appendChild(
             option
         );
@@ -668,116 +722,200 @@ async function loadMessages() {
     status.textContent =
         "Loading messages...";
 
-    const response =
-        await fetch(
-            "/api/messages?chatId=" +
-            encodeURIComponent(
-                chatId
-            )
+    buttons.innerHTML =
+        "";
+
+    const apiLink =
+        document.createElement(
+            "a"
         );
 
-    const text =
-        await response.text();
+    apiLink.href =
+        "/api/messages?chatId=" +
+        encodeURIComponent(
+            chatId
+        );
 
-    let data;
+    apiLink.target =
+        "_blank";
+
+    apiLink.textContent =
+        "Open Messages API";
+
+    buttons.appendChild(
+        apiLink
+    );
+
+    const chatLink =
+        document.createElement(
+            "a"
+        );
+
+    chatLink.href =
+        "/api/chat?chatId=" +
+        encodeURIComponent(
+            chatId
+        );
+
+    chatLink.target =
+        "_blank";
+
+    chatLink.textContent =
+        "Open Chat API";
+
+    buttons.appendChild(
+        chatLink
+    );
 
     try {
 
-        data =
-            JSON.parse(
-                text
+        const response =
+            await fetch(
+                "/api/messages?chatId=" +
+                encodeURIComponent(
+                    chatId
+                )
             );
 
-    } catch {
+        const text =
+            await response.text();
 
-        throw new Error(
-            "Non-JSON response from /api/messages:\\n\\n" +
-            text
-        );
-    }
+        let data;
 
-    if (!response.ok) {
+        try {
 
-        throw new Error(
+            data =
+                JSON.parse(
+                    text
+                );
+
+        } catch {
+
+            throw new Error(
+                "Non-JSON response:\\n\\n" +
+                text
+            );
+        }
+
+        info.textContent =
             JSON.stringify(
                 data,
                 null,
                 2
-            )
-        );
-    }
-
-    messages =
-        data;
-
-    messageSelect.innerHTML =
-        "";
-
-    for (
-        const message
-        of messages
-    ) {
-
-        const option =
-            document.createElement(
-                "option"
             );
 
-        option.value =
-            message.id;
-
-        let label =
-            "#" +
-            message.id;
-
         if (
-            message.fileName
+            !response.ok ||
+            data.success === false
         ) {
 
-            label +=
-                " " +
-                message.fileName;
+            status.textContent =
+                "MESSAGE ERROR";
 
-        } else if (
-            message.text
-        ) {
+            messages =
+                [];
 
-            label +=
-                " " +
-                message.text
-                    .replace(
-                        /\\s+/g,
-                        " "
-                    )
-                    .slice(
-                        0,
-                        100
-                    );
+            messageSelect.innerHTML =
+                "";
 
-        } else if (
-            message.mediaType
-        ) {
-
-            label +=
-                " [" +
-                message.mediaType +
-                "]";
-
+            return;
         }
 
-        option.textContent =
-            label;
+        messages =
+            data.messages ||
+            [];
 
-        messageSelect.appendChild(
-            option
-        );
+        messageSelect.innerHTML =
+            "";
+
+        for (
+            const message
+            of messages
+        ) {
+
+            const option =
+                document.createElement(
+                    "option"
+                );
+
+            option.value =
+                message.id;
+
+            let label =
+                "#" +
+                message.id;
+
+            if (
+                message.fileName
+            ) {
+
+                label +=
+                    " " +
+                    message.fileName;
+
+            } else if (
+                message.text
+            ) {
+
+                label +=
+                    " " +
+                    message.text
+                        .replace(
+                            /\s+/g,
+                            " "
+                        )
+                        .slice(
+                            0,
+                            100
+                        );
+
+            } else if (
+                message.mediaType
+            ) {
+
+                label +=
+                    " [" +
+                    message.mediaType +
+                    "]";
+
+            } else if (
+                message.type
+            ) {
+
+                label +=
+                    " [" +
+                    message.type +
+                    "]";
+            }
+
+            option.textContent =
+                label;
+
+            messageSelect.appendChild(
+                option
+            );
+        }
+
+        status.textContent =
+            data.count +
+            " messages loaded. Chat ID: " +
+            data.chatId;
+
+        updateMessage();
+
+    } catch (
+        error
+    ) {
+
+        status.textContent =
+            "MESSAGE LOAD ERROR";
+
+        info.textContent =
+            error.stack ||
+            String(
+                error
+            );
     }
-
-    status.textContent =
-        messages.length +
-        " messages loaded.";
-
-    updateMessage();
 }
 
 function updateMessage() {
@@ -911,35 +1049,120 @@ loadChats()
     }
 
     if (
-        path === "/api/messages"
+        path === "/api/chat"
     ) {
-
+    
         const chatId =
             url.searchParams.get(
                 "chatId"
             );
-
+    
         if (!chatId) {
-
+    
             return json(
                 {
+                    success:
+                        false,
+    
                     error:
                         "Missing chatId."
                 },
                 400
             );
         }
+    
+        try {
+    
+            const client =
+                await getTelegramClient(
+                    env
+                );
+    
+            const chat =
+                await client.getChat(
+                    chatId
+                );
+    
+            return json({
+                success:
+                    true,
+    
+                requestedChatId:
+                    chatId,
+    
+                chat
+            });
+    
+        } catch (
+            error
+        ) {
+    
+            return json(
+                {
+                    success:
+                        false,
+    
+                    requestedChatId:
+                        chatId,
+    
+                    error:
+                        error?.message ||
+                        String(
+                            error
+                        ),
+    
+                    name:
+                        error?.name ||
+                        null,
+    
+                    stack:
+                        error?.stack ||
+                        null
+                },
+                500
+            );
+        }
+    }
 
+    if (
+        path === "/api/messages"
+    ) {
+    
+        const chatId =
+            url.searchParams.get(
+                "chatId"
+            );
+    
+        if (!chatId) {
+    
+            return json(
+                {
+                    success:
+                        false,
+    
+                    error:
+                        "Missing chatId."
+                },
+                400
+            );
+        }
+    
         const client =
             await getTelegramClient(
                 env
             );
-
-        return json(
+    
+        const result =
             await getMessages(
                 client,
                 chatId
-            )
+            );
+    
+        return json(
+            result,
+            result.success
+                ? 200
+                : 500
         );
     }
 

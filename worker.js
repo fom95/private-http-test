@@ -316,27 +316,25 @@ async function createClient(env) {
 }
 
 async function getChatForId(client, chatId) {
-    const numericId = Number(chatId);
+    const numericId =
+        Number(chatId);
 
     if (!Number.isSafeInteger(numericId)) {
-        throw new Error(`Invalid chat ID: ${chatId}`);
+        throw new Error(
+            `Invalid chat ID: ${chatId}`
+        );
     }
 
-    const start = Date.now();
-
     const chat =
-        await client.getChat(numericId);
+        await client.getChat(
+            numericId
+        );
 
     if (!chat) {
         throw new Error(
             `Chat ${chatId} was not found.`
         );
     }
-
-    chat._debugTimings = {
-        getChat: `${Date.now() - start} ms`,
-        total: `${Date.now() - start} ms`
-    };
 
     return chat;
 }
@@ -1799,168 +1797,174 @@ async function handleApi(
     }
 
     if (path === "/api/chat") {
-    const chatId =
-        url.searchParams.get(
-            "chat"
-        );
-
-    if (!chatId) {
-        return json({
-            success: false,
-            error: "Missing chat."
-        }, 400);
-    }
-
-    const start =
-        Date.now();
-
-    const clientStart =
-        Date.now();
-
-    const client =
-        await createClient(env);
-
-    const clientTime =
-        Date.now() -
-        clientStart;
-
-    try {
-        const result =
-            await getChatForId(
-                client,
-                chatId
+        const chatId =
+            url.searchParams.get(
+                "chat"
             );
-
-        return json({
-            success: true,
-
-            timings: {
-                createClient:
-                    `${clientTime} ms`,
-                getChats:
-                    result.timings.getChats,
-                getChatTotal:
-                    result.timings.total,
-                total:
-                    `${Date.now() - start} ms`
-            },
-
-            chat: {
-                id:
-                    result.chat.id,
-                title:
-                    result.chat.title ??
-                    null,
-                firstName:
-                    result.chat.firstName ??
-                    null,
-                lastName:
-                    result.chat.lastName ??
-                    null,
-                type:
-                    result.chat.type ??
-                    null,
-                username:
-                    result.chat.username ??
-                    null
-            }
-        });
-    } finally {
+    
+        if (!chatId) {
+            return json({
+                success: false,
+                error: "Missing chat."
+            }, 400);
+        }
+    
+        const start =
+            Date.now();
+    
+        const clientStart =
+            Date.now();
+    
+        const client =
+            await createClient(env);
+    
+        const clientTime =
+            Date.now() -
+            clientStart;
+    
         try {
-            await client.disconnect();
-        } catch {}
+            const chatStart =
+                Date.now();
+    
+            const chat =
+                await getChatForId(
+                    client,
+                    chatId
+                );
+    
+            const chatTime =
+                Date.now() -
+                chatStart;
+    
+            return json({
+                success: true,
+    
+                timings: {
+                    createClient:
+                        `${clientTime} ms`,
+                    getChat:
+                        `${chatTime} ms`,
+                    total:
+                        `${Date.now() - start} ms`
+                },
+    
+                chat: {
+                    id:
+                        chat.id,
+                    title:
+                        chat.title ??
+                        null,
+                    firstName:
+                        chat.firstName ??
+                        null,
+                    lastName:
+                        chat.lastName ??
+                        null,
+                    type:
+                        chat.type ??
+                        null,
+                    username:
+                        chat.username ??
+                        null
+                }
+            });
+        } finally {
+            try {
+                await client.disconnect();
+            } catch {}
+        }
     }
-}
 
     if (path === "/api/messages") {
-    const chatId =
-        url.searchParams.get(
-            "chat"
-        );
-
-    if (!chatId) {
-        return json({
-            success: false,
-            error: "Missing chat."
-        }, 400);
-    }
-
-    const start =
-        Date.now();
-
-    const clientStart =
-        Date.now();
-
-    const client =
-        await createClient(env);
-
-    const clientTime =
-        Date.now() -
-        clientStart;
-
-    try {
-        const result =
-            await getMessages(
-                client,
-                chatId
+        const chatId =
+            url.searchParams.get(
+                "chat"
             );
-
-        return json({
-            success: true,
-
-            timings: {
-                createClient:
-                    `${clientTime} ms`,
-                getChats:
-                    result.timings.getChats,
-                getChatTotal:
-                    result.timings.getChatTotal,
-                getInputPeer:
-                    result.timings.getInputPeer,
-                getHistory:
-                    result.timings.getHistory,
-                total:
-                    `${Date.now() - start} ms`
-            },
-
-            chatId:
-                Number(chatId),
-
-            messages:
-                result.messages.map(
-                    message => ({
-                        id:
-                            message.id,
-                        date:
-                            message.date ??
-                            null,
-                        type:
-                            message.type ??
-                            null,
-                        text:
-                            message.text ??
-                            "",
-                        caption:
-                            message.caption ??
-                            "",
-                        senderId:
-                            message.sender?.id ??
-                            null,
-                        hasMedia:
-                            Boolean(
-                                getMessageMedia(
-                                    message
-                                )
-                            )
-                    })
-                )
-        });
-    } finally {
+    
+        if (!chatId) {
+            return json({
+                success: false,
+                error: "Missing chat."
+            }, 400);
+        }
+    
+        const start =
+            Date.now();
+    
+        const clientStart =
+            Date.now();
+    
+        const client =
+            await createClient(env);
+    
+        const clientTime =
+            Date.now() -
+            clientStart;
+    
         try {
-            await client.disconnect();
-        } catch {}
+            const historyStart =
+                Date.now();
+    
+            const messages =
+                await getMessages(
+                    client,
+                    chatId
+                );
+    
+            const historyTime =
+                Date.now() -
+                historyStart;
+    
+            return json({
+                success: true,
+    
+                timings: {
+                    createClient:
+                        `${clientTime} ms`,
+                    getHistory:
+                        `${historyTime} ms`,
+                    total:
+                        `${Date.now() - start} ms`
+                },
+    
+                chatId:
+                    Number(chatId),
+    
+                messages:
+                    messages.map(
+                        message => ({
+                            id:
+                                message.id,
+                            date:
+                                message.date ??
+                                null,
+                            type:
+                                message.type ??
+                                null,
+                            text:
+                                message.text ??
+                                "",
+                            caption:
+                                message.caption ??
+                                "",
+                            senderId:
+                                message.sender?.id ??
+                                null,
+                            hasMedia:
+                                Boolean(
+                                    getMessageMedia(
+                                        message
+                                    )
+                                )
+                        })
+                    )
+            });
+        } finally {
+            try {
+                await client.disconnect();
+            } catch {}
+        }
     }
-}
 
     if (path === "/api/media-info") {
         const chatId =
@@ -2566,7 +2570,7 @@ async function loadChats() {
                             ": " +
                             value
                     )
-                    .join("\n")
+                    .join("\\n")
             ) +
             "</pre>";
     }
@@ -2603,7 +2607,7 @@ async function loadMessages(chatId) {
 
         const preview =
             text
-                .replace(/\s+/g, " ")
+                .replace(/\\s+/g, " ")
                 .slice(0, 80);
 
         const mediaMarker =
@@ -2652,7 +2656,7 @@ async function loadMessages(chatId) {
                             ": " +
                             value
                     )
-                    .join("\n")
+                    .join("\\n")
             ) +
             "</pre>";
     }

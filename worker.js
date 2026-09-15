@@ -27,8 +27,7 @@ async function createClient(env) {
 
     const client = new Client({
         apiId,
-        apiHash,
-        storage: session
+        apiHash
     });
 
     await client.start({

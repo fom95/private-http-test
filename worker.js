@@ -40,6 +40,7 @@ async function getTelegramClient(env) {
     });
 
     await client.connect();
+
     return client;
 }
 
@@ -218,285 +219,188 @@ async function getMessages(client,chatId) {
     };
 }
 
-async function handleMediaRequest(request,env,chatId,messageId) {
-    const numericChatId=Number(chatId);
-    const numericMessageId=Number(messageId);
-
-    if(!Number.isSafeInteger(numericChatId) ||
-       !Number.isSafeInteger(numericMessageId))
-        return json({
-            success:false,
-            error:"Invalid chat or message ID."
-        },400);
-
-    const client=await getTelegramClient(env);
-
-    try {
-        const chat=await getChatForId(client,numericChatId);
-
-        await client.getInputPeer(chat.id);
-
-        const message=await client.getMessage(
-            chat.id,
-            numericMessageId
-        );
-
-        if(!message)
-            return json({
-                success:false,
-                error:"Message not found."
-            },404);
-
-        const media=getMessageMedia(message);
-
-        if(!media)
-            return json({
-                success:false,
-                error:"Message has no supported media."
-            },404);
-
-        const thumbnails=getMediaThumbnails(media);
-        const url=new URL(request.url);
-
-        const thumbParam=url.searchParams.get("thumb");
-        const isThumbnail=thumbParam!==null;
-
-        let fileId=media.fileId;
-        let fileSize=Number(media.fileSize||0);
-        let contentType=media.mimeType||"application/octet-stream";
-        let fileName=media.fileName||null;
-
-        if(isThumbnail) {
-            const thumbIndex=Number(thumbParam);
-
-            if(!Number.isInteger(thumbIndex) ||
-               thumbIndex<0 ||
-               thumbIndex>=thumbnails.length)
-                return json({
-                    success:false,
-                    error:"Invalid thumbnail index."
-                },400);
-
-            const thumb=thumbnails[thumbIndex];
-
-            if(!thumb?.fileId)
-                return json({
-                    success:false,
-                    error:"Thumbnail has no file ID."
-                },404);
-
-            fileId=thumb.fileId;
-            fileSize=Number(thumb.fileSize||0);
-            contentType=thumb.mimeType||
-                media.mimeType||
-                "application/octet-stream";
-            fileName=null;
-        }
-
-        if(!fileId)
-            return json({
-                success:false,
-                error:"Media has no file ID."
-            },404);
-
-        const rangeHeader=request.headers.get("Range");
-
-        let rangeStart=0;
-        let rangeEnd=fileSize>0?fileSize-1:null;
-        let partial=false;
-
-        if(rangeHeader) {
-            const match=/^bytes=(\d*)-(\d*)$/i.exec(
-                rangeHeader.trim()
-            );
-
-            if(!match)
-                return new Response(null,{
-                    status:416,
-                    headers:{
-                        "Content-Range":`bytes */${fileSize}`
-                    }
-                });
-
-            const startText=match[1];
-            const endText=match[2];
-
-            if(startText==="") {
-                const suffixLength=Number(endText);
-
-                if(!Number.isFinite(suffixLength) ||
-                   suffixLength<=0 ||
-                   fileSize<=0)
-                    return new Response(null,{
-                        status:416,
-                        headers:{
-                            "Content-Range":`bytes */${fileSize}`
-                        }
-                    });
-
-                rangeStart=Math.max(0,fileSize-suffixLength);
-                rangeEnd=fileSize-1;
-            } else {
-                rangeStart=Number(startText);
-
-                if(!Number.isSafeInteger(rangeStart) ||
-                   rangeStart<0 ||
-                   rangeStart>=fileSize)
-                    return new Response(null,{
-                        status:416,
-                        headers:{
-                            "Content-Range":`bytes */${fileSize}`
-                        }
-                    });
-
-                if(endText==="") {
-                    rangeEnd=fileSize-1;
-                } else {
-                    rangeEnd=Number(endText);
-
-                    if(!Number.isSafeInteger(rangeEnd) ||
-                       rangeEnd<rangeStart)
-                        return new Response(null,{
-                            status:416,
-                            headers:{
-                                "Content-Range":`bytes */${fileSize}`
-                            }
-                        });
-
-                    rangeEnd=Math.min(rangeEnd,fileSize-1);
-                }
-            }
-
-            partial=true;
-        }
-
-        const requestedLength=
-            rangeEnd===null
-                ?null
-                :rangeEnd-rangeStart+1;
-
-        const headers={
-            "Accept-Ranges":"bytes",
-            "Cache-Control":"public, max-age=31536000, immutable",
-            "Content-Type":contentType
+function parseRange(rangeHeader,fileSize) {
+    if(!rangeHeader)
+        return {
+            partial:false,
+            start:0,
+            end:fileSize>0?fileSize-1:null
         };
 
-        if(fileName) {
-            headers["Content-Disposition"]=
-                `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`;
+    if(!fileSize)
+        return null;
+
+    const match=/^bytes=(\d*)-(\d*)$/i.exec(
+        rangeHeader.trim()
+    );
+
+    if(!match)
+        return null;
+
+    const startText=match[1];
+    const endText=match[2];
+
+    let start;
+    let end;
+
+    if(startText==="") {
+        const suffixLength=Number(endText);
+
+        if(!Number.isSafeInteger(suffixLength) ||
+           suffixLength<=0)
+            return null;
+
+        start=Math.max(0,fileSize-suffixLength);
+        end=fileSize-1;
+    } else {
+        start=Number(startText);
+
+        if(!Number.isSafeInteger(start) ||
+           start<0 ||
+           start>=fileSize)
+            return null;
+
+        if(endText==="") {
+            end=fileSize-1;
+        } else {
+            end=Number(endText);
+
+            if(!Number.isSafeInteger(end) ||
+               end<start)
+                return null;
+
+            end=Math.min(end,fileSize-1);
         }
+    }
 
-        if(fileSize>0 && rangeEnd!==null) {
-            headers["Content-Length"]=String(requestedLength);
+    return {
+        partial:true,
+        start,
+        end
+    };
+}
 
-            if(partial) {
-                headers["Content-Range"]=
-                    `bytes ${rangeStart}-${rangeEnd}/${fileSize}`;
+async function streamTelegramFile(
+    request,
+    client,
+    fileId,
+    fileSize,
+    contentType,
+    fileName,
+    isThumbnail=false,
+    thumbnailMimeDetect=false
+) {
+    const range=parseRange(
+        request.headers.get("Range"),
+        fileSize
+    );
+
+    if(request.headers.has("Range") && !range) {
+        return new Response(null,{
+            status:416,
+            headers:{
+                "Content-Range":`bytes */${fileSize}`
             }
-        }
-
-        if(request.method==="HEAD") {
-            return new Response(null,{
-                status:partial?206:200,
-                headers
-            });
-        }
-
-        const download=client.download(fileId,{
-            offset:rangeStart,
-            signal:request.signal
         });
+    }
 
-        if(isThumbnail) {
-            const iterator=download[Symbol.asyncIterator]();
-            const first=await iterator.next();
+    const start=range?.start||0;
+    const end=range?.end??(
+        fileSize>0
+            ?fileSize-1
+            :null
+    );
 
-            if(first.done)
-                return new Response(null,{
-                    status:404,
-                    headers:{
-                        "Content-Type":"text/plain; charset=utf-8"
-                    }
-                });
+    const partial=range?.partial||false;
 
-            const firstChunk=first.value;
-            const detected=detectImageMimeType(firstChunk);
+    const requestedLength=
+        end===null
+            ?null
+            :end-start+1;
 
-            if(detected) {
-                contentType=detected;
-                headers["Content-Type"]=detected;
-            }
+    const headers={
+        "Accept-Ranges":"bytes",
+        "Cache-Control":"public, max-age=31536000, immutable",
+        "Content-Type":contentType
+    };
 
-            const stream=new ReadableStream({
-                async start(controller) {
-                    let remaining=requestedLength;
+    if(fileName) {
+        headers["Content-Disposition"]=
+            `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`;
+    }
 
-                    try {
-                        let bytes=firstChunk;
+    if(fileSize>0 && end!==null) {
+        headers["Content-Length"]=String(requestedLength);
 
-                        if(remaining!==null) {
-                            if(remaining<=0) {
-                                controller.close();
-                                return;
-                            }
+        if(partial) {
+            headers["Content-Range"]=
+                `bytes ${start}-${end}/${fileSize}`;
+        }
+    }
 
-                            if(bytes.length>remaining)
-                                bytes=bytes.slice(0,remaining);
+    if(request.method==="HEAD") {
+        return new Response(null,{
+            status:partial?206:200,
+            headers
+        });
+    }
 
-                            remaining-=bytes.length;
-                        }
+    const download=client.download(fileId,{
+        offset:start,
+        signal:request.signal
+    });
 
-                        controller.enqueue(bytes);
+    if(thumbnailMimeDetect) {
+        const iterator=download[Symbol.asyncIterator]();
+        const first=await iterator.next();
 
-                        if(remaining===0) {
-                            controller.close();
-                            return;
-                        }
-
-                        while(true) {
-                            const next=await iterator.next();
-
-                            if(next.done)
-                                break;
-
-                            bytes=next.value;
-
-                            if(remaining!==null) {
-                                if(remaining<=0)
-                                    break;
-
-                                if(bytes.length>remaining)
-                                    bytes=bytes.slice(0,remaining);
-
-                                remaining-=bytes.length;
-                            }
-
-                            controller.enqueue(bytes);
-
-                            if(remaining===0)
-                                break;
-                        }
-
-                        controller.close();
-                    } catch(error) {
-                        controller.error(error);
-                    }
+        if(first.done)
+            return new Response(null,{
+                status:404,
+                headers:{
+                    "Content-Type":"text/plain; charset=utf-8"
                 }
             });
 
-            return new Response(stream,{
-                status:partial?206:200,
-                headers
-            });
-        }
+        const firstChunk=first.value;
+        const detected=detectImageMimeType(firstChunk);
+
+        if(detected)
+            headers["Content-Type"]=detected;
 
         const stream=new ReadableStream({
             async start(controller) {
                 let remaining=requestedLength;
 
                 try {
-                    for await(const chunk of download) {
-                        let bytes=chunk;
+                    let bytes=firstChunk;
+
+                    if(remaining!==null) {
+                        if(remaining<=0) {
+                            controller.close();
+                            return;
+                        }
+
+                        if(bytes.length>remaining)
+                            bytes=bytes.slice(0,remaining);
+
+                        remaining-=bytes.length;
+                    }
+
+                    controller.enqueue(bytes);
+
+                    if(remaining===0) {
+                        controller.close();
+                        return;
+                    }
+
+                    while(true) {
+                        const next=await iterator.next();
+
+                        if(next.done)
+                            break;
+
+                        bytes=next.value;
 
                         if(remaining!==null) {
                             if(remaining<=0)
@@ -525,6 +429,85 @@ async function handleMediaRequest(request,env,chatId,messageId) {
             status:partial?206:200,
             headers
         });
+    }
+
+    const stream=new ReadableStream({
+        async start(controller) {
+            let remaining=requestedLength;
+
+            try {
+                for await(const chunk of download) {
+                    let bytes=chunk;
+
+                    if(remaining!==null) {
+                        if(remaining<=0)
+                            break;
+
+                        if(bytes.length>remaining)
+                            bytes=bytes.slice(0,remaining);
+
+                        remaining-=bytes.length;
+                    }
+
+                    controller.enqueue(bytes);
+
+                    if(remaining===0)
+                        break;
+                }
+
+                controller.close();
+            } catch(error) {
+                controller.error(error);
+            }
+        }
+    });
+
+    return new Response(stream,{
+        status:partial?206:200,
+        headers
+    });
+}
+
+/*
+ * New media endpoint.
+ *
+ * The fileId was already obtained from Telegram while building the
+ * message API response. This endpoint therefore does NOT need to:
+ *
+ *   getChats()
+ *   getInputPeer()
+ *   getMessage()
+ *
+ * This is important for video Range requests.
+ */
+async function handleDirectMediaRequest(
+    request,
+    env,
+    fileId,
+    fileSize,
+    contentType,
+    fileName,
+    isThumbnail=false
+) {
+    if(!fileId)
+        return json({
+            success:false,
+            error:"Missing Telegram file ID."
+        },400);
+
+    const client=await getTelegramClient(env);
+
+    try {
+        return await streamTelegramFile(
+            request,
+            client,
+            fileId,
+            Number(fileSize||0),
+            contentType||"application/octet-stream",
+            fileName||null,
+            isThumbnail,
+            isThumbnail
+        );
     } finally {
         try {
             await client.disconnect();
@@ -532,21 +515,35 @@ async function handleMediaRequest(request,env,chatId,messageId) {
     }
 }
 
-async function testDownload(env,chatId,messageId) {
+/*
+ * Compatibility endpoint for old /media/chat/message URLs.
+ *
+ * New links do not use this path. It remains here so existing links
+ * continue to work.
+ */
+async function handleLegacyMediaRequest(
+    request,
+    env,
+    chatId,
+    messageId
+) {
     const numericChatId=Number(chatId);
     const numericMessageId=Number(messageId);
 
     if(!Number.isSafeInteger(numericChatId) ||
        !Number.isSafeInteger(numericMessageId))
-        return {
+        return json({
             success:false,
             error:"Invalid chat or message ID."
-        };
+        },400);
 
     const client=await getTelegramClient(env);
 
     try {
-        const chat=await getChatForId(client,numericChatId);
+        const chat=await getChatForId(
+            client,
+            numericChatId
+        );
 
         await client.getInputPeer(chat.id);
 
@@ -556,18 +553,86 @@ async function testDownload(env,chatId,messageId) {
         );
 
         if(!message)
-            throw new Error("Message not found.");
+            return json({
+                success:false,
+                error:"Message not found."
+            },404);
 
         const media=getMessageMedia(message);
 
         if(!media)
-            throw new Error("Message has no supported media.");
+            return json({
+                success:false,
+                error:"Message has no supported media."
+            },404);
 
+        const thumbnails=getMediaThumbnails(media);
+        const url=new URL(request.url);
+        const thumbParam=url.searchParams.get("thumb");
+
+        if(thumbParam!==null) {
+            const index=Number(thumbParam);
+
+            if(!Number.isInteger(index) ||
+               index<0 ||
+               index>=thumbnails.length)
+                return json({
+                    success:false,
+                    error:"Invalid thumbnail index."
+                },400);
+
+            const thumb=thumbnails[index];
+
+            return await streamTelegramFile(
+                request,
+                client,
+                thumb.fileId,
+                Number(thumb.fileSize||0),
+                "application/octet-stream",
+                null,
+                true,
+                true
+            );
+        }
+
+        /*
+         * IMPORTANT:
+         * Use the document/photo/video's original MIME type here.
+         * Do not sniff the full document just because its contents
+         * happen to be an image.
+         */
+        return await streamTelegramFile(
+            request,
+            client,
+            media.fileId,
+            Number(media.fileSize||0),
+            media.mimeType||"application/octet-stream",
+            media.fileName||null,
+            false,
+            false
+        );
+    } finally {
+        try {
+            await client.disconnect();
+        } catch {}
+    }
+}
+
+async function testDownload(env,fileId,fileSize) {
+    if(!fileId)
+        return {
+            success:false,
+            error:"Missing file ID."
+        };
+
+    const client=await getTelegramClient(env);
+
+    try {
         const started=Date.now();
         let bytesDownloaded=0;
         let chunks=0;
 
-        const download=client.download(media.fileId);
+        const download=client.download(fileId);
 
         for await(const chunk of download) {
             bytesDownloaded+=chunk.length;
@@ -577,10 +642,8 @@ async function testDownload(env,chatId,messageId) {
         return {
             success:true,
             test:"mtkruto-download-discard",
-            chatId:String(chat.id),
-            messageId:String(message.id),
-            fileId:media.fileId,
-            fileSize:media.fileSize??null,
+            fileId,
+            fileSize:Number(fileSize||0),
             bytesDownloaded,
             chunks,
             elapsedMs:Date.now()-started
@@ -601,61 +664,153 @@ async function main(request,env) {
     const url=new URL(request.url);
     const path=url.pathname;
 
-    if(path==="/")
+    if(path==="/") {
         return html(`<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Telegram Media Test</title>
+
 <style>
+:root{
+    color-scheme:dark;
+}
+
+*{
+    box-sizing:border-box;
+}
+
 body{
-    font-family:system-ui,sans-serif;
-    margin:30px;
-    max-width:1100px
+    margin:0;
+    padding:32px;
+    background:#111315;
+    color:#e7e7e7;
+    font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 }
-select,button{
-    font-size:16px;
-    padding:6px;
-    margin:4px
+
+main{
+    max-width:1000px;
+    margin:0 auto;
 }
-a{
+
+h1{
+    margin-top:0;
+    color:#fff;
+}
+
+h2{
+    margin-bottom:10px;
+}
+
+h3{
+    margin-top:0;
+    color:#fff;
+}
+
+.panel{
+    background:#191c20;
+    border:1px solid #30343a;
+    border-radius:8px;
+    padding:18px;
+    margin:16px 0;
+}
+
+.section{
+    margin-top:18px;
+    padding-top:16px;
+    border-top:1px solid #30343a;
+}
+
+.section:first-child{
+    margin-top:0;
+    padding-top:0;
+    border-top:0;
+}
+
+label{
     display:block;
-    margin:8px 0
+    margin-bottom:8px;
+    color:#aaa;
 }
+
+select{
+    width:100%;
+    max-width:700px;
+    background:#22262b;
+    color:#eee;
+    border:1px solid #41464d;
+    border-radius:5px;
+    padding:8px;
+    font-size:15px;
+}
+
+a{
+    color:#78b7ff;
+    display:block;
+    margin:9px 0;
+    text-decoration:none;
+}
+
+a:hover{
+    text-decoration:underline;
+}
+
+.media-link{
+    color:#8ed1ff;
+    font-size:17px;
+    font-weight:600;
+}
+
 pre{
     white-space:pre-wrap;
-    word-break:break-word
-}
-.media-link{
-    font-weight:bold;
-    font-size:18px
-}
-.warning{
-    margin-top:20px;
+    word-break:break-word;
+    background:#0c0e10;
+    border:1px solid #292d32;
+    border-radius:5px;
     padding:12px;
-    border:1px solid #888
+    overflow:auto;
+}
+
+.warning{
+    color:#bbb;
+    font-size:14px;
+    line-height:1.5;
+}
+
+.meta{
+    color:#aaa;
+    font-size:14px;
+}
+
+.empty{
+    color:#888;
 }
 </style>
 </head>
+
 <body>
+<main>
 
 <h1>Telegram Media Test</h1>
 
-<div>
-<label>
-Chat:
+<div class="panel">
+
+<div class="section">
+<label for="chat">Chat</label>
 <select id="chat"></select>
-</label>
 </div>
 
-<div>
-<label>
-Message:
+<div class="section">
+<label for="message">Message</label>
 <select id="message"></select>
-</label>
+</div>
+
 </div>
 
 <div id="details"></div>
+
+</main>
 
 <script>
 const chatSelect=document.getElementById("chat");
@@ -694,6 +849,9 @@ async function loadChats(){
 async function loadMessages(){
     const id=Number(chatSelect.value);
 
+    details.innerHTML=
+        '<div class="panel"><div class="empty">Loading messages...</div></div>';
+
     const r=await fetch(
         "/api/messages?chat="+encodeURIComponent(id)
     );
@@ -702,9 +860,9 @@ async function loadMessages(){
 
     if(!data.success){
         details.innerHTML=
-            "<pre>"+
+            '<div class="panel"><pre>'+
             escapeHtml(JSON.stringify(data,null,2))+
-            "</pre>";
+            "</pre></div>";
         return;
     }
 
@@ -718,7 +876,7 @@ async function loadMessages(){
 
         const media=message.media;
 
-        const label=
+        o.textContent=
             "#"+message.id+
             (media?.fileName
                 ?" - "+media.fileName
@@ -727,7 +885,6 @@ async function loadMessages(){
                 ?" ["+media.type+"]"
                 :"");
 
-        o.textContent=label;
         messageSelect.appendChild(o);
     }
 
@@ -744,6 +901,44 @@ function escapeHtml(s){
     }[c]));
 }
 
+function mediaUrl(media){
+    if(!media?.fileId)
+        return null;
+
+    const params=new URLSearchParams();
+
+    params.set("file",media.fileId);
+
+    if(media.fileSize!=null)
+        params.set("size",String(media.fileSize));
+
+    if(media.mimeType)
+        params.set("type",media.mimeType);
+
+    if(media.fileName)
+        params.set("name",media.fileName);
+
+    return location.origin+"/media?"+params.toString();
+}
+
+function thumbnailUrl(media,index){
+    const thumb=media?.thumbnails?.[index];
+
+    if(!thumb?.fileId)
+        return null;
+
+    const params=new URLSearchParams();
+
+    params.set("file",thumb.fileId);
+
+    if(thumb.fileSize!=null)
+        params.set("size",String(thumb.fileSize));
+
+    params.set("thumb","1");
+
+    return location.origin+"/media?"+params.toString();
+}
+
 function showMessage(){
     const message=messages.find(
         m=>Number(m.id)===Number(messageSelect.value)
@@ -755,105 +950,165 @@ function showMessage(){
     }
 
     const media=message.media;
-    const chat=Number(chatSelect.value);
-    const id=Number(message.id);
 
-    const mediaUrl=
-        location.origin+
-        "/media/"+chat+"/"+id;
+    let out='<div class="panel">';
 
-    let out="<h2>Message #"+id+"</h2>";
+    out+="<h2>Message #"+message.id+"</h2>";
 
-    /*
-     * Deliberately no <img> or <video> element is created here.
-     * Media only loads when one of these links is clicked.
-     */
-    out+=
-        "<p><a class=\\"media-link\\" "+
-        "href=\\""+mediaUrl+"\\" "+
-        "target=\\"_blank\\" "+
-        "rel=\\"noopener\\">"+
-        "Open media in new tab"+
-        "</a></p>";
+    if(message.text){
+        out+="<div class=\\"section\\">";
+        out+="<h3>Message text</h3>";
+        out+="<pre>"+
+            escapeHtml(message.text)+
+            "</pre>";
+        out+="</div>";
+    }
 
     /*
-     * This version asks Cloudflare for structured JSON if the request
-     * itself is tested manually, which makes a Cloudflare-generated
-     * error easier to inspect.
+     * CONTENT LINKS
      */
-    out+=
-        "<p><a href=\\""+mediaUrl+
-        "\\" target=\\"_blank\\" rel=\\"noopener\\">"+
-        "Open media request"+
-        "</a></p>";
+    out+='<div class="section">';
+    out+="<h3>Message content</h3>";
 
-    out+=
-        "<p><a href=\\"/api/messages?chat="+chat+"\\">"+
-        "Open Messages API"+
-        "</a></p>";
+    if(!media) {
+        out+='<div class="empty">No supported media.</div>';
+    } else {
+        const fullUrl=mediaUrl(media);
 
-    out+=
-        "<p><a href=\\"/api/chat?chat="+chat+"\\">"+
-        "Open Chat API"+
-        "</a></p>";
-
-    if(media?.thumbnails?.length){
-        out+="<h3>Thumbnails</h3>";
-
-        for(const thumb of media.thumbnails){
-            const u=
-                "/media/"+chat+"/"+id+
-                "?thumb="+thumb.index;
+        if(fullUrl) {
+            out+=
+                '<a class="media-link" '+
+                'href="'+fullUrl+'" '+
+                'target="_blank" '+
+                'rel="noopener">Open full media</a>';
 
             out+=
-                "<a href=\\""+u+
-                "\\" target=\\"_blank\\" rel=\\"noopener\\">"+
-                "Open thumbnail "+thumb.index+
-                " ("+
-                thumb.width+
-                "x"+
-                thumb.height+
-                ")"+
-                "</a>";
+                '<a href="'+fullUrl+'" '+
+                'target="_blank" '+
+                'rel="noopener">Open media in new tab</a>';
+        }
+
+        if(media.thumbnails?.length) {
+            out+="<h3>Thumbnails</h3>";
+
+            for(const thumb of media.thumbnails) {
+                const u=thumbnailUrl(
+                    media,
+                    thumb.index
+                );
+
+                if(!u)
+                    continue;
+
+                out+=
+                    '<a href="'+u+'" '+
+                    'target="_blank" '+
+                    'rel="noopener">'+
+                    "Open thumbnail "+
+                    thumb.index+
+                    " ("+
+                    thumb.width+
+                    "x"+
+                    thumb.height+
+                    ")</a>";
+            }
         }
     }
 
-    out+="<h3>Media JSON</h3>";
+    out+="</div>";
+
+    /*
+     * API LINKS
+     */
+    out+='<div class="section">';
+    out+="<h3>API / diagnostics</h3>";
+
+    const chat=Number(chatSelect.value);
+    const id=Number(message.id);
 
     out+=
-        "<pre>"+
-        escapeHtml(JSON.stringify(media,null,2))+
+        '<a href="/api/messages?chat='+chat+'" '+
+        'target="_blank" rel="noopener">'+
+        "Open Messages API</a>";
+
+    out+=
+        '<a href="/api/chat?chat='+chat+'" '+
+        'target="_blank" rel="noopener">'+
+        "Open Chat API</a>";
+
+    if(media?.fileId) {
+        const params=new URLSearchParams();
+
+        params.set("file",media.fileId);
+
+        if(media.fileSize!=null)
+            params.set("size",String(media.fileSize));
+
+        if(media.mimeType)
+            params.set("type",media.mimeType);
+
+        if(media.fileName)
+            params.set("name",media.fileName);
+
+        out+=
+            '<a href="/media-info?'+params.toString()+'" '+
+            'target="_blank" rel="noopener">'+
+            "Inspect media info</a>";
+
+        out+=
+            '<a href="/test-download?'+params.toString()+'" '+
+            'target="_blank" rel="noopener">'+
+            "Test full Telegram download</a>";
+    }
+
+    out+="</div>";
+
+    /*
+     * MEDIA METADATA
+     */
+    out+='<div class="section">';
+    out+="<h3>Media information</h3>";
+
+    out+="<pre>"+
+        escapeHtml(
+            JSON.stringify(media,null,2)
+        )+
         "</pre>";
 
-    out+=
-        "<p><a href=\\"/test-download/"+
-        chat+
-        "/"+
-        id+
-        "\\" target=\\"_blank\\" rel=\\"noopener\\">"+
-        "Test full download"+
-        "</a></p>";
+    out+="</div>";
 
+    out+='<div class="section warning">';
     out+=
-        "<div class=\\"warning\\">"+
-        "<strong>Media is not loaded automatically.</strong><br>"+
-        "Click the media link when you want to test the request. "+
-        "It opens in a separate tab so a Cloudflare 1102 error "+
-        "will not destroy this test page."+
-        "</div>";
+        "<strong>Nothing above automatically loads media.</strong> "+
+        "Opening a media link starts the actual Telegram download "+
+        "in a separate tab.";
+    out+="</div>";
+
+    out+="</div>";
 
     details.innerHTML=out;
 }
 
-chatSelect.addEventListener("change",loadMessages);
-messageSelect.addEventListener("change",showMessage);
+chatSelect.addEventListener(
+    "change",
+    loadMessages
+);
+
+messageSelect.addEventListener(
+    "change",
+    showMessage
+);
 
 loadChats();
 </script>
 
 </body>
 </html>`);
+    }
 
+    /*
+     * API: chat list
+     */
     if(path==="/api/chats") {
         const client=await getTelegramClient(env);
 
@@ -896,6 +1151,9 @@ loadChats();
         }
     }
 
+    /*
+     * API: individual chat
+     */
     if(path==="/api/chat") {
         const chatId=url.searchParams.get("chat");
 
@@ -929,6 +1187,9 @@ loadChats();
         }
     }
 
+    /*
+     * API: messages
+     */
     if(path==="/api/messages") {
         const chatId=url.searchParams.get("chat");
 
@@ -948,6 +1209,7 @@ loadChats();
 
             return json({
                 success:true,
+
                 chat:{
                     id:chat.id,
                     title:chat.title??null,
@@ -956,6 +1218,7 @@ loadChats();
                     username:chat.username??null,
                     type:chat.type??null
                 },
+
                 messages:messages.map(message=>{
                     const media=getMessageMediaInfo(message);
 
@@ -964,18 +1227,34 @@ loadChats();
                         date:message.date??null,
                         type:message.type??null,
                         text:message.text??message.caption??"",
+
                         media:media.hasMedia
                             ?{
                                 ...media,
+
+                                /*
+                                 * The important part:
+                                 * media URLs contain the Telegram fileId,
+                                 * so subsequent Range requests don't need
+                                 * to retrieve the message again.
+                                 */
                                 url:
-                                    `${url.origin}/media/`+
-                                    `${chat.id}/${message.id}`,
+                                    `${url.origin}/media?`+
+                                    `file=${encodeURIComponent(media.fileId)}`+
+                                    `&size=${encodeURIComponent(media.fileSize??0)}`+
+                                    `&type=${encodeURIComponent(media.mimeType||"application/octet-stream")}`+
+                                    (media.fileName
+                                        ?`&name=${encodeURIComponent(media.fileName)}`
+                                        :""),
+
                                 thumbnails:media.thumbnails.map(thumb=>({
                                     ...thumb,
+
                                     url:
-                                        `${url.origin}/media/`+
-                                        `${chat.id}/${message.id}`+
-                                        `?thumb=${thumb.index}`
+                                        `${url.origin}/media?`+
+                                        `file=${encodeURIComponent(thumb.fileId)}`+
+                                        `&size=${encodeURIComponent(thumb.fileSize??0)}`+
+                                        `&thumb=1`
                                 }))
                             }
                             :null
@@ -995,30 +1274,110 @@ loadChats();
         }
     }
 
-    const mediaMatch=
-        path.match(/^\/media\/(-?\d+)\/(\d+)$/);
+    /*
+     * Direct media endpoint.
+     *
+     * This is now the preferred path:
+     *
+     * /media?file=<telegram-file-id>&size=<size>&type=<mime>
+     *
+     * No Telegram message lookup occurs here.
+     */
+    if(path==="/media") {
+        const fileId=url.searchParams.get("file");
 
-    if(mediaMatch)
-        return handleMediaRequest(
-            request,
-            env,
-            mediaMatch[1],
-            mediaMatch[2]
+        if(!fileId)
+            return json({
+                success:false,
+                error:"Missing file parameter."
+            },400);
+
+        const fileSize=Number(
+            url.searchParams.get("size")||0
         );
 
-    const testMatch=
-        path.match(/^\/test-download\/(-?\d+)\/(\d+)$/);
+        const contentType=
+            url.searchParams.get("type")||
+            "application/octet-stream";
 
-    if(testMatch) {
+        const fileName=
+            url.searchParams.get("name")||
+            null;
+
+        const isThumbnail=
+            url.searchParams.has("thumb");
+
+        return handleDirectMediaRequest(
+            request,
+            env,
+            fileId,
+            fileSize,
+            contentType,
+            fileName,
+            isThumbnail
+        );
+    }
+
+    /*
+     * Media metadata endpoint.
+     *
+     * This does not download anything from Telegram.
+     */
+    if(path==="/media-info") {
+        const fileId=url.searchParams.get("file");
+
+        if(!fileId)
+            return json({
+                success:false,
+                error:"Missing file parameter."
+            },400);
+
+        return json({
+            success:true,
+            fileId,
+            fileSize:Number(
+                url.searchParams.get("size")||0
+            ),
+            mimeType:
+                url.searchParams.get("type")||
+                null,
+            fileName:
+                url.searchParams.get("name")||
+                null,
+            thumbnail:url.searchParams.has("thumb")
+        });
+    }
+
+    /*
+     * Full-download diagnostic.
+     */
+    if(path==="/test-download") {
+        const fileId=url.searchParams.get("file");
+
         const result=await testDownload(
             env,
-            testMatch[1],
-            testMatch[2]
+            fileId,
+            url.searchParams.get("size")
         );
 
         return json(
             result,
             result.success?200:500
+        );
+    }
+
+    /*
+     * Old media URL compatibility.
+     */
+    const legacyMediaMatch=
+        path.match(/^\/media\/(-?\d+)\/(\d+)$/);
+
+    if(legacyMediaMatch) {
+        return handleLegacyMediaRequest(
+            request,
+            env,
+            legacyMediaMatch[1],
+            legacyMediaMatch[2]
         );
     }
 

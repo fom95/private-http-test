@@ -300,26 +300,14 @@ async function createClient(env) {
         );
     }
 
-    if (!env.MTKRUTO_CACHE) {
-        throw new Error(
-            "MTKRUTO_CACHE KV binding is not configured."
-        );
-    }
-
-    const storage =
-        new CloudflareKVStorage(
-            env.MTKRUTO_CACHE
-        );
-
     const client =
         new Client({
             apiId,
             apiHash,
             authString:
                 session,
-            storage,
             persistCache:
-                true
+                false
         });
 
     await client.start();
@@ -327,7 +315,108 @@ async function createClient(env) {
     return client;
 }
 
-async function getChatForId(client, chatId) {
+async function getCachedChatPeer(
+    env,
+    chatId
+) {
+    if (!env.MTKRUTO_CACHE) {
+        return null;
+    }
+
+    const storage =
+        new CloudflareKVStorage(
+            env.MTKRUTO_CACHE
+        );
+
+    const cached =
+        await storage.get([
+            "peers",
+            Number(chatId)
+        ]);
+
+    if (
+        !Array.isArray(cached) ||
+        cached.length !== 2 ||
+        !cached[0] ||
+        cached[1] === null ||
+        cached[1] === undefined
+    ) {
+        return null;
+    }
+
+    return {
+        chat:
+            cached[0],
+        accessHash:
+            typeof cached[1] === "bigint"
+                ? cached[1]
+                : BigInt(cached[1])
+    };
+}
+
+async function cacheChatPeer(
+    env,
+    chatId,
+    peer
+) {
+    if (!env.MTKRUTO_CACHE) {
+        return false;
+    }
+
+    const storage =
+        new CloudflareKVStorage(
+            env.MTKRUTO_CACHE
+        );
+
+    const key = [
+        "peers",
+        Number(chatId)
+    ];
+
+    /*
+     * Always check KV immediately before writing.
+     *
+     * This is intentional even if the caller already
+     * checked it, because another request/isolate may
+     * have populated the entry in the meantime.
+     */
+    const existing =
+        await storage.get(key);
+
+    if (existing !== null) {
+        return false;
+    }
+
+    try {
+        await storage.set(
+            key,
+            [
+                peer[0],
+                peer[1]
+            ]
+        );
+
+        return true;
+    } catch (error) {
+        /*
+         * A KV write quota error must not prevent
+         * the Telegram request itself from working.
+         */
+        console.log(
+            "Chat peer KV cache write failed:",
+            error?.message ||
+                String(error)
+        );
+
+        return false;
+    }
+}
+
+async function prepareChatPeer(
+    client,
+    env,
+    chatId
+) {
     const numericId =
         Number(chatId);
 
@@ -336,6 +425,143 @@ async function getChatForId(client, chatId) {
             `Invalid chat ID: ${chatId}`
         );
     }
+
+    /*
+     * First: try the persistent chat/hash cache.
+     */
+    const cached =
+        await getCachedChatPeer(
+            env,
+            numericId
+        );
+
+    if (cached) {
+        client.messageStorage.setPeer2(
+            cached.chat,
+            cached.accessHash
+        );
+
+        return {
+            cached: true,
+            peer:
+                cached
+        };
+    }
+
+    /*
+     * No persistent entry exists.
+     *
+     * Ask Telegram for the chat. This causes
+     * MTKruto to obtain the peer/access hash.
+     */
+    const chat =
+        await client.getChat(
+            numericId
+        );
+
+    if (!chat) {
+        throw new Error(
+            `Chat ${chatId} was not found.`
+        );
+    }
+
+    /*
+     * getChat() should have populated MTKruto's
+     * in-memory peer map. Read it back.
+     */
+    let peer =
+        await client.messageStorage.peers.get([
+            numericId
+        ]);
+
+    /*
+     * If the peer wasn't populated by getChat(),
+     * explicitly obtain the input peer. This is
+     * still only an in-memory operation because
+     * persistCache=false.
+     */
+    if (!peer) {
+        await client.getInputPeer(
+            numericId
+        );
+
+        peer =
+            await client.messageStorage.peers.get([
+                numericId
+            ]);
+    }
+
+    if (
+        !peer ||
+        !Array.isArray(peer) ||
+        peer.length !== 2
+    ) {
+        throw new Error(
+            `Could not resolve Telegram peer for chat ${chatId}.`
+        );
+    }
+
+    /*
+     * Check KV again before writing.
+     *
+     * If another request populated it while we were
+     * talking to Telegram, we use that existing value
+     * and NEVER issue a put.
+     */
+    const existing =
+        await getCachedChatPeer(
+            env,
+            numericId
+        );
+
+    if (existing) {
+        client.messageStorage.setPeer2(
+            existing.chat,
+            existing.accessHash
+        );
+
+        return {
+            cached: true,
+            peer:
+                existing
+        };
+    }
+
+    /*
+     * This is the ONLY place where a new chat
+     * peer is written to KV.
+     */
+    await cacheChatPeer(
+        env,
+        numericId,
+        peer
+    );
+
+    return {
+        cached: false,
+        peer
+    };
+}
+
+async function getChatForId(
+    client,
+    env,
+    chatId
+) {
+    const numericId =
+        Number(chatId);
+
+    if (!Number.isSafeInteger(numericId)) {
+        throw new Error(
+            `Invalid chat ID: ${chatId}`
+        );
+    }
+
+    await prepareChatPeer(
+        client,
+        env,
+        numericId
+    );
 
     const chat =
         await client.getChat(
@@ -351,7 +577,11 @@ async function getChatForId(client, chatId) {
     return chat;
 }
 
-async function getMessages(client, chatId) {
+async function getMessages(
+    client,
+    env,
+    chatId
+) {
     const numericId =
         Number(chatId);
 
@@ -360,6 +590,12 @@ async function getMessages(client, chatId) {
             `Invalid chat ID: ${chatId}`
         );
     }
+
+    await prepareChatPeer(
+        client,
+        env,
+        numericId
+    );
 
     const start =
         Date.now();
@@ -383,6 +619,7 @@ async function getMessages(client, chatId) {
 
 async function getMessage(
     client,
+    env,
     chatId,
     messageId
 ) {
@@ -393,8 +630,12 @@ async function getMessage(
         Number(messageId);
 
     if (
-        !Number.isSafeInteger(numericChatId) ||
-        !Number.isSafeInteger(numericMessageId) ||
+        !Number.isSafeInteger(
+            numericChatId
+        ) ||
+        !Number.isSafeInteger(
+            numericMessageId
+        ) ||
         numericChatId === 0 ||
         numericMessageId <= 0
     ) {
@@ -402,6 +643,12 @@ async function getMessage(
             "Invalid chat or message ID."
         );
     }
+
+    await prepareChatPeer(
+        client,
+        env,
+        numericChatId
+    );
 
     const message =
         await client.getMessage(
@@ -844,6 +1091,7 @@ async function streamRangeDownload(
 
 async function getMessageMediaInfo(
     client,
+    env,
     chatId,
     messageId,
     existingMessage = null
@@ -852,6 +1100,7 @@ async function getMessageMediaInfo(
         existingMessage ||
         await getMessage(
             client,
+            env,
             chatId,
             messageId
         );
@@ -1267,6 +1516,7 @@ async function handleDirectMediaRequest(
         const message =
             await getMessage(
                 client,
+                env,
                 chatId,
                 messageId
             );
@@ -1905,6 +2155,7 @@ async function handleApi(
             const chat =
                 await getChatForId(
                     client,
+                    env,
                     chatId
                 );
     
@@ -1984,6 +2235,7 @@ async function handleApi(
             const messages =
                 await getMessages(
                     client,
+                    env,
                     chatId
                 );
     
@@ -2070,6 +2322,7 @@ async function handleApi(
                 ...(
                     await getMessageMediaInfo(
                         client,
+                        env,
                         chatId,
                         messageId
                     )
@@ -2135,9 +2388,9 @@ async function handleApi(
                     media:
                         await getMessageMediaInfo(
                             client,
+                            env,
                             chatId,
-                            messageId,
-                            message
+                            messageId
                         )
                 }
             });
@@ -2174,6 +2427,7 @@ async function handleApi(
             const message =
                 await getMessage(
                     client,
+                    env,
                     chatId,
                     messageId
                 );

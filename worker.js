@@ -1,2320 +1,972 @@
-import {
-    Client
-} from "@mtkruto/mtkruto";
+import { Client } from "@mtkruto/mtkruto";
 
-function json(
-    data,
-    status = 200
-) {
-
-    return new Response(
-        JSON.stringify(
-            data,
-            null,
-            2
-        ),
-        {
-            status,
-            headers: {
-                "Content-Type":
-                    "application/json; charset=utf-8"
-            }
+function json(data,status=200,headers={}) {
+    return new Response(JSON.stringify(data,null,2),{
+        status,
+        headers:{
+            "Content-Type":"application/json; charset=utf-8",
+            ...headers
         }
-    );
+    });
 }
 
-function html(
-    body
-) {
-
-    return new Response(
-        body,
-        {
-            headers: {
-                "Content-Type":
-                    "text/html; charset=utf-8"
-            }
-        }
-    );
+function html(body,status=200) {
+    return new Response(body,{
+        status,
+        headers:{"Content-Type":"text/html; charset=utf-8"}
+    });
 }
 
-function errorInfo(
-    error
-) {
-
+function errorInfo(error) {
     return {
-        error:
-            error?.message ||
-            String(error),
-
-        name:
-            error?.name ||
-            null,
-
-        stack:
-            error?.stack ||
-            null
+        error:String(error?.message||error),
+        name:error?.name||null,
+        stack:error?.stack||null
     };
 }
 
-async function getTelegramClient(
-    env
-) {
+async function getTelegramClient(env) {
+    const apiId=Number(await env.API_ID.get());
+    const apiHash=await env.API_HASH.get();
+    const authString=await env.MTKRUTO_SESSION.get();
 
-    const apiId =
-        Number(
-            await env.API_ID.get()
-        );
-
-    const apiHash =
-        await env.API_HASH.get();
-
-    const authString =
-        await env.MTKRUTO_SESSION.get();
-
-    const client =
-        new Client({
-            apiId,
-
-            apiHash,
-
-            authString,
-
-            persistCache:
-                false,
-
-            defaultHandlers:
-                false,
-
-            disableUpdates:
-                true
-        });
+    const client=new Client({
+        apiId,
+        apiHash,
+        authString,
+        persistCache:false,
+        defaultHandlers:false,
+        disableUpdates:true
+    });
 
     await client.connect();
-
     return client;
 }
 
-function getMessageMedia(
-    message
-) {
-
-    switch (
-        message?.type
-    ) {
-
+function getMessageMedia(message) {
+    switch(message?.type) {
         case "photo":
         case "livePhoto":
-            return message.photo || null;
+            return message.photo||null;
 
         case "document":
-            return message.document || null;
+            return message.document||null;
 
         case "video":
-            return message.video || null;
+            return message.video||null;
 
         case "animation":
-            return message.animation || null;
+            return message.animation||null;
 
         case "audio":
-            return message.audio || null;
+            return message.audio||null;
 
         case "voice":
-            return message.voice || null;
+            return message.voice||null;
 
         case "videoNote":
-            return message.videoNote || null;
+            return message.videoNote||null;
 
         case "sticker":
-            return message.sticker || null;
+            return message.sticker||null;
 
         default:
             return null;
     }
 }
 
-function getMediaThumbnails(
-    media
-) {
-
-    if (
-        Array.isArray(
-            media?.thumbnails
-        )
-    ) {
-
+function getMediaThumbnails(media) {
+    if(Array.isArray(media?.thumbnails) && media.thumbnails.length)
         return media.thumbnails;
-    }
 
-    if (
-        media?.thumbnail
-    ) {
-
-        return [
-            media.thumbnail
-        ];
-    }
+    if(media?.thumbnail)
+        return [media.thumbnail];
 
     return [];
 }
 
-function getMessageMediaInfo(
-    message
-) {
+function getMessageMediaInfo(message) {
+    const media=getMessageMedia(message);
 
-    const media =
-        getMessageMedia(
-            message
-        );
-
-    if (!media) {
-
+    if(!media) {
         return {
-            hasMedia:
-                false,
-
-            type:
-                null,
-
-            fileId:
-                null,
-
-            fileUniqueId:
-                null,
-
-            fileSize:
-                0,
-
-            fileName:
-                null,
-
-            mimeType:
-                null,
-
-            width:
-                null,
-
-            height:
-                null,
-
-            duration:
-                null,
-
-            thumbnails:
-                []
+            hasMedia:false,
+            type:null
         };
     }
 
-    const thumbnails =
-        getMediaThumbnails(
-            media
-        );
+    const thumbnails=getMediaThumbnails(media);
 
     return {
-        hasMedia:
-            true,
-
-        type:
-            media.type ||
-            message.type ||
-            null,
-
-        fileId:
-            media.fileId ||
-            null,
-
-        fileUniqueId:
-            media.fileUniqueId ||
-            null,
-
-        fileSize:
-            Number(
-                media.fileSize ||
-                0
-            ),
-
-        fileName:
-            media.fileName ||
-            null,
-
-        mimeType:
-            media.mimeType ||
-            null,
-
-        width:
-            media.width ||
-            null,
-
-        height:
-            media.height ||
-            null,
-
-        duration:
-            media.duration ||
-            null,
-
-        thumbnails:
-            thumbnails.map(
-                (
-                    thumbnail,
-                    index
-                ) => ({
-
-                    index,
-
-                    fileId:
-                        thumbnail.fileId ||
-                        null,
-
-                    fileUniqueId:
-                        thumbnail.fileUniqueId ||
-                        null,
-
-                    width:
-                        thumbnail.width ||
-                        null,
-
-                    height:
-                        thumbnail.height ||
-                        null,
-
-                    fileSize:
-                        Number(
-                            thumbnail.fileSize ||
-                            0
-                        )
-                })
-            )
+        hasMedia:true,
+        type:message.type,
+        fileId:media.fileId||null,
+        fileSize:media.fileSize??null,
+        fileName:media.fileName||null,
+        mimeType:media.mimeType||null,
+        width:media.width??null,
+        height:media.height??null,
+        duration:media.duration??null,
+        thumbnailCount:thumbnails.length,
+        thumbnails:thumbnails.map((thumb,index)=>({
+            index,
+            fileId:thumb.fileId||null,
+            fileUniqueId:thumb.fileUniqueId||null,
+            fileSize:thumb.fileSize??null,
+            width:thumb.width??null,
+            height:thumb.height??null
+        }))
     };
 }
 
-function detectImageMimeType(
-    bytes
-) {
-
-    if (
-        !bytes ||
-        bytes.byteLength < 4
-    ) {
-
-        return null;
-    }
-
-    const b =
-        bytes instanceof Uint8Array
-            ? bytes
-            : new Uint8Array(
-                bytes
-            );
-
-    if (
-        b[0] === 0xFF &&
-        b[1] === 0xD8 &&
-        b[2] === 0xFF
-    ) {
-
+function detectImageMimeType(bytes) {
+    if(bytes.length>=3 &&
+       bytes[0]===0xff &&
+       bytes[1]===0xd8 &&
+       bytes[2]===0xff)
         return "image/jpeg";
-    }
 
-    if (
-        b.length >= 8 &&
-        b[0] === 0x89 &&
-        b[1] === 0x50 &&
-        b[2] === 0x4E &&
-        b[3] === 0x47 &&
-        b[4] === 0x0D &&
-        b[5] === 0x0A &&
-        b[6] === 0x1A &&
-        b[7] === 0x0A
-    ) {
-
+    if(bytes.length>=8 &&
+       bytes[0]===0x89 &&
+       bytes[1]===0x50 &&
+       bytes[2]===0x4e &&
+       bytes[3]===0x47 &&
+       bytes[4]===0x0d &&
+       bytes[5]===0x0a &&
+       bytes[6]===0x1a &&
+       bytes[7]===0x0a)
         return "image/png";
+
+    if(bytes.length>=6) {
+        const s=new TextDecoder().decode(bytes.slice(0,6));
+        if(s==="GIF87a"||s==="GIF89a")
+            return "image/gif";
     }
 
-    if (
-        b[0] === 0x47 &&
-        b[1] === 0x49 &&
-        b[2] === 0x46 &&
-        b[3] === 0x38
-    ) {
-
-        return "image/gif";
-    }
-
-    if (
-        b.length >= 12 &&
-        b[0] === 0x52 &&
-        b[1] === 0x49 &&
-        b[2] === 0x46 &&
-        b[3] === 0x46 &&
-        b[8] === 0x57 &&
-        b[9] === 0x45 &&
-        b[10] === 0x42 &&
-        b[11] === 0x50
-    ) {
-
+    if(bytes.length>=12 &&
+       bytes[0]===0x52 &&
+       bytes[1]===0x49 &&
+       bytes[2]===0x46 &&
+       bytes[3]===0x46 &&
+       bytes[8]===0x57 &&
+       bytes[9]===0x45 &&
+       bytes[10]===0x42 &&
+       bytes[11]===0x50)
         return "image/webp";
-    }
 
-    if (
-        b.length >= 12 &&
-        b[4] === 0x66 &&
-        b[5] === 0x74 &&
-        b[6] === 0x79 &&
-        b[7] === 0x70
-    ) {
-
-        const brand =
-            String.fromCharCode(
-                b[8],
-                b[9],
-                b[10],
-                b[11]
-            );
-
-        if (
-            brand === "avif" ||
-            brand === "avis"
-        ) {
-
+    if(bytes.length>=12) {
+        const s=new TextDecoder().decode(bytes.slice(4,12));
+        if(s==="ftypavif"||s==="ftypavis")
             return "image/avif";
-        }
 
-        if (
-            brand === "heic" ||
-            brand === "heix" ||
-            brand === "hevc" ||
-            brand === "hevx"
-        ) {
-
+        if(s==="ftypheic"||
+           s==="ftypheix"||
+           s==="ftyphevc"||
+           s==="ftyphevx")
             return "image/heic";
-        }
     }
 
     return null;
 }
 
-async function getChatList(
-    client
-) {
+async function getChatForId(client,chatId) {
+    const numericChatId=Number(chatId);
 
-    const chats =
-        await client.getChats({
-            from:
-                "main",
+    if(!Number.isSafeInteger(numericChatId))
+        throw new Error(`Invalid chat ID: ${chatId}`);
 
-            limit:
-                100
-        });
+    const result=await client.getChats({
+        from:"main",
+        limit:100
+    });
 
-    return chats.map(
-        item => {
+    const items=Array.isArray(result)?result:(result?.chats||[]);
 
-            const chat =
-                item.chat;
+    for(const item of items) {
+        const chat=item?.chat||item;
 
-            let title;
+        if(chat && Number(chat.id)===numericChatId)
+            return chat;
+    }
 
-            if (
-                chat.title
-            ) {
-
-                title =
-                    chat.title;
-
-            } else {
-
-                title =
-                    [
-                        chat.firstName,
-                        chat.lastName
-                    ]
-                        .filter(
-                            Boolean
-                        )
-                        .join(
-                            " "
-                        );
-            }
-
-            return {
-                id:
-                    String(
-                        chat.id
-                    ),
-
-                title:
-                    title ||
-                    String(
-                        chat.id
-                    ),
-
-                type:
-                    chat.type ||
-                    null,
-
-                username:
-                    chat.username ||
-                    null
-            };
-        }
-    );
+    throw new Error(`Chat ${numericChatId} was not found in the accessible chat list.`);
 }
 
-async function getMessages(
-    client,
-    chatId,
-    requestUrl
-) {
+async function getMessages(client,chatId) {
+    const numericChatId=Number(chatId);
+
+    if(!Number.isSafeInteger(numericChatId))
+        throw new Error(`Invalid chat ID: ${chatId}`);
+
+    const chat=await getChatForId(client,numericChatId);
+
+    await client.getInputPeer(chat.id);
+
+    const messages=await client.getHistory(chat.id,{
+        limit:100
+    });
+
+    return {
+        chat,
+        messages
+    };
+}
+
+async function handleMediaRequest(request,env,chatId,messageId) {
+    const numericChatId=Number(chatId);
+    const numericMessageId=Number(messageId);
+
+    if(!Number.isSafeInteger(numericChatId) ||
+       !Number.isSafeInteger(numericMessageId))
+        return json({
+            success:false,
+            error:"Invalid chat or message ID."
+        },400);
+
+    const client=await getTelegramClient(env);
 
     try {
+        /*
+         * Do NOT call getInputPeer(numericChatId) directly here.
+         * A fresh MTKruto client cannot always resolve the raw channel ID.
+         * Resolve it through getChats(), which is also how /api/messages works.
+         */
+        const chat=await getChatForId(client,numericChatId);
 
-        const numericChatId =
-            Number(
-                chatId
+        await client.getInputPeer(chat.id);
+
+        const message=await client.getMessage(
+            chat.id,
+            numericMessageId
+        );
+
+        if(!message)
+            return json({
+                success:false,
+                error:"Message not found."
+            },404);
+
+        const media=getMessageMedia(message);
+
+        if(!media)
+            return json({
+                success:false,
+                error:"Message has no supported media."
+            },404);
+
+        const thumbnails=getMediaThumbnails(media);
+        const url=new URL(request.url);
+
+        const thumbParam=url.searchParams.get("thumb");
+        const isThumbnail=thumbParam!==null;
+
+        let fileId=media.fileId;
+        let fileSize=Number(media.fileSize||0);
+        let contentType=media.mimeType||"application/octet-stream";
+        let fileName=media.fileName||null;
+
+        if(isThumbnail) {
+            const thumbIndex=Number(thumbParam);
+
+            if(!Number.isInteger(thumbIndex) ||
+               thumbIndex<0 ||
+               thumbIndex>=thumbnails.length)
+                return json({
+                    success:false,
+                    error:"Invalid thumbnail index."
+                },400);
+
+            const thumb=thumbnails[thumbIndex];
+
+            if(!thumb?.fileId)
+                return json({
+                    success:false,
+                    error:"Thumbnail has no file ID."
+                },404);
+
+            fileId=thumb.fileId;
+            fileSize=Number(thumb.fileSize||0);
+
+            /*
+             * MTKruto does not necessarily provide a useful MIME type for
+             * Telegram document thumbnails, so these are sniffed below.
+             */
+            contentType=thumb.mimeType||
+                media.mimeType||
+                "application/octet-stream";
+
+            fileName=null;
+        }
+
+        if(!fileId)
+            return json({
+                success:false,
+                error:"Media has no file ID."
+            },404);
+
+        const rangeHeader=request.headers.get("Range");
+
+        let rangeStart=0;
+        let rangeEnd=fileSize>0?fileSize-1:null;
+        let partial=false;
+
+        if(rangeHeader) {
+            const match=/^bytes=(\d*)-(\d*)$/i.exec(
+                rangeHeader.trim()
             );
 
-        if (
-            !Number.isSafeInteger(
-                numericChatId
-            )
-        ) {
+            if(!match)
+                return new Response(null,{
+                    status:416,
+                    headers:{
+                        "Content-Range":`bytes */${fileSize}`
+                    }
+                });
 
-            throw new Error(
-                `Invalid numeric chat ID: ${chatId}`
-            );
+            const startText=match[1];
+            const endText=match[2];
+
+            if(startText==="") {
+                const suffixLength=Number(endText);
+
+                if(!Number.isFinite(suffixLength) ||
+                   suffixLength<=0 ||
+                   fileSize<=0)
+                    return new Response(null,{
+                        status:416,
+                        headers:{
+                            "Content-Range":`bytes */${fileSize}`
+                        }
+                    });
+
+                rangeStart=Math.max(0,fileSize-suffixLength);
+                rangeEnd=fileSize-1;
+            } else {
+                rangeStart=Number(startText);
+
+                if(!Number.isSafeInteger(rangeStart) ||
+                   rangeStart<0 ||
+                   rangeStart>=fileSize)
+                    return new Response(null,{
+                        status:416,
+                        headers:{
+                            "Content-Range":`bytes */${fileSize}`
+                        }
+                    });
+
+                if(endText==="") {
+                    rangeEnd=fileSize-1;
+                } else {
+                    rangeEnd=Number(endText);
+
+                    if(!Number.isSafeInteger(rangeEnd) ||
+                       rangeEnd<rangeStart)
+                        return new Response(null,{
+                            status:416,
+                            headers:{
+                                "Content-Range":`bytes */${fileSize}`
+                            }
+                        });
+
+                    rangeEnd=Math.min(rangeEnd,fileSize-1);
+                }
+            }
+
+            partial=true;
+        }
+
+        const requestedLength=
+            rangeEnd===null
+                ?null
+                :rangeEnd-rangeStart+1;
+
+        const headers={
+            "Accept-Ranges":"bytes",
+            "Cache-Control":"public, max-age=31536000, immutable",
+            "Content-Type":contentType
+        };
+
+        if(fileName) {
+            headers["Content-Disposition"]=
+                `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`;
+        }
+
+        if(fileSize>0 && rangeEnd!==null) {
+            headers["Content-Length"]=String(requestedLength);
+
+            if(partial) {
+                headers["Content-Range"]=
+                    `bytes ${rangeStart}-${rangeEnd}/${fileSize}`;
+            }
+        }
+
+        if(request.method==="HEAD") {
+            return new Response(null,{
+                status:partial?206:200,
+                headers
+            });
         }
 
         /*
-         * Keep the known-working getChats()
-         * resolution here.
-         *
-         * This is intentionally NOT cached
-         * globally because the MTKruto client
-         * itself is request-scoped.
+         * Start downloading at the requested Telegram offset.
+         * Do not specify chunkSize here: MTKruto rejects the previously
+         * attempted 2 MiB value.
          */
+        const download=client.download(fileId,{
+            offset:rangeStart,
+            signal:request.signal
+        });
 
-        const chats =
-            await client.getChats({
-                from:
-                    "main",
+        let firstChunk=null;
 
-                limit:
-                    100
+        if(isThumbnail) {
+            const iterator=download[Symbol.asyncIterator]();
+            const first=await iterator.next();
+
+            if(first.done)
+                return new Response(null,{
+                    status:404,
+                    headers:{
+                        "Content-Type":"text/plain; charset=utf-8"
+                    }
+                });
+
+            firstChunk=first.value;
+
+            const detected=detectImageMimeType(firstChunk);
+
+            if(detected) {
+                contentType=detected;
+                headers["Content-Type"]=detected;
+            }
+
+            /*
+             * Return the first bytes that were already consumed for MIME
+             * detection, followed by the remainder of the generator.
+             */
+            const stream=new ReadableStream({
+                async start(controller) {
+                    let remaining=requestedLength;
+
+                    try {
+                        if(firstChunk) {
+                            let bytes=firstChunk;
+
+                            if(remaining!==null) {
+                                if(remaining<=0) {
+                                    controller.close();
+                                    return;
+                                }
+
+                                if(bytes.length>remaining)
+                                    bytes=bytes.slice(0,remaining);
+
+                                remaining-=bytes.length;
+                            }
+
+                            controller.enqueue(bytes);
+
+                            if(remaining===0) {
+                                controller.close();
+                                return;
+                            }
+                        }
+
+                        while(true) {
+                            const next=await iterator.next();
+
+                            if(next.done)
+                                break;
+
+                            let bytes=next.value;
+
+                            if(remaining!==null) {
+                                if(remaining<=0)
+                                    break;
+
+                                if(bytes.length>remaining)
+                                    bytes=bytes.slice(0,remaining);
+
+                                remaining-=bytes.length;
+                            }
+
+                            controller.enqueue(bytes);
+
+                            if(remaining===0)
+                                break;
+                        }
+
+                        controller.close();
+                    } catch(error) {
+                        controller.error(error);
+                    }
+                }
             });
 
-        const chatItem =
-            chats.find(
-                item =>
-                    Number(
-                        item.chat.id
-                    ) ===
-                    numericChatId
-            );
-
-        if (!chatItem) {
-
-            throw new Error(
-                `Chat ${numericChatId} was not found in MTKruto getChats().`
-            );
-        }
-
-        const chat =
-            chatItem.chat;
-
-        await client.getInputPeer(
-            chat.id
-        );
-
-        const messages =
-            await client.getHistory(
-                chat.id,
-                {
-                    limit:
-                        100
-                }
-            );
-
-        const origin =
-            new URL(
-                requestUrl
-            ).origin;
-
-        return {
-            success:
-                true,
-
-            chatId:
-                String(
-                    chat.id
-                ),
-
-            chatTitle:
-                chat.title ||
-                [
-                    chat.firstName,
-                    chat.lastName
-                ]
-                    .filter(
-                        Boolean
-                    )
-                    .join(
-                        " "
-                    ) ||
-                null,
-
-            chatType:
-                chat.type ||
-                null,
-
-            count:
-                messages.length,
-
-            messages:
-                messages.map(
-                    message => {
-
-                        const media =
-                            getMessageMediaInfo(
-                                message
-                            );
-
-                        let mediaUrl =
-                            null;
-
-                        if (
-                            media.fileId
-                        ) {
-
-                            mediaUrl =
-                                `${origin}/media/` +
-                                `${encodeURIComponent(
-                                    chat.id
-                                )}/` +
-                                `${encodeURIComponent(
-                                    message.id
-                                )}`;
-                        }
-
-                        const thumbnailUrls =
-                            media.thumbnails.map(
-                                thumbnail => ({
-
-                                    index:
-                                        thumbnail.index,
-
-                                    fileId:
-                                        thumbnail.fileId,
-
-                                    fileUniqueId:
-                                        thumbnail.fileUniqueId,
-
-                                    width:
-                                        thumbnail.width,
-
-                                    height:
-                                        thumbnail.height,
-
-                                    fileSize:
-                                        thumbnail.fileSize,
-
-                                    url:
-                                        thumbnail.fileId
-                                            ? `${origin}/media/` +
-                                              `${encodeURIComponent(
-                                                  chat.id
-                                              )}/` +
-                                              `${encodeURIComponent(
-                                                  message.id
-                                              )}?thumb=${thumbnail.index}`
-                                            : null
-                                })
-                            );
-
-                        return {
-                            id:
-                                String(
-                                    message.id
-                                ),
-
-                            type:
-                                message.type ||
-                                null,
-
-                            date:
-                                message.date
-                                    ? new Date(
-                                        message.date
-                                    ).toISOString()
-                                    : null,
-
-                            text:
-                                message.text ||
-                                message.caption ||
-                                "",
-
-                            link:
-                                message.link ||
-                                null,
-
-                            hasMedia:
-                                media.hasMedia,
-
-                            mediaType:
-                                media.type,
-
-                            fileId:
-                                media.fileId,
-
-                            fileUniqueId:
-                                media.fileUniqueId,
-
-                            fileSize:
-                                media.fileSize,
-
-                            fileName:
-                                media.fileName,
-
-                            mimeType:
-                                media.mimeType,
-
-                            width:
-                                media.width,
-
-                            height:
-                                media.height,
-
-                            duration:
-                                media.duration,
-
-                            mediaUrl,
-
-                            thumbnails:
-                                thumbnailUrls
-                        };
-                    }
-                )
-        };
-
-    } catch (
-        error
-    ) {
-
-        return {
-            success:
-                false,
-
-            chatId:
-                String(
-                    chatId
-                ),
-
-            error:
-                error?.message ||
-                String(
-                    error
-                ),
-
-            name:
-                error?.name ||
-                null,
-
-            stack:
-                error?.stack ||
-                null
-        };
-    }
-}
-
-async function handleMediaRequest(
-    request,
-    env,
-    chatId,
-    messageId
-) {
-
-    const numericChatId =
-        Number(
-            chatId
-        );
-
-    const numericMessageId =
-        Number(
-            messageId
-        );
-
-    if (
-        !Number.isSafeInteger(
-            numericChatId
-        )
-    ) {
-
-        return new Response(
-            "Invalid chat ID.",
-            {
-                status: 400
-            }
-        );
-    }
-
-    if (
-        !Number.isSafeInteger(
-            numericMessageId
-        )
-    ) {
-
-        return new Response(
-            "Invalid message ID.",
-            {
-                status: 400
-            }
-        );
-    }
-
-    const client =
-        await getTelegramClient(
-            env
-        );
-
-    /*
-     * Unlike /api/messages, do not call
-     * getChats() here.
-     *
-     * This is important for video seeking:
-     * every Range request can go directly
-     * through getInputPeer() and getMessage().
-     */
-
-    await client.getInputPeer(
-        numericChatId
-    );
-
-    const message =
-        await client.getMessage(
-            numericChatId,
-            numericMessageId
-        );
-
-    if (!message) {
-
-        return new Response(
-            "Message not found.",
-            {
-                status: 404
-            }
-        );
-    }
-
-    const media =
-        getMessageMedia(
-            message
-        );
-
-    if (!media) {
-
-        return new Response(
-            "Message has no supported media.",
-            {
-                status: 404
-            }
-        );
-    }
-
-    const url =
-        new URL(
-            request.url
-        );
-
-    const thumbParam =
-        url.searchParams.get(
-            "thumb"
-        );
-
-    let fileId =
-        media.fileId;
-
-    let contentType =
-        media.mimeType ||
-        "application/octet-stream";
-
-    let fileSize =
-        Number(
-            media.fileSize ||
-            0
-        );
-
-    let isThumbnail =
-        false;
-
-    if (
-        thumbParam !== null
-    ) {
-
-        const thumbIndex =
-            Number(
-                thumbParam
-            );
-
-        const thumbnails =
-            getMediaThumbnails(
-                media
-            );
-
-        if (
-            !Number.isInteger(
-                thumbIndex
-            ) ||
-            thumbIndex < 0 ||
-            thumbIndex >=
-                thumbnails.length
-        ) {
-
-            return new Response(
-                "Thumbnail not found.",
-                {
-                    status: 404
-                }
-            );
-        }
-
-        const thumbnail =
-            thumbnails[
-                thumbIndex
-            ];
-
-        if (
-            !thumbnail.fileId
-        ) {
-
-            return new Response(
-                "Thumbnail has no file ID.",
-                {
-                    status: 404
-                }
-            );
-        }
-
-        fileId =
-            thumbnail.fileId;
-
-        fileSize =
-            Number(
-                thumbnail.fileSize ||
-                0
-            );
-
-        isThumbnail =
-            true;
-    }
-
-    if (!fileId) {
-
-        return new Response(
-            "Media has no downloadable file ID.",
-            {
-                status: 404
-            }
-        );
-    }
-
-    if (
-        !Number.isFinite(
-            fileSize
-        ) ||
-        fileSize < 0
-    ) {
-
-        return new Response(
-            "Media has an invalid file size.",
-            {
-                status: 500
-            }
-        );
-    }
-
-    const rangeHeader =
-        request.headers.get(
-            "Range"
-        );
-
-    let rangeStart =
-        0;
-
-    let rangeEnd =
-        fileSize - 1;
-
-    let status =
-        200;
-
-    if (
-        rangeHeader
-    ) {
-
-        const match =
-            rangeHeader.match(
-                /^bytes=(\d*)-(\d*)$/
-            );
-
-        if (!match) {
-
-            return new Response(
-                "Invalid Range.",
-                {
-                    status: 416,
-
-                    headers: {
-                        "Content-Range":
-                            `bytes */${fileSize}`
-                    }
-                }
-            );
-        }
-
-        if (
-            match[1]
-        ) {
-
-            rangeStart =
-                Number(
-                    match[1]
-                );
-        }
-
-        if (
-            match[2]
-        ) {
-
-            rangeEnd =
-                Number(
-                    match[2]
-                );
-
-        } else {
-
-            rangeEnd =
-                fileSize - 1;
-        }
-
-        if (
-            !match[1] &&
-            match[2]
-        ) {
-
-            const requestedLength =
-                Number(
-                    match[2]
-                );
-
-            rangeStart =
-                Math.max(
-                    0,
-                    fileSize -
-                    requestedLength
-                );
-
-            rangeEnd =
-                fileSize - 1;
-        }
-
-        if (
-            !Number.isSafeInteger(
-                rangeStart
-            ) ||
-            !Number.isSafeInteger(
-                rangeEnd
-            ) ||
-            rangeStart > rangeEnd ||
-            rangeStart >= fileSize
-        ) {
-
-            return new Response(
-                "Requested range not satisfiable.",
-                {
-                    status: 416,
-
-                    headers: {
-                        "Content-Range":
-                            `bytes */${fileSize}`
-                    }
-                }
-            );
-        }
-
-        rangeEnd =
-            Math.min(
-                rangeEnd,
-                fileSize - 1
-            );
-
-        status =
-            206;
-    }
-
-    const responseLength =
-        fileSize === 0
-            ? 0
-            : rangeEnd -
-              rangeStart +
-              1;
-
-    const headers =
-        new Headers();
-
-    headers.set(
-        "Content-Type",
-        contentType
-    );
-
-    headers.set(
-        "Accept-Ranges",
-        "bytes"
-    );
-
-    headers.set(
-        "Content-Length",
-        String(
-            responseLength
-        )
-    );
-
-    headers.set(
-        "Cache-Control",
-        "public, max-age=31536000, immutable"
-    );
-
-    if (
-        status === 206
-    ) {
-
-        headers.set(
-            "Content-Range",
-            `bytes ${rangeStart}-${rangeEnd}/${fileSize}`
-        );
-    }
-
-    if (
-        request.method ===
-        "HEAD"
-    ) {
-
-        return new Response(
-            null,
-            {
-                status,
+            return new Response(stream,{
+                status:partial?206:200,
                 headers
-            }
-        );
-    }
-
-    const iterator =
-        client.download(
-            fileId,
-            {
-                offset:
-                    rangeStart,
-
-                signal:
-                    request.signal
-            }
-        );
-
-    /*
-     * For thumbnails, inspect the first
-     * downloaded bytes before sending them.
-     *
-     * The bytes are then immediately placed
-     * back into the HTTP stream, so detection
-     * does not discard anything.
-     */
-
-    let firstChunk =
-        null;
-
-    if (
-        isThumbnail
-    ) {
-
-        const firstResult =
-            await iterator.next();
-
-        if (
-            firstResult.done
-        ) {
-
-            return new Response(
-                "Thumbnail download returned no data.",
-                {
-                    status: 502
-                }
-            );
+            });
         }
 
-        firstChunk =
-            firstResult.value;
-
-        const detectedType =
-            detectImageMimeType(
-                firstChunk
-            );
-
-        if (
-            detectedType
-        ) {
-
-            contentType =
-                detectedType;
-
-        } else if (
-            !contentType ||
-            contentType ===
-                "application/octet-stream"
-        ) {
-
-            contentType =
-                "image/jpeg";
-        }
-
-        headers.set(
-            "Content-Type",
-            contentType
-        );
-    }
-
-    let bytesSent =
-        0;
-
-    const stream =
-        new ReadableStream({
-
-            async start(
-                controller
-            ) {
+        const stream=new ReadableStream({
+            async start(controller) {
+                let remaining=requestedLength;
 
                 try {
+                    for await(const chunk of download) {
+                        let bytes=chunk;
 
-                    if (
-                        firstChunk
-                    ) {
+                        if(remaining!==null) {
+                            if(remaining<=0)
+                                break;
 
-                        let chunk =
-                            firstChunk;
+                            if(bytes.length>remaining)
+                                bytes=bytes.slice(0,remaining);
 
-                        const remaining =
-                            responseLength -
-                            bytesSent;
-
-                        if (
-                            chunk.byteLength >
-                            remaining
-                        ) {
-
-                            chunk =
-                                chunk.slice(
-                                    0,
-                                    remaining
-                                );
+                            remaining-=bytes.length;
                         }
 
-                        if (
-                            chunk.byteLength
-                        ) {
+                        controller.enqueue(bytes);
 
-                            controller.enqueue(
-                                chunk
-                            );
-
-                            bytesSent +=
-                                chunk.byteLength;
-                        }
-
-                        if (
-                            bytesSent >=
-                            responseLength
-                        ) {
-
-                            controller.close();
-
-                            return;
-                        }
-                    }
-
-                    for await (
-                        const chunk
-                        of iterator
-                    ) {
-
-                        if (
-                            bytesSent >=
-                            responseLength
-                        ) {
-
+                        if(remaining===0)
                             break;
-                        }
-
-                        const remaining =
-                            responseLength -
-                            bytesSent;
-
-                        let output =
-                            chunk;
-
-                        if (
-                            output.byteLength >
-                            remaining
-                        ) {
-
-                            output =
-                                output.slice(
-                                    0,
-                                    remaining
-                                );
-                        }
-
-                        if (
-                            output.byteLength
-                        ) {
-
-                            controller.enqueue(
-                                output
-                            );
-
-                            bytesSent +=
-                                output.byteLength;
-                        }
-
-                        if (
-                            bytesSent >=
-                            responseLength
-                        ) {
-
-                            break;
-                        }
                     }
 
                     controller.close();
-
-                } catch (
-                    error
-                ) {
-
-                    controller.error(
-                        error
-                    );
+                } catch(error) {
+                    controller.error(error);
                 }
             }
         });
 
-    return new Response(
-        stream,
-        {
-            status,
+        return new Response(stream,{
+            status:partial?206:200,
             headers
-        }
-    );
+        });
+    } finally {
+        try {
+            await client.disconnect();
+        } catch {}
+    }
 }
 
-async function testDownload(
-    request,
-    env,
-    chatId,
-    messageId
-) {
+async function testDownload(env,chatId,messageId) {
+    const numericChatId=Number(chatId);
+    const numericMessageId=Number(messageId);
 
-    const started =
-        Date.now();
+    if(!Number.isSafeInteger(numericChatId) ||
+       !Number.isSafeInteger(numericMessageId))
+        return {
+            success:false,
+            error:"Invalid chat or message ID."
+        };
 
-    const client =
-        await getTelegramClient(
-            env
-        );
+    const client=await getTelegramClient(env);
 
-    const numericChatId =
-        Number(
-            chatId
-        );
+    try {
+        const chat=await getChatForId(client,numericChatId);
 
-    const numericMessageId =
-        Number(
-            messageId
-        );
+        await client.getInputPeer(chat.id);
 
-    await client.getInputPeer(
-        numericChatId
-    );
-
-    const message =
-        await client.getMessage(
-            numericChatId,
+        const message=await client.getMessage(
+            chat.id,
             numericMessageId
         );
 
-    if (!message) {
+        if(!message)
+            throw new Error("Message not found.");
 
-        throw new Error(
-            `Telegram message not found: ${messageId}`
-        );
-    }
+        const media=getMessageMedia(message);
 
-    const media =
-        getMessageMediaInfo(
-            message
-        );
+        if(!media)
+            throw new Error("Message has no supported media.");
 
-    if (!media.fileId) {
+        const started=Date.now();
+        let bytesDownloaded=0;
+        let chunks=0;
 
-        throw new Error(
-            "The selected message does not contain downloadable media."
-        );
-    }
+        const download=client.download(media.fileId,{
+            signal:undefined
+        });
 
-    if (!media.fileSize) {
-
-        throw new Error(
-            "MTKruto returned media without a file size."
-        );
-    }
-
-    let bytes =
-        0;
-
-    let chunks =
-        0;
-
-    const iterator =
-        client.download(
-            media.fileId,
-            {
-                signal:
-                    request.signal
-            }
-        );
-
-    for await (
-        const chunk
-        of iterator
-    ) {
-
-        if (
-            request.signal.aborted
-        ) {
-
-            return json(
-                {
-                    success:
-                        false,
-
-                    aborted:
-                        true,
-
-                    bytesDownloaded:
-                        bytes,
-
-                    chunks,
-
-                    fileSize:
-                        media.fileSize,
-
-                    elapsedMs:
-                        Date.now() -
-                        started
-                },
-                499
-            );
+        for await(const chunk of download) {
+            bytesDownloaded+=chunk.length;
+            chunks++;
         }
 
-        bytes +=
-            chunk.byteLength;
-
-        chunks++;
+        return {
+            success:true,
+            test:"mtkruto-download-discard",
+            chatId:String(chat.id),
+            messageId:String(message.id),
+            fileId:media.fileId,
+            fileSize:media.fileSize??null,
+            bytesDownloaded,
+            chunks,
+            elapsedMs:Date.now()-started
+        };
+    } catch(error) {
+        return {
+            success:false,
+            ...errorInfo(error)
+        };
+    } finally {
+        try {
+            await client.disconnect();
+        } catch {}
     }
-
-    return json({
-        success:
-            true,
-
-        test:
-            "mtkruto-download-discard",
-
-        chatId:
-            String(
-                chatId
-            ),
-
-        messageId:
-            String(
-                messageId
-            ),
-
-        fileId:
-            media.fileId,
-
-        fileSize:
-            media.fileSize,
-
-        bytesDownloaded:
-            bytes,
-
-        chunks,
-
-        elapsedMs:
-            Date.now() -
-            started
-    });
 }
 
-async function handleRequest(
-    request,
-    env
-) {
+async function main(request,env) {
+    const url=new URL(request.url);
+    const path=url.pathname;
 
-    const url =
-        new URL(
-            request.url
-        );
-
-    const path =
-        url.pathname;
-
-    if (
-        path === "/"
-    ) {
-
-        return html(`
-<!doctype html>
-
+    if(path==="/")
+        return html(`<!doctype html>
 <html>
-
 <head>
-
 <meta charset="utf-8">
-
-<title>
-MTKruto Telegram Test
-</title>
-
+<title>Telegram Media Test</title>
 <style>
-
-body {
-    font-family: sans-serif;
-    max-width: 900px;
-    margin: 40px auto;
-    padding: 0 20px;
-}
-
-select {
-    width: 100%;
-    max-width: 750px;
-    padding: 8px;
-    margin: 6px 0 16px;
-}
-
-a {
-    display: inline-block;
-    margin: 8px 12px 8px 0;
-}
-
-pre {
-    white-space: pre-wrap;
-    word-break: break-word;
-    background: #f4f4f4;
-    padding: 12px;
-}
-
-.status {
-    margin: 15px 0;
-    font-weight: bold;
-}
-
+body{font-family:system-ui,sans-serif;margin:30px;max-width:1100px}
+select,button{font-size:16px;padding:6px;margin:4px}
+a{display:block;margin:6px 0}
+pre{white-space:pre-wrap;word-break:break-word}
+img{max-width:500px;max-height:500px}
+video{max-width:800px;max-height:600px}
 </style>
-
 </head>
-
 <body>
+<h1>Telegram Media Test</h1>
 
-<h1>
-MTKruto Telegram Test
-</h1>
-
-<div
-    class="status"
-    id="status"
->
-Loading chats...
+<div>
+<label>Chat:
+<select id="chat"></select>
+</label>
 </div>
 
-<label>
-Chat
+<div>
+<label>Message:
+<select id="message"></select>
 </label>
-
-<select id="chat">
-</select>
-
-<label>
-Message
-</label>
-
-<select id="message">
-</select>
-
-<div id="buttons">
 </div>
 
-<pre id="info">
-</pre>
+<div id="details"></div>
 
 <script>
+const chatSelect=document.getElementById("chat");
+const messageSelect=document.getElementById("message");
+const details=document.getElementById("details");
 
-const chatSelect =
-    document.getElementById(
-        "chat"
-    );
+let chats=[];
+let messages=[];
 
-const messageSelect =
-    document.getElementById(
-        "message"
-    );
+async function loadChats(){
+    const r=await fetch("/api/chats");
+    const data=await r.json();
 
-const status =
-    document.getElementById(
-        "status"
-    );
+    chats=data.chats||[];
 
-const info =
-    document.getElementById(
-        "info"
-    );
+    chatSelect.innerHTML="";
 
-const buttons =
-    document.getElementById(
-        "buttons"
-    );
-
-let chats = [];
-
-let messages = [];
-
-async function loadChats() {
-
-    status.textContent =
-        "Loading chats...";
-
-    const response =
-        await fetch(
-            "/api/chats"
-        );
-
-    const text =
-        await response.text();
-
-    let data;
-
-    try {
-
-        data =
-            JSON.parse(
-                text
-            );
-
-    } catch {
-
-        throw new Error(
-            "Non-JSON response from /api/chats:\\n\\n" +
-            text
-        );
+    for(const chat of chats){
+        const o=document.createElement("option");
+        o.value=chat.id;
+        o.textContent=
+            chat.title||
+            [chat.firstName,chat.lastName].filter(Boolean).join(" ")||
+            String(chat.id);
+        chatSelect.appendChild(o);
     }
-
-    if (!response.ok) {
-
-        throw new Error(
-            JSON.stringify(
-                data,
-                null,
-                2
-            )
-        );
-    }
-
-    if (
-        !Array.isArray(
-            data
-        )
-    ) {
-
-        throw new Error(
-            "Unexpected /api/chats response:\\n\\n" +
-            JSON.stringify(
-                data,
-                null,
-                2
-            )
-        );
-    }
-
-    chats =
-        data;
-
-    chatSelect.innerHTML =
-        "";
-
-    for (
-        const chat
-        of chats
-    ) {
-
-        const option =
-            document.createElement(
-                "option"
-            );
-
-        option.value =
-            chat.id;
-
-        option.textContent =
-            chat.title +
-            " [" +
-            (
-                chat.type ||
-                "unknown"
-            ) +
-            "] — ID: " +
-            chat.id;
-
-        chatSelect.appendChild(
-            option
-        );
-    }
-
-    status.textContent =
-        chats.length +
-        " chats loaded.";
 
     await loadMessages();
 }
 
-async function loadMessages() {
+async function loadMessages(){
+    const id=Number(chatSelect.value);
 
-    const chatId =
-        chatSelect.value;
+    const r=await fetch("/api/messages?chat="+encodeURIComponent(id));
+    const data=await r.json();
 
-    if (!chatId) {
-
+    if(!data.success){
+        details.innerHTML="<pre>"+escapeHtml(JSON.stringify(data,null,2))+"</pre>";
         return;
     }
 
-    status.textContent =
-        "Loading messages...";
+    messages=data.messages||[];
+    messageSelect.innerHTML="";
 
-    buttons.innerHTML =
-        "";
+    for(const message of messages){
+        const o=document.createElement("option");
+        o.value=message.id;
 
-    const apiLink =
-        document.createElement(
-            "a"
-        );
+        const media=message.media;
+        const label=
+            "#"+message.id+
+            (media?.fileName?" - "+media.fileName:"")+
+            (media?.type?" ["+media.type+"]":"");
 
-    apiLink.href =
-        "/api/messages?chatId=" +
-        encodeURIComponent(
-            chatId
-        );
-
-    apiLink.target =
-        "_blank";
-
-    apiLink.textContent =
-        "Open Messages API";
-
-    buttons.appendChild(
-        apiLink
-    );
-
-    const chatLink =
-        document.createElement(
-            "a"
-        );
-
-    chatLink.href =
-        "/api/chat?chatId=" +
-        encodeURIComponent(
-            chatId
-        );
-
-    chatLink.target =
-        "_blank";
-
-    chatLink.textContent =
-        "Open Chat API";
-
-    buttons.appendChild(
-        chatLink
-    );
-
-    try {
-
-        const response =
-            await fetch(
-                "/api/messages?chatId=" +
-                encodeURIComponent(
-                    chatId
-                )
-            );
-
-        const text =
-            await response.text();
-
-        let data;
-
-        try {
-
-            data =
-                JSON.parse(
-                    text
-                );
-
-        } catch {
-
-            throw new Error(
-                "Non-JSON response:\\n\\n" +
-                text
-            );
-        }
-
-        info.textContent =
-            JSON.stringify(
-                data,
-                null,
-                2
-            );
-
-        if (
-            !response.ok ||
-            data.success === false
-        ) {
-
-            status.textContent =
-                "MESSAGE ERROR";
-
-            messages =
-                [];
-
-            messageSelect.innerHTML =
-                "";
-
-            return;
-        }
-
-        messages =
-            data.messages ||
-            [];
-
-        messageSelect.innerHTML =
-            "";
-
-        for (
-            const message
-            of messages
-        ) {
-
-            const option =
-                document.createElement(
-                    "option"
-                );
-
-            option.value =
-                message.id;
-
-            let label =
-                "#" +
-                message.id;
-
-            if (
-                message.fileName
-            ) {
-
-                label +=
-                    " " +
-                    message.fileName;
-
-            } else if (
-                message.text
-            ) {
-
-                label +=
-                    " " +
-                    message.text
-                        .replace(
-                            /\s+/g,
-                            " "
-                        )
-                        .slice(
-                            0,
-                            100
-                        );
-
-            } else if (
-                message.mediaType
-            ) {
-
-                label +=
-                    " [" +
-                    message.mediaType +
-                    "]";
-
-            } else if (
-                message.type
-            ) {
-
-                label +=
-                    " [" +
-                    message.type +
-                    "]";
-            }
-
-            option.textContent =
-                label;
-
-            messageSelect.appendChild(
-                option
-            );
-        }
-
-        status.textContent =
-            data.count +
-            " messages loaded. Chat ID: " +
-            data.chatId;
-
-        updateMessage();
-
-    } catch (
-        error
-    ) {
-
-        status.textContent =
-            "MESSAGE LOAD ERROR";
-
-        info.textContent =
-            error.stack ||
-            String(
-                error
-            );
+        o.textContent=label;
+        messageSelect.appendChild(o);
     }
+
+    showMessage();
 }
 
-function updateMessage() {
+function escapeHtml(s){
+    return s.replace(/[&<>"']/g,c=>({
+        "&":"&amp;",
+        "<":"&lt;",
+        ">":"&gt;",
+        '"':"&quot;",
+        "'":"&#39;"
+    }[c]));
+}
 
-    const message =
-        messages.find(
-            item =>
-                String(
-                    item.id
-                ) ===
-                String(
-                    messageSelect.value
-                )
-        );
+function showMessage(){
+    const message=messages.find(
+        m=>Number(m.id)===Number(messageSelect.value)
+    );
 
-    if (!message) {
-
-        info.textContent =
-            "";
-
-        buttons.innerHTML =
-            "";
-
+    if(!message){
+        details.innerHTML="";
         return;
     }
 
-    info.textContent =
-        JSON.stringify(
-            message,
-            null,
-            2
-        );
+    const media=message.media;
+    const chat=Number(chatSelect.value);
+    const id=Number(message.id);
+    const mediaUrl=
+        location.origin+
+        "/media/"+chat+"/"+id;
 
-    buttons.innerHTML =
-        "";
+    let html="<h2>Message #"+id+"</h2>";
 
-    if (
-        message.mediaUrl
-    ) {
+    html+="<p><a href=\\""+mediaUrl+"\\">Open media</a></p>";
 
-        const media =
-            document.createElement(
-                "a"
-            );
+    html+="<p><a href=\\"/api/messages?chat="+chat+"\\">Open Messages API</a></p>";
+    html+="<p><a href=\\"/api/chat?chat="+chat+"\\">Open Chat API</a></p>";
 
-        media.href =
-            message.mediaUrl;
+    if(media?.thumbnails?.length){
+        html+="<h3>Thumbnails</h3>";
 
-        media.target =
-            "_blank";
+        for(const thumb of media.thumbnails){
+            const u=
+                "/media/"+chat+"/"+id+
+                "?thumb="+thumb.index;
 
-        media.textContent =
-            "Open media";
-
-        buttons.appendChild(
-            media
-        );
-    }
-
-    if (
-        message.thumbnails &&
-        message.thumbnails.length
-    ) {
-
-        for (
-            const thumbnail
-            of message.thumbnails
-        ) {
-
-            if (
-                !thumbnail.url
-            ) {
-
-                continue;
-            }
-
-            const link =
-                document.createElement(
-                    "a"
-            );
-
-            link.href =
-                thumbnail.url;
-
-            link.target =
-                "_blank";
-
-            link.textContent =
-                "Thumbnail " +
-                thumbnail.index +
-                " (" +
-                thumbnail.width +
-                "×" +
-                thumbnail.height +
-                ")";
-
-            buttons.appendChild(
-                link
-            );
+            html+=
+                "<a href=\\""+u+"\\">"+
+                "Thumbnail "+thumb.index+
+                " ("+thumb.width+"x"+thumb.height+")"+
+                "</a>";
         }
     }
 
-    if (
-        message.fileId
-    ) {
+    html+="<h3>Media JSON</h3>";
+    html+="<pre>"+
+        escapeHtml(JSON.stringify(media,null,2))+
+        "</pre>";
 
-        const test =
-            document.createElement(
-                "a"
-            );
+    html+="<p><a href=\\"/test-download/"+chat+"/"+id+"\\">Test full download</a></p>";
 
-        test.href =
-            "/test-download/" +
-            encodeURIComponent(
-                chatSelect.value
-            ) +
-            "/" +
-            encodeURIComponent(
-                message.id
-            );
+    if(media?.mimeType?.startsWith("image/"))
+        html+="<img src=\\""+mediaUrl+"\\">";
 
-        test.target =
-            "_blank";
+    if(media?.mimeType?.startsWith("video/"))
+        html+=
+            "<video controls preload=\\"metadata\\" src=\\""+
+            mediaUrl+
+            "\\"></video>";
 
-        test.textContent =
-            "Test full download";
-
-        buttons.appendChild(
-            test
-        );
-    }
+    details.innerHTML=html;
 }
 
-chatSelect.addEventListener(
-    "change",
-    () => {
+chatSelect.addEventListener("change",loadMessages);
+messageSelect.addEventListener("change",showMessage);
 
-        loadMessages()
-            .catch(
-                error => {
-
-                    status.textContent =
-                        "ERROR";
-
-                    info.textContent =
-                        error.stack ||
-                        String(
-                            error
-                        );
-                }
-            );
-    }
-);
-
-messageSelect.addEventListener(
-    "change",
-    updateMessage
-);
-
-loadChats()
-    .catch(
-        error => {
-
-            status.textContent =
-                "LOAD CHATS ERROR";
-
-            info.textContent =
-                error.stack ||
-                String(
-                    error
-                );
-        }
-    );
-
+loadChats();
 </script>
-
 </body>
+</html>`);
 
-</html>
-        `);
-    }
-
-    if (
-        path === "/api/chats"
-    ) {
-
-        const client =
-            await getTelegramClient(
-                env
-            );
-
-        return json(
-            await getChatList(
-                client
-            )
-        );
-    }
-
-    if (
-        path === "/api/chat"
-    ) {
-
-        const chatId =
-            url.searchParams.get(
-                "chatId"
-            );
-
-        if (!chatId) {
-
-            return json(
-                {
-                    success:
-                        false,
-
-                    error:
-                        "Missing chatId."
-                },
-                400
-            );
-        }
+    if(path==="/api/chats") {
+        const client=await getTelegramClient(env);
 
         try {
-
-            const client =
-                await getTelegramClient(
-                    env
-                );
-
-            const numericChatId =
-                Number(
-                    chatId
-                );
-
-            await client.getInputPeer(
-                numericChatId
-            );
-
-            const chats =
-                await client.getChats({
-                    from:
-                        "main",
-
-                    limit:
-                        100
-                });
-
-            const chatItem =
-                chats.find(
-                    item =>
-                        Number(
-                            item.chat.id
-                        ) ===
-                        numericChatId
-                );
-
-            if (!chatItem) {
-
-                throw new Error(
-                    `Chat ${chatId} was not found.`
-                );
-            }
-
-            const chat =
-                chatItem.chat;
-
-            return json({
-                success:
-                    true,
-
-                requestedChatId:
-                    chatId,
-
-                chat
+            const result=await client.getChats({
+                from:"main",
+                limit:100
             });
 
-        } catch (
-            error
-        ) {
+            const items=Array.isArray(result)
+                ?result
+                :(result?.chats||[]);
 
-            return json(
-                {
-                    success:
-                        false,
+            const chats=items.map(item=>{
+                const chat=item?.chat||item;
 
-                    requestedChatId:
-                        chatId,
+                return {
+                    id:chat?.id??null,
+                    title:chat?.title??null,
+                    firstName:chat?.firstName??null,
+                    lastName:chat?.lastName??null,
+                    username:chat?.username??null,
+                    type:chat?.type??null
+                };
+            });
 
-                    error:
-                        error?.message ||
-                        String(
-                            error
-                        ),
-
-                    name:
-                        error?.name ||
-                        null,
-
-                    stack:
-                        error?.stack ||
-                        null
-                },
-                500
-            );
+            return json({
+                success:true,
+                chats
+            });
+        } catch(error) {
+            return json({
+                success:false,
+                ...errorInfo(error)
+            },500);
+        } finally {
+            try {
+                await client.disconnect();
+            } catch {}
         }
     }
 
-    if (
-        path === "/api/messages"
-    ) {
+    if(path==="/api/chat") {
+        const chatId=url.searchParams.get("chat");
 
-        const chatId =
-            url.searchParams.get(
-                "chatId"
-            );
+        if(chatId===null)
+            return json({
+                success:false,
+                error:"Missing chat parameter."
+            },400);
 
-        if (!chatId) {
+        const client=await getTelegramClient(env);
 
-            return json(
-                {
-                    success:
-                        false,
+        try {
+            const chat=await getChatForId(client,Number(chatId));
 
-                    error:
-                        "Missing chatId."
-                },
-                400
-            );
+            return json({
+                success:true,
+                chat
+            });
+        } catch(error) {
+            return json({
+                success:false,
+                ...errorInfo(error)
+            },500);
+        } finally {
+            try {
+                await client.disconnect();
+            } catch {}
         }
+    }
 
-        const client =
-            await getTelegramClient(
-                env
-            );
+    if(path==="/api/messages") {
+        const chatId=url.searchParams.get("chat");
 
-        const result =
-            await getMessages(
+        if(chatId===null)
+            return json({
+                success:false,
+                error:"Missing chat parameter."
+            },400);
+
+        const client=await getTelegramClient(env);
+
+        try {
+            const {chat,messages}=await getMessages(
                 client,
-                chatId,
-                request.url
+                Number(chatId)
             );
 
-        return json(
-            result,
-            result.success
-                ? 200
-                : 500
-        );
+            return json({
+                success:true,
+                chat:{
+                    id:chat.id,
+                    title:chat.title??null,
+                    firstName:chat.firstName??null,
+                    lastName:chat.lastName??null,
+                    username:chat.username??null,
+                    type:chat.type??null
+                },
+                messages:messages.map(message=>{
+                    const media=getMessageMediaInfo(message);
+
+                    return {
+                        id:message.id,
+                        date:message.date??null,
+                        type:message.type??null,
+                        text:message.text??message.caption??"",
+                        media:media.hasMedia
+                            ?{
+                                ...media,
+                                url:
+                                    `${url.origin}/media/`+
+                                    `${chat.id}/${message.id}`,
+                                thumbnails:media.thumbnails.map(thumb=>({
+                                    ...thumb,
+                                    url:
+                                        `${url.origin}/media/`+
+                                        `${chat.id}/${message.id}`+
+                                        `?thumb=${thumb.index}`
+                                }))
+                            }
+                            :null
+                    };
+                })
+            });
+        } catch(error) {
+            return json({
+                success:false,
+                chatId:String(chatId),
+                ...errorInfo(error)
+            },500);
+        } finally {
+            try {
+                await client.disconnect();
+            } catch {}
+        }
     }
 
-    const mediaMatch =
-        path.match(
-            /^\/media\/([^/]+)\/([^/]+)$/
-        );
+    const mediaMatch=
+        path.match(/^\/media\/(-?\d+)\/(\d+)$/);
 
-    if (mediaMatch) {
-
+    if(mediaMatch)
         return handleMediaRequest(
             request,
             env,
-            decodeURIComponent(
-                mediaMatch[1]
-            ),
-            decodeURIComponent(
-                mediaMatch[2]
-            )
-        );
-    }
-
-    const testMatch =
-        path.match(
-            /^\/test-download\/([^/]+)\/([^/]+)$/
+            mediaMatch[1],
+            mediaMatch[2]
         );
 
-    if (testMatch) {
+    const testMatch=
+        path.match(/^\/test-download\/(-?\d+)\/(\d+)$/);
 
-        return testDownload(
-            request,
+    if(testMatch) {
+        const result=await testDownload(
             env,
-            decodeURIComponent(
-                testMatch[1]
-            ),
-            decodeURIComponent(
-                testMatch[2]
-            )
+            testMatch[1],
+            testMatch[2]
         );
+
+        return json(result,result.success?200:500);
     }
 
-    return new Response(
-        "Not Found",
-        {
-            status: 404
-        }
-    );
+    return new Response("Not found",{
+        status:404
+    });
 }
 
 export default {
-
-    async fetch(
-        request,
-        env
-    ) {
-
+    async fetch(request,env) {
         try {
-
-            return await handleRequest(
-                request,
-                env
-            );
-
-        } catch (error) {
-
-            return json(
-                errorInfo(
-                    error
-                ),
-                500
-            );
+            return await main(request,env);
+        } catch(error) {
+            return json({
+                success:false,
+                ...errorInfo(error)
+            },500);
         }
     }
 };

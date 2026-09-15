@@ -95,12 +95,77 @@ async function getTelegramClient(
     return client;
 }
 
+function getMessageMedia(
+    message
+) {
+
+    switch (
+        message?.type
+    ) {
+
+        case "photo":
+        case "livePhoto":
+            return message.photo || null;
+
+        case "document":
+            return message.document || null;
+
+        case "video":
+            return message.video || null;
+
+        case "animation":
+            return message.animation || null;
+
+        case "audio":
+            return message.audio || null;
+
+        case "voice":
+            return message.voice || null;
+
+        case "videoNote":
+            return message.videoNote || null;
+
+        case "sticker":
+            return message.sticker || null;
+
+        default:
+            return null;
+    }
+}
+
+function getMediaThumbnails(
+    media
+) {
+
+    if (
+        Array.isArray(
+            media?.thumbnails
+        )
+    ) {
+
+        return media.thumbnails;
+    }
+
+    if (
+        media?.thumbnail
+    ) {
+
+        return [
+            media.thumbnail
+        ];
+    }
+
+    return [];
+}
+
 function getMessageMediaInfo(
     message
 ) {
 
     const media =
-        message?.media;
+        getMessageMedia(
+            message
+        );
 
     if (!media) {
 
@@ -141,41 +206,9 @@ function getMessageMediaInfo(
     }
 
     const thumbnails =
-        Array.isArray(
-            media.thumbnails
-        )
-            ? media.thumbnails.map(
-                (
-                    thumbnail,
-                    index
-                ) => ({
-
-                    index,
-
-                    fileId:
-                        thumbnail.fileId ||
-                        null,
-
-                    fileUniqueId:
-                        thumbnail.fileUniqueId ||
-                        null,
-
-                    width:
-                        thumbnail.width ||
-                        null,
-
-                    height:
-                        thumbnail.height ||
-                        null,
-
-                    fileSize:
-                        Number(
-                            thumbnail.fileSize ||
-                            0
-                        )
-                })
-            )
-            : [];
+        getMediaThumbnails(
+            media
+        );
 
     return {
         hasMedia:
@@ -183,6 +216,7 @@ function getMessageMediaInfo(
 
         type:
             media.type ||
+            message.type ||
             null,
 
         fileId:
@@ -219,7 +253,38 @@ function getMessageMediaInfo(
             media.duration ||
             null,
 
-        thumbnails
+        thumbnails:
+            thumbnails.map(
+                (
+                    thumbnail,
+                    index
+                ) => ({
+
+                    index,
+
+                    fileId:
+                        thumbnail.fileId ||
+                        null,
+
+                    fileUniqueId:
+                        thumbnail.fileUniqueId ||
+                        null,
+
+                    width:
+                        thumbnail.width ||
+                        null,
+
+                    height:
+                        thumbnail.height ||
+                        null,
+
+                    fileSize:
+                        Number(
+                            thumbnail.fileSize ||
+                            0
+                        )
+                })
+            )
     };
 }
 
@@ -648,12 +713,14 @@ async function handleMediaRequest(
     }
 
     const media =
-        message.media;
+        getMessageMedia(
+            message
+        );
 
     if (!media) {
 
         return new Response(
-            "Message has no media.",
+            "Message has no supported media.",
             {
                 status: 404
             }
@@ -693,11 +760,9 @@ async function handleMediaRequest(
             );
 
         const thumbnails =
-            Array.isArray(
-                media.thumbnails
-            )
-                ? media.thumbnails
-                : [];
+            getMediaThumbnails(
+                media
+            );
 
         if (
             !Number.isInteger(

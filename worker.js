@@ -1740,7 +1740,25 @@ async function fetchImageParts(
     mimeType,
     token
 ) {
-    const partCount = Math.min(4, fileSize > 0 ? 4 : 0);
+    const partCount =
+        fileSize >= 4 * TELEGRAM_OFFSET_ALIGNMENT
+            ? 4
+            : 1;
+
+    const boundaries = [0];
+
+    for (let i = 1; i < partCount; i++) {
+        boundaries.push(
+            Math.floor(
+                (fileSize * i / partCount) /
+                TELEGRAM_OFFSET_ALIGNMENT
+            ) *
+            TELEGRAM_OFFSET_ALIGNMENT
+        );
+    }
+
+    boundaries.push(fileSize);
+
     const parts = new Array(partCount);
 
     async function fetchPart(index) {
@@ -1748,14 +1766,8 @@ async function fetchImageParts(
             throw new Error("Media load cancelled.");
         }
 
-        const start = Math.floor(
-            fileSize * index / partCount
-        );
-
-        const end = Math.floor(
-            fileSize * (index + 1) / partCount
-        );
-
+        const start = boundaries[index];
+        const end = boundaries[index + 1];
         const length = end - start;
 
         const params = new URLSearchParams({
@@ -1779,12 +1791,16 @@ async function fetchImageParts(
             } catch {}
 
             throw new Error(
-                `Image part ${index + 1} failed: HTTP ${response.status}` +
-                (errorText ? ` - ${errorText}` : "")
+                "Image part " +
+                (index + 1) +
+                " failed: HTTP " +
+                response.status +
+                (errorText ? " - " + errorText : "")
             );
         }
 
-        const buffer = await response.arrayBuffer();
+        const buffer =
+            await response.arrayBuffer();
 
         if (token !== mediaLoadToken) {
             throw new Error("Media load cancelled.");
@@ -1794,7 +1810,9 @@ async function fetchImageParts(
     }
 
     mediaStatus.textContent =
-        "Downloading image in 4 parts...";
+        partCount === 4
+            ? "Downloading image in 4 parts..."
+            : "Downloading image...";
 
     const partsCompleted = [];
 
@@ -1803,18 +1821,22 @@ async function fetchImageParts(
             {length: partCount},
             (_, index) =>
                 fetchPart(index).then(buffer => {
-                    partsCompleted[index] = buffer;
+                    partsCompleted[index] =
+                        buffer;
 
-                    const total = partsCompleted
-                        .filter(Boolean)
-                        .reduce(
-                            (sum, part) =>
-                                sum + part.byteLength,
-                            0
-                        );
+                    const total =
+                        partsCompleted
+                            .filter(Boolean)
+                            .reduce(
+                                (sum, part) =>
+                                    sum +
+                                    part.byteLength,
+                                0
+                            );
 
                     mediaProgress.style.width =
-                        (total / fileSize * 100) + "%";
+                        (total / fileSize * 100) +
+                        "%";
 
                     mediaStatus.textContent =
                         "Downloaded " +
@@ -1823,8 +1845,10 @@ async function fetchImageParts(
                         formatBytes(fileSize) +
                         " (" +
                         partsCompleted.filter(Boolean).length +
-                        " / 4 parts)";
-                    
+                        " / " +
+                        partCount +
+                        " parts)";
+
                     return buffer;
                 })
         )

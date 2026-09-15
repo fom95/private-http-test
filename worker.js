@@ -280,25 +280,50 @@ function createMediaHeaders({
     return headers;
 }
 
-async function streamFullDownload(client, fileId, size, signal) {
-    const iterator = client.download(fileId, {
-        chunkSize: TELEGRAM_CHUNK_SIZE,
-        signal
-    });
+async function streamFullDownload(
+    client,
+    fileId,
+    signal
+) {
+    const iterator =
+        client.download(fileId, {
+            chunkSize:
+                TELEGRAM_CHUNK_SIZE,
+            signal
+        });
 
-    const stream = new ReadableStream({
+    let disconnected = false;
+
+    async function disconnect() {
+        if (disconnected) {
+            return;
+        }
+
+        disconnected = true;
+
+        try {
+            await client.disconnect();
+        } catch {}
+    }
+
+    return new ReadableStream({
         async pull(controller) {
             try {
-                const result = await iterator.next();
+                const result =
+                    await iterator.next();
 
                 if (result.done) {
                     controller.close();
+                    await disconnect();
                     return;
                 }
 
-                controller.enqueue(result.value);
+                controller.enqueue(
+                    result.value
+                );
             } catch (error) {
                 controller.error(error);
+                await disconnect();
             }
         },
 
@@ -306,10 +331,10 @@ async function streamFullDownload(client, fileId, size, signal) {
             try {
                 await iterator.return?.();
             } catch {}
+
+            await disconnect();
         }
     });
-
-    return stream;
 }
 
 async function streamRangeDownload(
@@ -744,11 +769,36 @@ async function handleDirectMediaRequest(
     env,
     url
 ) {
-    const chatId =
+    if (
+        request.method !== "GET" &&
+        request.method !== "HEAD"
+    ) {
+        return new Response(null, {
+            status: 405,
+            headers: {
+                Allow: "GET, HEAD"
+            }
+        });
+    }
+
+    const pathParts =
+        url.pathname
+            .split("/")
+            .filter(Boolean);
+
+    let chatId =
         url.searchParams.get("chat");
 
-    const messageId =
+    let messageId =
         url.searchParams.get("message");
+
+    if (
+        pathParts[0] === "media" &&
+        pathParts.length >= 3
+    ) {
+        chatId = pathParts[1];
+        messageId = pathParts[2];
+    }
 
     const thumbnail =
         url.searchParams.get("thumbnail");
@@ -817,8 +867,7 @@ async function handleDirectMediaRequest(
             const selected =
                 thumbnails[
                     thumbnails.length - 1
-                ] ||
-                thumbnails[0];
+                ] || thumbnails[0];
 
             fileId =
                 selected.fileId;
@@ -840,9 +889,10 @@ async function handleDirectMediaRequest(
 
         if (
             !fileId ||
-            !Number.isFinite(
+            !Number.isSafeInteger(
                 Number(fileSize)
-            )
+            ) ||
+            Number(fileSize) <= 0
         ) {
             return json({
                 success: false,
@@ -866,81 +916,22 @@ async function handleDirectMediaRequest(
             });
         }
 
-        const rangeHeader =
-            request.headers.get(
-                "Range"
-            );
-
-        if (!rangeHeader) {
-            const stream =
-                await streamFullDownload(
-                    client,
-                    fileId,
-                    fileSize,
-                    request.signal
-                );
-
-            const response =
-                new Response(
-                    stream,
-                    {
-                        status: 200,
-                        headers:
-                            createMediaHeaders({
-                                mimeType,
-                                size: fileSize,
-                                filename
-                            })
-                    }
-                );
-
-            response.headers.set(
-                "X-Telegram-File-Size",
-                String(fileSize)
-            );
-
-            return response;
-        }
-
-        const range =
-            parseRange(
-                rangeHeader,
-                fileSize
-            );
-
-        if (!range) {
-            return new Response(null, {
-                status: 416,
-                headers: {
-                    "Content-Range":
-                        `bytes */${fileSize}`,
-                    "Cache-Control":
-                        "no-store"
-                }
-            });
-        }
-
         const stream =
-            await streamRangeDownload(
+            await streamFullDownload(
                 client,
                 fileId,
-                fileSize,
-                range.start,
-                range.end,
                 request.signal
             );
 
         return new Response(
             stream,
             {
-                status: 206,
+                status: 200,
                 headers:
                     createMediaHeaders({
                         mimeType,
                         size: fileSize,
-                        filename,
-                        start: range.start,
-                        end: range.end
+                        filename
                     })
             }
         );
@@ -2662,11 +2653,11 @@ async function selectMessage(
 
     addLink(
         "Direct media URL",
-        "/image?chat=" +
+        "/media/" +
         encodeURIComponent(
             selectedChatId
         ) +
-        "&message=" +
+        "/" +
         encodeURIComponent(
             selectedMessageId
         )
@@ -2831,47 +2822,14 @@ export default {
             }
 
             if (
-                url.pathname.startsWith(
-                    "/media/"
-                )
+                url.pathname === "/media" ||
+                url.pathname.startsWith("/media/")
             ) {
-                const parts =
-                    url.pathname
-                        .split("/")
-                        .filter(
-                            Boolean
-                        );
-
-                if (
-                    parts.length >= 3
-                ) {
-                    const chatId =
-                        parts[1];
-
-                    const messageId =
-                        parts[2];
-
-                    const mediaUrl =
-                        new URL(
-                            "/media",
-                            url.origin
-                        );
-
-                    mediaUrl.searchParams.set(
-                        "chat",
-                        chatId
-                    );
-
-                    mediaUrl.searchParams.set(
-                        "message",
-                        messageId
-                    );
-
-                    return Response.redirect(
-                        mediaUrl,
-                        302
-                    );
-                }
+                return await handleDirectMediaRequest(
+                    request,
+                    env,
+                    url
+                );
             }
 
             return new Response(

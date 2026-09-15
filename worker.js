@@ -1,831 +1,785 @@
 import { Client } from "@mtkruto/mtkruto";
 
-const TELEGRAM_CHUNK_SIZE=256*1024;
+const TELEGRAM_CHUNK_SIZE = 256 * 1024;
+const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 
-function json(data,status=200,headers={}) {
-    return new Response(JSON.stringify(data,null,2),{
+function json(data, status = 200, extraHeaders = {}) {
+    return new Response(JSON.stringify(data, null, 2), {
         status,
-        headers:{
-            "Content-Type":"application/json; charset=utf-8",
-            ...headers
+        headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            ...extraHeaders
         }
     });
 }
 
-function html(body,status=200) {
-    return new Response(body,{
+function html(body, status = 200) {
+    return new Response(`<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Telegram Media Test</title>
+<style>
+*{box-sizing:border-box}
+body{
+    margin:0;
+    padding:24px;
+    background:#111;
+    color:#ddd;
+    font:14px system-ui,sans-serif;
+}
+main{
+    max-width:1000px;
+    margin:auto;
+}
+h1,h2{
+    color:#fff;
+}
+h1{
+    margin-top:0;
+}
+section{
+    background:#1b1b1b;
+    border:1px solid #333;
+    border-radius:8px;
+    padding:16px;
+    margin:16px 0;
+}
+select,button{
+    background:#222;
+    color:#eee;
+    border:1px solid #555;
+    border-radius:5px;
+    padding:7px 10px;
+}
+select{
+    width:100%;
+    max-width:700px;
+}
+button{
+    cursor:pointer;
+}
+button:hover{
+    background:#333;
+}
+label{
+    display:block;
+    margin:8px 0 5px;
+}
+a{
+    color:#7db7ff;
+    display:block;
+    margin:8px 0;
+    overflow-wrap:anywhere;
+}
+pre{
+    white-space:pre-wrap;
+    overflow-wrap:anywhere;
+    background:#0b0b0b;
+    border:1px solid #292929;
+    padding:12px;
+    border-radius:5px;
+    max-height:500px;
+    overflow:auto;
+}
+.item{
+    border-top:1px solid #333;
+    padding:10px 0;
+}
+.item:first-child{
+    border-top:0;
+}
+.small{
+    color:#999;
+}
+.error{
+    color:#ff7777;
+}
+</style>
+</head>
+<body>
+<main>
+${body}
+</main>
+</body>
+</html>`, {
         status,
-        headers:{"Content-Type":"text/html; charset=utf-8"}
+        headers: {
+            "Content-Type": "text/html; charset=utf-8"
+        }
     });
 }
 
 function errorInfo(error) {
     return {
-        error:String(error?.message||error),
-        name:error?.name||null,
-        stack:error?.stack||null
+        success: false,
+        error: error?.message || String(error),
+        name: error?.name || "Error",
+        stack: error?.stack
     };
 }
 
 async function getTelegramClient(env) {
-    const apiId=Number(await env.API_ID.get());
-    const apiHash=await env.API_HASH.get();
-    const authString=await env.MTKRUTO_SESSION.get();
+    const apiId = Number(await env.API_ID.get());
+    const apiHash = await env.API_HASH.get();
+    const authString = await env.MTKRUTO_SESSION.get();
 
-    const client=new Client({
+    if (!apiId || !apiHash || !authString) {
+        throw new Error("Missing Telegram credentials or MTKruto session.");
+    }
+
+    const client = new Client({
         apiId,
         apiHash,
         authString,
-        persistCache:false,
-        defaultHandlers:false,
-        disableUpdates:true
+        persistCache: false,
+        defaultHandlers: false,
+        disableUpdates: true
     });
 
     await client.connect();
-
     return client;
 }
 
 function getMessageMedia(message) {
-    switch(message?.type) {
-        case "photo":
-        case "livePhoto":
-            return message.photo||null;
+    if (!message) return null;
 
-        case "document":
-            return message.document||null;
-
-        case "video":
-            return message.video||null;
-
-        case "animation":
-            return message.animation||null;
-
-        case "audio":
-            return message.audio||null;
-
-        case "voice":
-            return message.voice||null;
-
-        case "videoNote":
-            return message.videoNote||null;
-
-        case "sticker":
-            return message.sticker||null;
-
-        default:
-            return null;
-    }
-}
-
-function getMediaThumbnails(media) {
-    if(Array.isArray(media?.thumbnails) && media.thumbnails.length)
-        return media.thumbnails;
-
-    if(media?.thumbnail)
-        return [media.thumbnail];
-
-    return [];
-}
-
-function getMessageMediaInfo(message) {
-    const media=getMessageMedia(message);
-
-    if(!media) {
+    if (message.type === "photo" && message.photo) {
         return {
-            hasMedia:false,
-            type:null
+            type: "photo",
+            media: message.photo,
+            mimeType: "image/jpeg",
+            fileName: null
         };
     }
 
-    const thumbnails=getMediaThumbnails(media);
+    if (message.type === "livePhoto") {
+        if (message.photo) {
+            return {
+                type: "photo",
+                media: message.photo,
+                mimeType: "image/jpeg",
+                fileName: null
+            };
+        }
 
-    let mimeType=media.mimeType||null;
-
-    /*
-     * Telegram Photo media is image data, but MTKruto's Photo object
-     * does not expose mimeType. Telegram photos are JPEG files.
-     */
-    if(!mimeType &&
-       (message.type==="photo"||message.type==="livePhoto"))
-        mimeType="image/jpeg";
-
-    return {
-        hasMedia:true,
-        type:message.type,
-        fileId:media.fileId||null,
-        fileSize:media.fileSize??null,
-        fileName:media.fileName||null,
-        mimeType,
-        width:media.width??null,
-        height:media.height??null,
-        duration:media.duration??null,
-        thumbnailCount:thumbnails.length,
-        thumbnails:thumbnails.map((thumb,index)=>({
-            index,
-            fileId:thumb.fileId||null,
-            fileUniqueId:thumb.fileUniqueId||null,
-            fileSize:thumb.fileSize??null,
-            width:thumb.width??null,
-            height:thumb.height??null
-        }))
-    };
-}
-
-function detectImageMimeType(bytes) {
-    if(bytes.length>=3 &&
-       bytes[0]===0xff &&
-       bytes[1]===0xd8 &&
-       bytes[2]===0xff)
-        return "image/jpeg";
-
-    if(bytes.length>=8 &&
-       bytes[0]===0x89 &&
-       bytes[1]===0x50 &&
-       bytes[2]===0x4e &&
-       bytes[3]===0x47 &&
-       bytes[4]===0x0d &&
-       bytes[5]===0x0a &&
-       bytes[6]===0x1a &&
-       bytes[7]===0x0a)
-        return "image/png";
-
-    if(bytes.length>=6) {
-        const s=new TextDecoder().decode(bytes.slice(0,6));
-
-        if(s==="GIF87a"||s==="GIF89a")
-            return "image/gif";
+        if (message.video) {
+            return {
+                type: "video",
+                media: message.video,
+                mimeType: message.video.mimeType || "video/mp4",
+                fileName: message.video.fileName || null
+            };
+        }
     }
 
-    if(bytes.length>=12 &&
-       bytes[0]===0x52 &&
-       bytes[1]===0x49 &&
-       bytes[2]===0x46 &&
-       bytes[3]===0x46 &&
-       bytes[8]===0x57 &&
-       bytes[9]===0x45 &&
-       bytes[10]===0x42 &&
-       bytes[11]===0x50)
-        return "image/webp";
+    const types = [
+        ["document", "document"],
+        ["video", "video"],
+        ["animation", "animation"],
+        ["audio", "audio"],
+        ["voice", "voice"],
+        ["videoNote", "videoNote"],
+        ["sticker", "sticker"]
+    ];
 
-    if(bytes.length>=12) {
-        const s=new TextDecoder().decode(bytes.slice(4,12));
+    for (const [messageType, property] of types) {
+        if (message.type === messageType && message[property]) {
+            const media = message[property];
 
-        if(s==="ftypavif"||s==="ftypavis")
-            return "image/avif";
-
-        if(s==="ftypheic"||
-           s==="ftypheix"||
-           s==="ftyphevc"||
-           s==="ftyphevx")
-            return "image/heic";
+            return {
+                type: messageType,
+                media,
+                mimeType: media.mimeType || null,
+                fileName: media.fileName || null
+            };
+        }
     }
 
     return null;
 }
 
-async function getChatForId(client,chatId) {
-    const numericChatId=Number(chatId);
+function getMediaThumbnails(media) {
+    if (!media) return [];
 
-    if(!Number.isSafeInteger(numericChatId))
-        throw new Error(`Invalid chat ID: ${chatId}`);
+    const thumbnails = [];
 
-    const result=await client.getChats({
-        from:"main",
-        limit:100
-    });
-
-    const items=Array.isArray(result)
-        ?result
-        :(result?.chats||[]);
-
-    for(const item of items) {
-        const chat=item?.chat||item;
-
-        if(chat && Number(chat.id)===numericChatId)
-            return chat;
+    if (Array.isArray(media.thumbnails)) {
+        for (const thumbnail of media.thumbnails) {
+            if (thumbnail?.fileId) {
+                thumbnails.push(thumbnail);
+            }
+        }
     }
 
-    throw new Error(
-        `Chat ${numericChatId} was not found in the accessible chat list.`
-    );
+    if (media.thumbnail?.fileId) {
+        thumbnails.push(media.thumbnail);
+    }
+
+    return thumbnails;
 }
 
-async function getMessages(client,chatId) {
-    const numericChatId=Number(chatId);
+function getMessageMediaInfo(message) {
+    const info = getMessageMedia(message);
 
-    if(!Number.isSafeInteger(numericChatId))
-        throw new Error(`Invalid chat ID: ${chatId}`);
+    if (!info) return null;
 
-    const chat=await getChatForId(client,numericChatId);
-
-    await client.getInputPeer(chat.id);
-
-    const messages=await client.getHistory(chat.id,{
-        limit:100
-    });
+    const media = info.media;
 
     return {
-        chat,
-        messages
+        type: info.type,
+        fileId: media.fileId || null,
+        fileUniqueId: media.fileUniqueId || null,
+        fileSize: media.fileSize ?? null,
+        fileName: info.fileName,
+        mimeType: info.mimeType,
+        width: media.width ?? null,
+        height: media.height ?? null,
+        duration: media.duration ?? null,
+        thumbnails: getMediaThumbnails(media).map((thumbnail, index) => ({
+            index,
+            fileId: thumbnail.fileId,
+            fileUniqueId: thumbnail.fileUniqueId || null,
+            fileSize: thumbnail.fileSize ?? null,
+            width: thumbnail.width ?? null,
+            height: thumbnail.height ?? null
+        }))
     };
 }
 
-function parseRange(rangeHeader,fileSize) {
-    if(!rangeHeader)
-        return {
-            partial:false,
-            start:0,
-            end:fileSize>0?fileSize-1:null
-        };
+function detectImageMimeType(bytes) {
+    if (!bytes || bytes.length < 4) return null;
 
-    if(!fileSize)
-        return null;
+    if (
+        bytes[0] === 0xff &&
+        bytes[1] === 0xd8 &&
+        bytes[2] === 0xff
+    ) {
+        return "image/jpeg";
+    }
 
-    const match=/^bytes=(\d*)-(\d*)$/i.exec(
-        rangeHeader.trim()
+    if (
+        bytes[0] === 0x89 &&
+        bytes[1] === 0x50 &&
+        bytes[2] === 0x4e &&
+        bytes[3] === 0x47
+    ) {
+        return "image/png";
+    }
+
+    if (
+        bytes[0] === 0x47 &&
+        bytes[1] === 0x49 &&
+        bytes[2] === 0x46 &&
+        bytes[3] === 0x38
+    ) {
+        return "image/gif";
+    }
+
+    if (
+        bytes.length >= 12 &&
+        bytes[0] === 0x52 &&
+        bytes[1] === 0x49 &&
+        bytes[2] === 0x46 &&
+        bytes[3] === 0x46 &&
+        bytes[8] === 0x57 &&
+        bytes[9] === 0x45 &&
+        bytes[10] === 0x42 &&
+        bytes[11] === 0x50
+    ) {
+        return "image/webp";
+    }
+
+    if (
+        bytes.length >= 12 &&
+        bytes[4] === 0x66 &&
+        bytes[5] === 0x74 &&
+        bytes[6] === 0x79 &&
+        bytes[7] === 0x70
+    ) {
+        const brand = String.fromCharCode(
+            bytes[8],
+            bytes[9],
+            bytes[10],
+            bytes[11]
+        );
+
+        if (
+            brand === "avif" ||
+            brand === "avis" ||
+            brand === "heic" ||
+            brand === "heix" ||
+            brand === "hevc" ||
+            brand === "hevx"
+        ) {
+            return brand.startsWith("he") ? "image/heic" : "image/avif";
+        }
+    }
+
+    return null;
+}
+
+async function getChatForId(client, chatId) {
+    const numericId = Number(chatId);
+
+    if (!Number.isFinite(numericId)) {
+        throw new Error(`Invalid chat ID: ${chatId}`);
+    }
+
+    const chats = await client.getChats({
+        from: "main",
+        limit: 100
+    });
+
+    const chat = chats.find(item =>
+        item?.chat &&
+        Number(item.chat.id) === numericId
     );
 
-    if(!match)
-        return null;
+    if (!chat?.chat) {
+        throw new Error(`Chat ${chatId} was not found.`);
+    }
 
-    const startText=match[1];
-    const endText=match[2];
+    return chat.chat;
+}
+
+async function getMessages(client, chatId) {
+    const chat = await getChatForId(client, chatId);
+
+    const peer = await client.getInputPeer(chat.id);
+
+    return await client.getHistory(peer, {
+        limit: 100
+    });
+}
+
+function parseRange(rangeHeader, fileSize) {
+    if (!rangeHeader) return null;
+
+    const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+
+    if (!match) {
+        return {
+            error: "Invalid Range header."
+        };
+    }
+
+    const startText = match[1];
+    const endText = match[2];
+
+    if (!startText && !endText) {
+        return {
+            error: "Invalid Range header."
+        };
+    }
 
     let start;
     let end;
 
-    if(startText==="") {
-        const suffixLength=Number(endText);
+    if (!startText) {
+        const suffixLength = Number(endText);
 
-        if(!Number.isSafeInteger(suffixLength) ||
-           suffixLength<=0)
-            return null;
+        if (!Number.isInteger(suffixLength) || suffixLength <= 0) {
+            return {
+                error: "Invalid suffix Range."
+            };
+        }
 
-        start=Math.max(0,fileSize-suffixLength);
-        end=fileSize-1;
+        start = Math.max(0, fileSize - suffixLength);
+        end = fileSize - 1;
     } else {
-        start=Number(startText);
+        start = Number(startText);
 
-        if(!Number.isSafeInteger(start) ||
-           start<0 ||
-           start>=fileSize)
-            return null;
+        if (!Number.isInteger(start) || start < 0) {
+            return {
+                error: "Invalid Range start."
+            };
+        }
 
-        if(endText==="") {
-            end=fileSize-1;
+        if (start >= fileSize) {
+            return {
+                unsatisfied: true
+            };
+        }
+
+        if (endText) {
+            end = Number(endText);
+
+            if (!Number.isInteger(end) || end < start) {
+                return {
+                    error: "Invalid Range end."
+                };
+            }
+
+            end = Math.min(end, fileSize - 1);
         } else {
-            end=Number(endText);
-
-            if(!Number.isSafeInteger(end) ||
-               end<start)
-                return null;
-
-            end=Math.min(end,fileSize-1);
+            end = fileSize - 1;
         }
     }
 
     return {
-        partial:true,
         start,
         end
     };
 }
 
-function createResponseHeaders(
-    fileSize,
-    range,
+function createMediaHeaders({
     contentType,
+    contentLength,
+    fileSize,
+    start,
+    end,
     fileName
-) {
-    const start=range?.start||0;
-    const end=range?.end??(
-        fileSize>0
-            ?fileSize-1
-            :null
+}) {
+    const headers = new Headers();
+
+    headers.set(
+        "Content-Type",
+        contentType || "application/octet-stream"
     );
 
-    const partial=range?.partial||false;
+    headers.set(
+        "Content-Length",
+        String(contentLength)
+    );
 
-    const headers={
-        "Accept-Ranges":"bytes",
-        "Cache-Control":"public, max-age=31536000, immutable",
-        "Content-Type":contentType
-    };
+    headers.set(
+        "Accept-Ranges",
+        "bytes"
+    );
 
-    if(fileName) {
-        /*
-         * Explicitly inline rather than attachment.
-         */
-        headers["Content-Disposition"]=
-            `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`;
+    headers.set(
+        "Cache-Control",
+        "public, max-age=31536000, immutable"
+    );
+
+    headers.set(
+        "Content-Disposition",
+        fileName
+            ? `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`
+            : "inline"
+    );
+
+    if (start !== undefined && end !== undefined) {
+        headers.set(
+            "Content-Range",
+            `bytes ${start}-${end}/${fileSize}`
+        );
     }
 
-    if(fileSize>0 && end!==null) {
-        headers["Content-Length"]=
-            String(end-start+1);
-
-        if(partial) {
-            headers["Content-Range"]=
-                `bytes ${start}-${end}/${fileSize}`;
-        }
-    }
-
-    return {
-        headers,
-        start,
-        end,
-        partial,
-        length:
-            end===null
-                ?null
-                :end-start+1
-    };
+    return headers;
 }
 
-/*
- * Download the exact HTTP range using MTKruto's downloadChunk().
- *
- * This deliberately does NOT use client.download().
- * downloadChunk() returns one Uint8Array for the requested portion,
- * avoiding the async-generator streaming behavior that was producing
- * the 0-byte request.
- *
- * MTKruto's current documentation explicitly provides downloadChunk()
- * for downloading a specific chunk and shows 256 KiB as its example.
- */
-async function streamRange(
-    request,
+function createTelegramStream({
     client,
     fileId,
-    start,
-    length,
+    fileSize,
+    httpStart,
+    httpEnd,
     signal
-) {
-    const stream=new ReadableStream({
-        async start(controller) {
-            let offset=start;
-            let remaining=length;
+}) {
+    let telegramOffset =
+        Math.floor(httpStart / TELEGRAM_OFFSET_ALIGNMENT) *
+        TELEGRAM_OFFSET_ALIGNMENT;
 
+    let discardBefore = httpStart - telegramOffset;
+    let remaining = httpEnd - httpStart + 1;
+    let closed = false;
+
+    const cleanup = async () => {
+        if (closed) return;
+        closed = true;
+
+        try {
+            await client.disconnect();
+        } catch {}
+    };
+
+    return new ReadableStream({
+        async start(controller) {
             try {
-                while(remaining>0) {
-                    const amount=Math.min(
-                        TELEGRAM_CHUNK_SIZE,
+                while (remaining > 0) {
+                    if (signal?.aborted) {
+                        throw new DOMException(
+                            "The request was aborted.",
+                            "AbortError"
+                        );
+                    }
+
+                    /*
+                     * IMPORTANT:
+                     *
+                     * Never use `remaining` as chunkSize.
+                     *
+                     * MTKruto requires chunkSize to be divisible by 1024.
+                     * We always request the fixed 256 KiB Telegram chunk and
+                     * trim it to whatever the HTTP Range actually needs.
+                     */
+                    const chunk = await client.downloadChunk(fileId, {
+                        chunkSize: TELEGRAM_CHUNK_SIZE,
+                        offset: telegramOffset,
+                        signal
+                    });
+
+                    if (!chunk || chunk.length === 0) {
+                        throw new Error(
+                            `Telegram returned an empty chunk at offset ${telegramOffset}.`
+                        );
+                    }
+
+                    let from = discardBefore;
+
+                    if (from >= chunk.length) {
+                        throw new Error(
+                            `Telegram returned too little data at offset ${telegramOffset}.`
+                        );
+                    }
+
+                    const available = chunk.length - from;
+                    const sendLength = Math.min(
+                        available,
                         remaining
                     );
 
-                    const chunk=
-                        await client.downloadChunk(
-                            fileId,
-                            {
-                                chunkSize:amount,
-                                offset,
-                                signal
-                            }
-                        );
+                    const output =
+                        from === 0 && sendLength === chunk.length
+                            ? chunk
+                            : chunk.slice(from, from + sendLength);
 
-                    if(!chunk || chunk.length===0)
-                        throw new Error(
-                            `Telegram returned an empty chunk at offset ${offset}.`
-                        );
+                    controller.enqueue(output);
 
-                    /*
-                     * Telegram/MTKruto should return no more than the
-                     * requested chunk, but don't trust that blindly.
-                     */
-                    const bytes=
-                        chunk.length>remaining
-                            ?chunk.slice(0,remaining)
-                            :chunk;
-
-                    controller.enqueue(bytes);
-
-                    offset+=bytes.length;
-                    remaining-=bytes.length;
-
-                    if(bytes.length===0)
-                        throw new Error(
-                            `Telegram returned a zero-byte chunk at offset ${offset}.`
-                        );
+                    remaining -= sendLength;
+                    telegramOffset += chunk.length;
+                    discardBefore = 0;
                 }
 
                 controller.close();
-            } catch(error) {
-                controller.error(error);
-            }
-        }
-    });
-
-    return stream;
-}
-
-async function handleDirectMediaRequest(
-    request,
-    env,
-    fileId,
-    fileSize,
-    contentType,
-    fileName,
-    isThumbnail=false
-) {
-    if(!fileId)
-        return json({
-            success:false,
-            error:"Missing Telegram file ID."
-        },400);
-
-    const numericSize=Number(fileSize||0);
-
-    const range=parseRange(
-        request.headers.get("Range"),
-        numericSize
-    );
-
-    if(request.headers.has("Range") && !range) {
-        return new Response(null,{
-            status:416,
-            headers:{
-                "Content-Range":
-                    `bytes */${numericSize}`
-            }
-        });
-    }
-
-    const info=createResponseHeaders(
-        numericSize,
-        range,
-        contentType,
-        fileName
-    );
-
-    if(request.method==="HEAD") {
-        return new Response(null,{
-            status:info.partial?206:200,
-            headers:info.headers
-        });
-    }
-
-    const client=await getTelegramClient(env);
-
-    /*
-     * IMPORTANT:
-     *
-     * Do not disconnect here after returning the Response.
-     * The stream still needs the Telegram client.
-     *
-     * The stream's cancellation/completion lifecycle owns the client.
-     */
-    try {
-        let actualContentType=contentType;
-
-        /*
-         * Only thumbnails are MIME-sniffed.
-         *
-         * Full Telegram Photos are already explicitly image/jpeg.
-         * Full Documents retain their Telegram-provided MIME type.
-         */
-        if(isThumbnail) {
-            const probe=await client.downloadChunk(
-                fileId,
-                {
-                    chunkSize:Math.min(
-                        TELEGRAM_CHUNK_SIZE,
-                        info.length||TELEGRAM_CHUNK_SIZE
-                    ),
-                    offset:info.start,
-                    signal:request.signal
-                }
-            );
-
-            const detected=detectImageMimeType(probe);
-
-            if(detected)
-                actualContentType=detected;
-
-            info.headers["Content-Type"]=
-                actualContentType;
-
-            /*
-             * The probe already contains the first bytes.
-             * Rather than download them again, build a stream which
-             * emits the probe and then requests only the remainder.
-             */
-            const stream=new ReadableStream({
-                async start(controller) {
-                    let remaining=info.length;
-                    let offset=info.start;
-
-                    try {
-                        let first=probe;
-
-                        if(first.length>remaining)
-                            first=first.slice(0,remaining);
-
-                        if(first.length>0) {
-                            controller.enqueue(first);
-                            remaining-=first.length;
-                            offset+=first.length;
-                        }
-
-                        while(remaining>0) {
-                            const amount=Math.min(
-                                TELEGRAM_CHUNK_SIZE,
-                                remaining
-                            );
-
-                            const chunk=
-                                await client.downloadChunk(
-                                    fileId,
-                                    {
-                                        chunkSize:amount,
-                                        offset,
-                                        signal:request.signal
-                                    }
-                                );
-
-                            if(!chunk || chunk.length===0)
-                                throw new Error(
-                                    `Telegram returned an empty thumbnail chunk at offset ${offset}.`
-                                );
-
-                            const bytes=
-                                chunk.length>remaining
-                                    ?chunk.slice(0,remaining)
-                                    :chunk;
-
-                            controller.enqueue(bytes);
-
-                            offset+=bytes.length;
-                            remaining-=bytes.length;
-                        }
-
-                        controller.close();
-                    } catch(error) {
-                        controller.error(error);
-                    } finally {
-                        try {
-                            await client.disconnect();
-                        } catch {}
-                    }
-                },
-
-                async cancel() {
-                    try {
-                        await client.disconnect();
-                    } catch {}
-                }
-            });
-
-            return new Response(stream,{
-                status:info.partial?206:200,
-                headers:info.headers
-            });
-        }
-
-        /*
-         * Normal media.
-         *
-         * Keep the MTKruto client alive until the stream finishes.
-         */
-        const stream=new ReadableStream({
-            async start(controller) {
+                await cleanup();
+            } catch (error) {
                 try {
-                    const body=await streamRange(
-                        request,
-                        client,
-                        fileId,
-                        info.start,
-                        info.length,
-                        request.signal
-                    );
-
-                    const reader=body.getReader();
-
-                    try {
-                        while(true) {
-                            const result=
-                                await reader.read();
-
-                            if(result.done)
-                                break;
-
-                            controller.enqueue(
-                                result.value
-                            );
-                        }
-
-                        controller.close();
-                    } finally {
-                        try {
-                            reader.releaseLock();
-                        } catch {}
-                    }
-                } catch(error) {
                     controller.error(error);
                 } finally {
-                    try {
-                        await client.disconnect();
-                    } catch {}
+                    await cleanup();
                 }
-            },
+            }
+        },
 
-            async cancel() {
-                try {
-                    await client.disconnect();
-                } catch {}
+        async cancel() {
+            await cleanup();
+        }
+    });
+}
+
+async function handleDirectMediaRequest(request, env) {
+    const url = new URL(request.url);
+
+    const fileId = url.searchParams.get("file");
+
+    if (!fileId) {
+        return json({
+            success: false,
+            error: "Missing file parameter."
+        }, 400);
+    }
+
+    const requestedType =
+        url.searchParams.get("type") || "application/octet-stream";
+
+    const requestedName =
+        url.searchParams.get("name") || null;
+
+    const isHead = request.method === "HEAD";
+
+    if (
+        request.method !== "GET" &&
+        request.method !== "HEAD"
+    ) {
+        return new Response(null, {
+            status: 405,
+            headers: {
+                Allow: "GET, HEAD"
             }
         });
-
-        return new Response(stream,{
-            status:info.partial?206:200,
-            headers:info.headers
-        });
-    } catch(error) {
-        try {
-            await client.disconnect();
-        } catch {}
-
-        throw error;
     }
-}
 
-async function handleLegacyMediaRequest(
-    request,
-    env,
-    chatId,
-    messageId
-) {
-    const numericChatId=Number(chatId);
-    const numericMessageId=Number(messageId);
-
-    if(!Number.isSafeInteger(numericChatId) ||
-       !Number.isSafeInteger(numericMessageId))
-        return json({
-            success:false,
-            error:"Invalid chat or message ID."
-        },400);
-
-    const client=await getTelegramClient(env);
+    const client = await getTelegramClient(env);
 
     try {
-        const chat=await getChatForId(
-            client,
-            numericChatId
-        );
+        /*
+         * A media URL already contains the Telegram file ID, so no
+         * getChats(), getInputPeer(), or getMessage() call is necessary.
+         */
+        const fileSizeParam = url.searchParams.get("size");
 
-        await client.getInputPeer(chat.id);
+        if (!fileSizeParam) {
+            await client.disconnect();
 
-        const message=await client.getMessage(
-            chat.id,
-            numericMessageId
-        );
-
-        if(!message)
             return json({
-                success:false,
-                error:"Message not found."
-            },404);
-
-        const media=getMessageMedia(message);
-
-        if(!media)
-            return json({
-                success:false,
-                error:"Message has no supported media."
-            },404);
-
-        const thumbnails=getMediaThumbnails(media);
-        const url=new URL(request.url);
-        const thumbParam=url.searchParams.get("thumb");
-
-        if(thumbParam!==null) {
-            const index=Number(thumbParam);
-
-            if(!Number.isInteger(index) ||
-               index<0 ||
-               index>=thumbnails.length)
-                return json({
-                    success:false,
-                    error:"Invalid thumbnail index."
-                },400);
-
-            const thumb=thumbnails[index];
-
-            const response=await handleDirectMediaRequest(
-                request,
-                env,
-                thumb.fileId,
-                Number(thumb.fileSize||0),
-                "application/octet-stream",
-                null,
-                true
-            );
-
-            /*
-             * handleDirectMediaRequest creates its own client.
-             */
-            try {
-                await client.disconnect();
-            } catch {}
-
-            return response;
+                success: false,
+                error: "Missing size parameter."
+            }, 400);
         }
 
-        let mimeType=media.mimeType||
-            "application/octet-stream";
+        const fileSize = Number(fileSizeParam);
 
-        if(!mimeType &&
-           (message.type==="photo"||
-            message.type==="livePhoto"))
-            mimeType="image/jpeg";
-
-        try {
+        if (!Number.isSafeInteger(fileSize) || fileSize < 0) {
             await client.disconnect();
-        } catch {}
 
-        return handleDirectMediaRequest(
-            request,
-            env,
-            media.fileId,
-            Number(media.fileSize||0),
-            mimeType,
-            media.fileName||null,
-            false
+            return json({
+                success: false,
+                error: "Invalid size parameter."
+            }, 400);
+        }
+
+        let contentType = requestedType;
+
+        if (
+            !contentType ||
+            contentType === "application/octet-stream"
+        ) {
+            contentType = "application/octet-stream";
+        }
+
+        let fileName = requestedName;
+
+        const range = parseRange(
+            request.headers.get("Range"),
+            fileSize
         );
-    } catch(error) {
-        try {
+
+        if (range?.error) {
             await client.disconnect();
-        } catch {}
 
-        throw error;
-    }
-}
+            return json({
+                success: false,
+                error: range.error
+            }, 416);
+        }
 
-async function testDownload(
-    env,
-    fileId,
-    fileSize
-) {
-    if(!fileId)
-        return {
-            success:false,
-            error:"Missing file ID."
-        };
+        if (range?.unsatisfied) {
+            await client.disconnect();
 
-    const client=await getTelegramClient(env);
+            return new Response(null, {
+                status: 416,
+                headers: {
+                    "Content-Range": `bytes */${fileSize}`,
+                    "Accept-Ranges": "bytes"
+                }
+            });
+        }
 
-    try {
-        const started=Date.now();
-        let bytesDownloaded=0;
-        let chunks=0;
-        let offset=0;
+        const start = range ? range.start : 0;
+        const end = range ? range.end : fileSize - 1;
 
-        const size=Number(fileSize||0);
+        const contentLength =
+            fileSize === 0
+                ? 0
+                : end - start + 1;
+
+        const headers = createMediaHeaders({
+            contentType,
+            contentLength,
+            fileSize,
+            start: range ? start : undefined,
+            end: range ? end : undefined,
+            fileName
+        });
 
         /*
-         * Use downloadChunk for the diagnostic as well, so this
-         * test exercises the same path as media requests.
+         * HEAD must not initiate a Telegram download.
          */
-        while(offset<size) {
-            const amount=Math.min(
-                TELEGRAM_CHUNK_SIZE,
-                size-offset
-            );
+        if (isHead) {
+            await client.disconnect();
 
-            const chunk=
-                await client.downloadChunk(
-                    fileId,
-                    {
-                        chunkSize:amount,
-                        offset
-                    }
-                );
-
-            if(!chunk || chunk.length===0)
-                throw new Error(
-                    `Telegram returned an empty chunk at offset ${offset}.`
-                );
-
-            bytesDownloaded+=chunk.length;
-            offset+=chunk.length;
-            chunks++;
+            return new Response(null, {
+                status: range ? 206 : 200,
+                headers
+            });
         }
 
-        return {
-            success:true,
-            test:"mtkruto-downloadChunk-discard",
+        /*
+         * Empty files do not need a Telegram request.
+         */
+        if (fileSize === 0) {
+            await client.disconnect();
+
+            return new Response(null, {
+                status: range ? 206 : 200,
+                headers
+            });
+        }
+
+        /*
+         * Keep the MTKruto client alive for the entire ReadableStream.
+         * Do NOT disconnect here.
+         */
+        const stream = createTelegramStream({
+            client,
             fileId,
-            fileSize:size,
-            bytesDownloaded,
-            chunks,
-            chunkSize:TELEGRAM_CHUNK_SIZE,
-            elapsedMs:Date.now()-started
-        };
-    } catch(error) {
-        return {
-            success:false,
-            ...errorInfo(error)
-        };
+            fileSize,
+            httpStart: start,
+            httpEnd: end,
+            signal: request.signal
+        });
+
+        return new Response(stream, {
+            status: range ? 206 : 200,
+            headers
+        });
+    } catch (error) {
+        try {
+            await client.disconnect();
+        } catch {}
+
+        throw error;
+    }
+}
+
+async function handleLegacyMediaRequest(request, env, chatId, messageId) {
+    const client = await getTelegramClient(env);
+
+    try {
+        const chat = await getChatForId(client, chatId);
+        const message = await client.getMessage(
+            chat.id,
+            Number(messageId)
+        );
+
+        const info = getMessageMediaInfo(message);
+
+        if (!info?.fileId) {
+            return json({
+                success: false,
+                error: "Message does not contain downloadable media."
+            }, 404);
+        }
+
+        const url = new URL(request.url);
+
+        url.pathname = "/media";
+        url.search = "";
+
+        url.searchParams.set("file", info.fileId);
+        url.searchParams.set("size", String(info.fileSize || 0));
+
+        if (info.mimeType) {
+            url.searchParams.set("type", info.mimeType);
+        }
+
+        if (info.fileName) {
+            url.searchParams.set("name", info.fileName);
+        }
+
+        const newRequest = new Request(
+            url.toString(),
+            request
+        );
+
+        return await handleDirectMediaRequest(
+            newRequest,
+            env
+        );
     } finally {
         try {
             await client.disconnect();
@@ -833,648 +787,623 @@ async function testDownload(
     }
 }
 
-async function main(request,env) {
-    const url=new URL(request.url);
-    const path=url.pathname;
+async function testDownload(request, env) {
+    const url = new URL(request.url);
 
-    if(path==="/") {
-        return html(`<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Telegram Media Test</title>
+    const fileId = url.searchParams.get("file");
 
-<style>
-:root{
-    color-scheme:dark;
-}
-
-*{
-    box-sizing:border-box;
-}
-
-body{
-    margin:0;
-    padding:32px;
-    background:#101214;
-    color:#e5e7eb;
-    font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-}
-
-main{
-    max-width:1000px;
-    margin:0 auto;
-}
-
-h1{
-    margin-top:0;
-    color:#fff;
-}
-
-h2,h3{
-    color:#fff;
-}
-
-.panel{
-    background:#181b1f;
-    border:1px solid #30343a;
-    border-radius:8px;
-    padding:18px;
-    margin:16px 0;
-}
-
-.section{
-    margin-top:20px;
-    padding-top:18px;
-    border-top:1px solid #30343a;
-}
-
-.section:first-child{
-    margin-top:0;
-    padding-top:0;
-    border-top:0;
-}
-
-label{
-    display:block;
-    margin-bottom:8px;
-    color:#aaa;
-}
-
-select{
-    width:100%;
-    max-width:700px;
-    background:#22262b;
-    color:#eee;
-    border:1px solid #41464d;
-    border-radius:5px;
-    padding:8px;
-    font-size:15px;
-}
-
-a{
-    display:block;
-    margin:9px 0;
-    color:#79b9ff;
-    text-decoration:none;
-}
-
-a:hover{
-    text-decoration:underline;
-}
-
-.media-link{
-    color:#8ed1ff;
-    font-size:17px;
-    font-weight:600;
-}
-
-pre{
-    white-space:pre-wrap;
-    word-break:break-word;
-    background:#0b0d0f;
-    border:1px solid #292d32;
-    border-radius:5px;
-    padding:12px;
-    overflow:auto;
-}
-
-.warning{
-    color:#999;
-    font-size:14px;
-    line-height:1.5;
-}
-
-.empty{
-    color:#777;
-}
-</style>
-</head>
-
-<body>
-<main>
-
-<h1>Telegram Media Test</h1>
-
-<div class="panel">
-
-<div class="section">
-<label for="chat">Chat</label>
-<select id="chat"></select>
-</div>
-
-<div class="section">
-<label for="message">Message</label>
-<select id="message"></select>
-</div>
-
-</div>
-
-<div id="details"></div>
-
-</main>
-
-<script>
-const chatSelect=document.getElementById("chat");
-const messageSelect=document.getElementById("message");
-const details=document.getElementById("details");
-
-let chats=[];
-let messages=[];
-
-async function loadChats(){
-    const r=await fetch("/api/chats");
-    const data=await r.json();
-
-    chats=data.chats||[];
-
-    chatSelect.innerHTML="";
-
-    for(const chat of chats){
-        const o=document.createElement("option");
-
-        o.value=chat.id;
-
-        o.textContent=
-            chat.title||
-            [chat.firstName,chat.lastName]
-                .filter(Boolean)
-                .join(" ")||
-            String(chat.id);
-
-        chatSelect.appendChild(o);
+    if (!fileId) {
+        return json({
+            success: false,
+            error: "Missing file parameter."
+        }, 400);
     }
 
-    await loadMessages();
-}
+    const sizeParam = url.searchParams.get("size");
 
-async function loadMessages(){
-    const id=Number(chatSelect.value);
-
-    details.innerHTML=
-        '<div class="panel">'+
-        '<div class="empty">Loading messages...</div>'+
-        '</div>';
-
-    const r=await fetch(
-        "/api/messages?chat="+encodeURIComponent(id)
-    );
-
-    const data=await r.json();
-
-    if(!data.success){
-        details.innerHTML=
-            '<div class="panel"><pre>'+
-            escapeHtml(JSON.stringify(data,null,2))+
-            "</pre></div>";
-        return;
+    if (!sizeParam) {
+        return json({
+            success: false,
+            error: "Missing size parameter."
+        }, 400);
     }
 
-    messages=data.messages||[];
-    messageSelect.innerHTML="";
+    const fileSize = Number(sizeParam);
 
-    for(const message of messages){
-        const o=document.createElement("option");
-
-        o.value=message.id;
-
-        const media=message.media;
-
-        o.textContent=
-            "#"+message.id+
-            (media?.fileName
-                ?" - "+media.fileName
-                :"")+
-            (media?.type
-                ?" ["+media.type+"]"
-                :"");
-
-        messageSelect.appendChild(o);
+    if (!Number.isSafeInteger(fileSize) || fileSize < 0) {
+        return json({
+            success: false,
+            error: "Invalid size parameter."
+        }, 400);
     }
 
-    showMessage();
-}
+    const client = await getTelegramClient(env);
 
-function escapeHtml(s){
-    return s.replace(/[&<>"']/g,c=>({
-        "&":"&amp;",
-        "<":"&lt;",
-        ">":"&gt;",
-        '"':"&quot;",
-        "'":"&#39;"
-    }[c]));
-}
+    try {
+        let offset = 0;
+        let total = 0;
+        let chunks = 0;
 
-function showMessage(){
-    const message=messages.find(
-        m=>Number(m.id)===Number(messageSelect.value)
-    );
+        const started = Date.now();
 
-    if(!message){
-        details.innerHTML="";
-        return;
-    }
-
-    const media=message.media;
-
-    let out='<div class="panel">';
-
-    out+="<h2>Message #"+message.id+"</h2>";
-
-    if(message.text){
-        out+='<div class="section">';
-        out+="<h3>Message text</h3>";
-        out+="<pre>"+
-            escapeHtml(message.text)+
-            "</pre>";
-        out+="</div>";
-    }
-
-    out+='<div class="section">';
-    out+="<h3>Message content</h3>";
-
-    if(!media) {
-        out+='<div class="empty">No supported media.</div>';
-    } else {
-        if(media.url) {
-            out+=
-                '<a class="media-link" '+
-                'href="'+media.url+'" '+
-                'target="_blank" '+
-                'rel="noopener">'+
-                "Open full media</a>";
-        }
-
-        if(media.thumbnails?.length) {
-            out+="<h3>Thumbnails</h3>";
-
-            for(const thumb of media.thumbnails) {
-                if(!thumb.url)
-                    continue;
-
-                out+=
-                    '<a href="'+thumb.url+'" '+
-                    'target="_blank" '+
-                    'rel="noopener">'+
-                    "Open thumbnail "+
-                    thumb.index+
-                    " ("+
-                    thumb.width+
-                    "x"+
-                    thumb.height+
-                    ")</a>";
+        while (offset < fileSize) {
+            if (request.signal.aborted) {
+                throw new DOMException(
+                    "The request was aborted.",
+                    "AbortError"
+                );
             }
+
+            const chunk = await client.downloadChunk(fileId, {
+                chunkSize: TELEGRAM_CHUNK_SIZE,
+                offset,
+                signal: request.signal
+            });
+
+            if (!chunk || chunk.length === 0) {
+                throw new Error(
+                    `Telegram returned an empty chunk at offset ${offset}.`
+                );
+            }
+
+            total += chunk.length;
+            offset += chunk.length;
+            chunks++;
         }
-    }
-
-    out+="</div>";
-
-    out+='<div class="section">';
-    out+="<h3>API / diagnostics</h3>";
-
-    const chat=Number(chatSelect.value);
-
-    out+=
-        '<a href="/api/messages?chat='+chat+'" '+
-        'target="_blank" rel="noopener">'+
-        "Open Messages API</a>";
-
-    out+=
-        '<a href="/api/chat?chat='+chat+'" '+
-        'target="_blank" rel="noopener">'+
-        "Open Chat API</a>";
-
-    if(media?.fileId) {
-        const params=new URLSearchParams();
-
-        params.set("file",media.fileId);
-
-        if(media.fileSize!=null)
-            params.set("size",String(media.fileSize));
-
-        if(media.mimeType)
-            params.set("type",media.mimeType);
-
-        if(media.fileName)
-            params.set("name",media.fileName);
-
-        out+=
-            '<a href="/media-info?'+
-            params.toString()+
-            '" target="_blank" rel="noopener">'+
-            "Inspect media info</a>";
-
-        out+=
-            '<a href="/test-download?'+
-            params.toString()+
-            '" target="_blank" rel="noopener">'+
-            "Test full Telegram download</a>";
-    }
-
-    out+="</div>";
-
-    out+='<div class="section">';
-    out+="<h3>Media information</h3>";
-
-    out+="<pre>"+
-        escapeHtml(
-            JSON.stringify(media,null,2)
-        )+
-        "</pre>";
-
-    out+="</div>";
-
-    out+='<div class="section warning">';
-    out+=
-        "<strong>Media is never loaded automatically.</strong> "+
-        "Clicking a content link starts the actual Telegram "+
-        "download in a separate tab.";
-    out+="</div>";
-
-    out+="</div>";
-
-    details.innerHTML=out;
-}
-
-chatSelect.addEventListener(
-    "change",
-    loadMessages
-);
-
-messageSelect.addEventListener(
-    "change",
-    showMessage
-);
-
-loadChats();
-</script>
-
-</body>
-</html>`);
-    }
-
-    if(path==="/api/chats") {
-        const client=await getTelegramClient(env);
-
-        try {
-            const result=await client.getChats({
-                from:"main",
-                limit:100
-            });
-
-            const items=Array.isArray(result)
-                ?result
-                :(result?.chats||[]);
-
-            const chats=items.map(item=>{
-                const chat=item?.chat||item;
-
-                return {
-                    id:chat?.id??null,
-                    title:chat?.title??null,
-                    firstName:chat?.firstName??null,
-                    lastName:chat?.lastName??null,
-                    username:chat?.username??null,
-                    type:chat?.type??null
-                };
-            });
-
-            return json({
-                success:true,
-                chats
-            });
-        } catch(error) {
-            return json({
-                success:false,
-                ...errorInfo(error)
-            },500);
-        } finally {
-            try {
-                await client.disconnect();
-            } catch {}
-        }
-    }
-
-    if(path==="/api/chat") {
-        const chatId=url.searchParams.get("chat");
-
-        if(chatId===null)
-            return json({
-                success:false,
-                error:"Missing chat parameter."
-            },400);
-
-        const client=await getTelegramClient(env);
-
-        try {
-            const chat=await getChatForId(
-                client,
-                Number(chatId)
-            );
-
-            return json({
-                success:true,
-                chat
-            });
-        } catch(error) {
-            return json({
-                success:false,
-                ...errorInfo(error)
-            },500);
-        } finally {
-            try {
-                await client.disconnect();
-            } catch {}
-        }
-    }
-
-    if(path==="/api/messages") {
-        const chatId=url.searchParams.get("chat");
-
-        if(chatId===null)
-            return json({
-                success:false,
-                error:"Missing chat parameter."
-            },400);
-
-        const client=await getTelegramClient(env);
-
-        try {
-            const {chat,messages}=await getMessages(
-                client,
-                Number(chatId)
-            );
-
-            return json({
-                success:true,
-
-                chat:{
-                    id:chat.id,
-                    title:chat.title??null,
-                    firstName:chat.firstName??null,
-                    lastName:chat.lastName??null,
-                    username:chat.username??null,
-                    type:chat.type??null
-                },
-
-                messages:messages.map(message=>{
-                    const media=getMessageMediaInfo(message);
-
-                    return {
-                        id:message.id,
-                        date:message.date??null,
-                        type:message.type??null,
-                        text:message.text??message.caption??"",
-
-                        media:media.hasMedia
-                            ?{
-                                ...media,
-
-                                url:
-                                    `${url.origin}/media?`+
-                                    `file=${encodeURIComponent(media.fileId)}`+
-                                    `&size=${encodeURIComponent(media.fileSize??0)}`+
-                                    `&type=${encodeURIComponent(media.mimeType||"application/octet-stream")}`+
-                                    (media.fileName
-                                        ?`&name=${encodeURIComponent(media.fileName)}`
-                                        :""),
-
-                                thumbnails:
-                                    media.thumbnails.map(thumb=>({
-                                        ...thumb,
-
-                                        url:
-                                            `${url.origin}/media?`+
-                                            `file=${encodeURIComponent(thumb.fileId)}`+
-                                            `&size=${encodeURIComponent(thumb.fileSize??0)}`+
-                                            `&thumb=1`
-                                    }))
-                            }
-                            :null
-                    };
-                })
-            });
-        } catch(error) {
-            return json({
-                success:false,
-                chatId:String(chatId),
-                ...errorInfo(error)
-            },500);
-        } finally {
-            try {
-                await client.disconnect();
-            } catch {}
-        }
-    }
-
-    /*
-     * Preferred media endpoint.
-     */
-    if(path==="/media") {
-        const fileId=url.searchParams.get("file");
-
-        if(!fileId)
-            return json({
-                success:false,
-                error:"Missing file parameter."
-            },400);
-
-        const fileSize=Number(
-            url.searchParams.get("size")||0
-        );
-
-        const contentType=
-            url.searchParams.get("type")||
-            "application/octet-stream";
-
-        const fileName=
-            url.searchParams.get("name")||
-            null;
-
-        const isThumbnail=
-            url.searchParams.has("thumb");
-
-        return handleDirectMediaRequest(
-            request,
-            env,
-            fileId,
-            fileSize,
-            contentType,
-            fileName,
-            isThumbnail
-        );
-    }
-
-    if(path==="/media-info") {
-        const fileId=url.searchParams.get("file");
-
-        if(!fileId)
-            return json({
-                success:false,
-                error:"Missing file parameter."
-            },400);
 
         return json({
-            success:true,
+            success: true,
             fileId,
-            fileSize:Number(
-                url.searchParams.get("size")||0
-            ),
-            mimeType:
-                url.searchParams.get("type")||
-                null,
-            fileName:
-                url.searchParams.get("name")||
-                null,
-            thumbnail:url.searchParams.has("thumb")
+            expectedSize: fileSize,
+            downloadedBytes: total,
+            chunks,
+            chunkSize: TELEGRAM_CHUNK_SIZE,
+            elapsedMs: Date.now() - started
+        });
+    } finally {
+        try {
+            await client.disconnect();
+        } catch {}
+    }
+}
+
+async function getChatsApi(env) {
+    const client = await getTelegramClient(env);
+
+    try {
+        const result = await client.getChats({
+            from: "main",
+            limit: 100
+        });
+
+        return result.map(item => {
+            const chat = item.chat;
+
+            return {
+                id: chat.id,
+                title: chat.title || null,
+                firstName: chat.firstName || null,
+                lastName: chat.lastName || null,
+                username: chat.username || null,
+                type: chat.type || null
+            };
+        });
+    } finally {
+        try {
+            await client.disconnect();
+        } catch {}
+    }
+}
+
+async function getChatMessagesApi(env, chatId) {
+    const client = await getTelegramClient(env);
+
+    try {
+        const messages = await getMessages(
+            client,
+            chatId
+        );
+
+        return messages.map(message => {
+            const media = getMessageMediaInfo(message);
+
+            const result = {
+                id: message.id,
+                type: message.type,
+                text: message.text || message.caption || "",
+                date: message.date || null
+            };
+
+            if (media) {
+                result.media = media;
+
+                if (media.fileId && media.fileSize != null) {
+                    const mediaUrl = new URL(
+                        "/media",
+                        "https://placeholder.invalid"
+                    );
+
+                    mediaUrl.searchParams.set(
+                        "file",
+                        media.fileId
+                    );
+
+                    mediaUrl.searchParams.set(
+                        "size",
+                        String(media.fileSize)
+                    );
+
+                    if (media.mimeType) {
+                        mediaUrl.searchParams.set(
+                            "type",
+                            media.mimeType
+                        );
+                    }
+
+                    if (media.fileName) {
+                        mediaUrl.searchParams.set(
+                            "name",
+                            media.fileName
+                        );
+                    }
+
+                    result.media.url =
+                        mediaUrl.pathname +
+                        mediaUrl.search;
+                }
+
+                if (media.thumbnails.length) {
+                    result.media.thumbnails =
+                        media.thumbnails.map(thumbnail => {
+                            const thumbnailUrl = new URL(
+                                "/media",
+                                "https://placeholder.invalid"
+                            );
+
+                            thumbnailUrl.searchParams.set(
+                                "file",
+                                thumbnail.fileId
+                            );
+
+                            thumbnailUrl.searchParams.set(
+                                "size",
+                                String(thumbnail.fileSize || 0)
+                            );
+
+                            return {
+                                ...thumbnail,
+                                url:
+                                    thumbnailUrl.pathname +
+                                    thumbnailUrl.search
+                            };
+                        });
+                }
+            }
+
+            return result;
+        });
+    } finally {
+        try {
+            await client.disconnect();
+        } catch {}
+    }
+}
+
+function makeAbsoluteMediaUrl(request, relativeUrl) {
+    return new URL(
+        relativeUrl,
+        request.url
+    ).toString();
+}
+
+function renderMessage(message, request) {
+    const media = message.media;
+
+    let content = `
+<div class="item">
+    <strong>Message ${message.id}</strong>
+    <div class="small">
+        Type: ${message.type || "unknown"}
+    </div>
+`;
+
+    if (message.text) {
+        content += `
+    <pre>${escapeHtml(message.text)}</pre>
+`;
+    }
+
+    if (media?.url) {
+        const fullUrl =
+            makeAbsoluteMediaUrl(request, media.url);
+
+        content += `
+    <a href="${escapeAttribute(fullUrl)}"
+       target="_blank"
+       rel="noopener">
+        Open full media${media.fileName ? ` — ${escapeHtml(media.fileName)}` : ""}
+    </a>
+`;
+    }
+
+    if (media?.thumbnails?.length) {
+        for (const [index, thumbnail] of
+            media.thumbnails.entries()) {
+
+            if (!thumbnail.url) continue;
+
+            const thumbnailUrl =
+                makeAbsoluteMediaUrl(
+                    request,
+                    thumbnail.url
+                );
+
+            content += `
+    <a href="${escapeAttribute(thumbnailUrl)}"
+       target="_blank"
+       rel="noopener">
+        Open thumbnail ${index + 1}
+    </a>
+`;
+        }
+    }
+
+    content += `
+</div>
+`;
+
+    return content;
+}
+
+function escapeHtml(value) {
+    return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+}
+
+function escapeAttribute(value) {
+    return escapeHtml(value);
+}
+
+async function renderHome(request, env) {
+    const url = new URL(request.url);
+
+    const selectedChatId =
+        url.searchParams.get("chat") || "";
+
+    const selectedMessageId =
+        url.searchParams.get("message") || "";
+
+    let chats = [];
+    let messages = [];
+    let error = null;
+
+    try {
+        chats = await getChatsApi(env);
+
+        if (selectedChatId) {
+            messages =
+                await getChatMessagesApi(
+                    env,
+                    selectedChatId
+                );
+        }
+    } catch (err) {
+        error = errorInfo(err);
+    }
+
+    let body = `
+<h1>Telegram Media Test</h1>
+
+<section>
+<h2>Chat</h2>
+
+<form method="get">
+<label for="chat">Select chat</label>
+<select id="chat" name="chat" onchange="this.form.submit()">
+<option value="">Select a chat</option>
+`;
+
+    for (const chat of chats) {
+        const name =
+            chat.title ||
+            [chat.firstName, chat.lastName]
+                .filter(Boolean)
+                .join(" ") ||
+            chat.username ||
+            String(chat.id);
+
+        body += `
+<option value="${escapeAttribute(chat.id)}"
+    ${String(chat.id) === String(selectedChatId) ? "selected" : ""}>
+    ${escapeHtml(name)} (${escapeHtml(chat.id)})
+</option>
+`;
+    }
+
+    body += `
+</select>
+</form>
+</section>
+`;
+
+    if (error) {
+        body += `
+<section>
+<h2 class="error">Error</h2>
+<pre>${escapeHtml(JSON.stringify(error, null, 2))}</pre>
+</section>
+`;
+    }
+
+    if (selectedChatId) {
+        body += `
+<section>
+<h2>Messages</h2>
+`;
+
+        if (!messages.length) {
+            body += `
+<div class="small">No messages found.</div>
+`;
+        }
+
+        for (const message of messages) {
+            body += renderMessage(
+                message,
+                request
+            );
+        }
+
+        body += `
+</section>
+`;
+    }
+
+    const origin =
+        new URL(request.url).origin;
+
+    body += `
+<section>
+<h2>API / diagnostics</h2>
+
+<a href="${escapeAttribute(
+        `${origin}/api/chats`
+    )}"
+   target="_blank"
+   rel="noopener">
+    Open Chats API
+</a>
+`;
+
+    if (selectedChatId) {
+        body += `
+<a href="${escapeAttribute(
+            `${origin}/api/chat?chat=${encodeURIComponent(selectedChatId)}`
+        )}"
+   target="_blank"
+   rel="noopener">
+    Open Chat API
+</a>
+
+<a href="${escapeAttribute(
+            `${origin}/api/messages?chat=${encodeURIComponent(selectedChatId)}`
+        )}"
+   target="_blank"
+   rel="noopener">
+    Open Messages API
+</a>
+`;
+    }
+
+    body += `
+</section>
+`;
+
+    return html(body);
+}
+
+async function main(request, env) {
+    const url = new URL(request.url);
+    const pathname = url.pathname;
+
+    if (
+        pathname === "/" ||
+        pathname === ""
+    ) {
+        return await renderHome(
+            request,
+            env
+        );
+    }
+
+    if (
+        pathname === "/api/chats" ||
+        pathname === "/api/chats/"
+    ) {
+        try {
+            const chats =
+                await getChatsApi(env);
+
+            return json({
+                success: true,
+                chats
+            });
+        } catch (error) {
+            return json(
+                errorInfo(error),
+                500
+            );
+        }
+    }
+
+    if (
+        pathname === "/api/chat" ||
+        pathname === "/api/chat/"
+    ) {
+        const chatId =
+            url.searchParams.get("chat");
+
+        if (!chatId) {
+            return json({
+                success: false,
+                error: "Missing chat parameter."
+            }, 400);
+        }
+
+        try {
+            const client =
+                await getTelegramClient(env);
+
+            try {
+                const chat =
+                    await getChatForId(
+                        client,
+                        chatId
+                    );
+
+                return json({
+                    success: true,
+                    chat
+                });
+            } finally {
+                try {
+                    await client.disconnect();
+                } catch {}
+            }
+        } catch (error) {
+            return json(
+                errorInfo(error),
+                500
+            );
+        }
+    }
+
+    if (
+        pathname === "/api/messages" ||
+        pathname === "/api/messages/"
+    ) {
+        const chatId =
+            url.searchParams.get("chat");
+
+        if (!chatId) {
+            return json({
+                success: false,
+                error: "Missing chat parameter."
+            }, 400);
+        }
+
+        try {
+            const messages =
+                await getChatMessagesApi(
+                    env,
+                    chatId
+                );
+
+            return json({
+                success: true,
+                chatId: Number(chatId),
+                messages
+            });
+        } catch (error) {
+            return json(
+                errorInfo(error),
+                500
+            );
+        }
+    }
+
+    if (
+        pathname === "/media-info" ||
+        pathname === "/media-info/"
+    ) {
+        const fileId =
+            url.searchParams.get("file");
+
+        if (!fileId) {
+            return json({
+                success: false,
+                error: "Missing file parameter."
+            }, 400);
+        }
+
+        return json({
+            success: true,
+            fileId,
+            size: url.searchParams.get("size"),
+            type: url.searchParams.get("type"),
+            name: url.searchParams.get("name")
         });
     }
 
-    if(path==="/test-download") {
-        const fileId=url.searchParams.get("file");
-
-        const result=await testDownload(
-            env,
-            fileId,
-            url.searchParams.get("size")
-        );
-
-        return json(
-            result,
-            result.success?200:500
-        );
+    if (
+        pathname === "/test-download" ||
+        pathname === "/test-download/"
+    ) {
+        try {
+            return await testDownload(
+                request,
+                env
+            );
+        } catch (error) {
+            return json(
+                errorInfo(error),
+                500
+            );
+        }
     }
 
-    /*
-     * Old URL compatibility.
-     */
-    const legacyMediaMatch=
-        path.match(/^\/media\/(-?\d+)\/(\d+)$/);
-
-    if(legacyMediaMatch) {
-        return handleLegacyMediaRequest(
-            request,
-            env,
-            legacyMediaMatch[1],
-            legacyMediaMatch[2]
-        );
+    if (
+        pathname === "/media" ||
+        pathname === "/media/"
+    ) {
+        try {
+            return await handleDirectMediaRequest(
+                request,
+                env
+            );
+        } catch (error) {
+            return json(
+                errorInfo(error),
+                500
+            );
+        }
     }
 
-    return new Response("Not found",{
-        status:404
+    const legacyMatch =
+        /^\/media\/(-?\d+)\/(\d+)$/.exec(
+            pathname
+        );
+
+    if (legacyMatch) {
+        try {
+            return await handleLegacyMediaRequest(
+                request,
+                env,
+                legacyMatch[1],
+                legacyMatch[2]
+            );
+        } catch (error) {
+            return json(
+                errorInfo(error),
+                500
+            );
+        }
+    }
+
+    return new Response("Not found", {
+        status: 404
     });
 }
 
 export default {
-    async fetch(request,env) {
-        try {
-            return await main(request,env);
-        } catch(error) {
-            return json({
-                success:false,
-                ...errorInfo(error)
-            },500);
-        }
+    async fetch(request, env) {
+        return await main(
+            request,
+            env
+        );
     }
 };

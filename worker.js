@@ -1,5 +1,7 @@
 import { Client } from "@mtkruto/mtkruto";
 
+const TELEGRAM_CHUNK_SIZE=256*1024;
+
 function json(data,status=200,headers={}) {
     return new Response(JSON.stringify(data,null,2),{
         status,
@@ -98,13 +100,23 @@ function getMessageMediaInfo(message) {
 
     const thumbnails=getMediaThumbnails(media);
 
+    let mimeType=media.mimeType||null;
+
+    /*
+     * Telegram Photo media is image data, but MTKruto's Photo object
+     * does not expose mimeType. Telegram photos are JPEG files.
+     */
+    if(!mimeType &&
+       (message.type==="photo"||message.type==="livePhoto"))
+        mimeType="image/jpeg";
+
     return {
         hasMedia:true,
         type:message.type,
         fileId:media.fileId||null,
         fileSize:media.fileSize??null,
         fileName:media.fileName||null,
-        mimeType:media.mimeType||null,
+        mimeType,
         width:media.width??null,
         height:media.height??null,
         duration:media.duration??null,
@@ -280,30 +292,12 @@ function parseRange(rangeHeader,fileSize) {
     };
 }
 
-async function streamTelegramFile(
-    request,
-    client,
-    fileId,
+function createResponseHeaders(
     fileSize,
+    range,
     contentType,
-    fileName,
-    isThumbnail=false,
-    thumbnailMimeDetect=false
+    fileName
 ) {
-    const range=parseRange(
-        request.headers.get("Range"),
-        fileSize
-    );
-
-    if(request.headers.has("Range") && !range) {
-        return new Response(null,{
-            status:416,
-            headers:{
-                "Content-Range":`bytes */${fileSize}`
-            }
-        });
-    }
-
     const start=range?.start||0;
     const end=range?.end??(
         fileSize>0
@@ -313,11 +307,6 @@ async function streamTelegramFile(
 
     const partial=range?.partial||false;
 
-    const requestedLength=
-        end===null
-            ?null
-            :end-start+1;
-
     const headers={
         "Accept-Ranges":"bytes",
         "Cache-Control":"public, max-age=31536000, immutable",
@@ -325,12 +314,16 @@ async function streamTelegramFile(
     };
 
     if(fileName) {
+        /*
+         * Explicitly inline rather than attachment.
+         */
         headers["Content-Disposition"]=
             `inline; filename*=UTF-8''${encodeURIComponent(fileName)}`;
     }
 
     if(fileSize>0 && end!==null) {
-        headers["Content-Length"]=String(requestedLength);
+        headers["Content-Length"]=
+            String(end-start+1);
 
         if(partial) {
             headers["Content-Range"]=
@@ -338,121 +331,82 @@ async function streamTelegramFile(
         }
     }
 
-    if(request.method==="HEAD") {
-        return new Response(null,{
-            status:partial?206:200,
-            headers
-        });
-    }
+    return {
+        headers,
+        start,
+        end,
+        partial,
+        length:
+            end===null
+                ?null
+                :end-start+1
+    };
+}
 
-    const download=client.download(fileId,{
-        offset:start,
-        signal:request.signal
-    });
-
-    if(thumbnailMimeDetect) {
-        const iterator=download[Symbol.asyncIterator]();
-        const first=await iterator.next();
-
-        if(first.done)
-            return new Response(null,{
-                status:404,
-                headers:{
-                    "Content-Type":"text/plain; charset=utf-8"
-                }
-            });
-
-        const firstChunk=first.value;
-        const detected=detectImageMimeType(firstChunk);
-
-        if(detected)
-            headers["Content-Type"]=detected;
-
-        const stream=new ReadableStream({
-            async start(controller) {
-                let remaining=requestedLength;
-
-                try {
-                    let bytes=firstChunk;
-
-                    if(remaining!==null) {
-                        if(remaining<=0) {
-                            controller.close();
-                            return;
-                        }
-
-                        if(bytes.length>remaining)
-                            bytes=bytes.slice(0,remaining);
-
-                        remaining-=bytes.length;
-                    }
-
-                    controller.enqueue(bytes);
-
-                    if(remaining===0) {
-                        controller.close();
-                        return;
-                    }
-
-                    while(true) {
-                        const next=await iterator.next();
-
-                        if(next.done)
-                            break;
-
-                        bytes=next.value;
-
-                        if(remaining!==null) {
-                            if(remaining<=0)
-                                break;
-
-                            if(bytes.length>remaining)
-                                bytes=bytes.slice(0,remaining);
-
-                            remaining-=bytes.length;
-                        }
-
-                        controller.enqueue(bytes);
-
-                        if(remaining===0)
-                            break;
-                    }
-
-                    controller.close();
-                } catch(error) {
-                    controller.error(error);
-                }
-            }
-        });
-
-        return new Response(stream,{
-            status:partial?206:200,
-            headers
-        });
-    }
-
+/*
+ * Download the exact HTTP range using MTKruto's downloadChunk().
+ *
+ * This deliberately does NOT use client.download().
+ * downloadChunk() returns one Uint8Array for the requested portion,
+ * avoiding the async-generator streaming behavior that was producing
+ * the 0-byte request.
+ *
+ * MTKruto's current documentation explicitly provides downloadChunk()
+ * for downloading a specific chunk and shows 256 KiB as its example.
+ */
+async function streamRange(
+    request,
+    client,
+    fileId,
+    start,
+    length,
+    signal
+) {
     const stream=new ReadableStream({
         async start(controller) {
-            let remaining=requestedLength;
+            let offset=start;
+            let remaining=length;
 
             try {
-                for await(const chunk of download) {
-                    let bytes=chunk;
+                while(remaining>0) {
+                    const amount=Math.min(
+                        TELEGRAM_CHUNK_SIZE,
+                        remaining
+                    );
 
-                    if(remaining!==null) {
-                        if(remaining<=0)
-                            break;
+                    const chunk=
+                        await client.downloadChunk(
+                            fileId,
+                            {
+                                chunkSize:amount,
+                                offset,
+                                signal
+                            }
+                        );
 
-                        if(bytes.length>remaining)
-                            bytes=bytes.slice(0,remaining);
+                    if(!chunk || chunk.length===0)
+                        throw new Error(
+                            `Telegram returned an empty chunk at offset ${offset}.`
+                        );
 
-                        remaining-=bytes.length;
-                    }
+                    /*
+                     * Telegram/MTKruto should return no more than the
+                     * requested chunk, but don't trust that blindly.
+                     */
+                    const bytes=
+                        chunk.length>remaining
+                            ?chunk.slice(0,remaining)
+                            :chunk;
 
                     controller.enqueue(bytes);
 
-                    if(remaining===0)
-                        break;
+                    offset+=bytes.length;
+                    remaining-=bytes.length;
+
+                    if(bytes.length===0)
+                        throw new Error(
+                            `Telegram returned a zero-byte chunk at offset ${offset}.`
+                        );
                 }
 
                 controller.close();
@@ -462,24 +416,9 @@ async function streamTelegramFile(
         }
     });
 
-    return new Response(stream,{
-        status:partial?206:200,
-        headers
-    });
+    return stream;
 }
 
-/*
- * New media endpoint.
- *
- * The fileId was already obtained from Telegram while building the
- * message API response. This endpoint therefore does NOT need to:
- *
- *   getChats()
- *   getInputPeer()
- *   getMessage()
- *
- * This is important for video Range requests.
- */
 async function handleDirectMediaRequest(
     request,
     env,
@@ -495,32 +434,221 @@ async function handleDirectMediaRequest(
             error:"Missing Telegram file ID."
         },400);
 
+    const numericSize=Number(fileSize||0);
+
+    const range=parseRange(
+        request.headers.get("Range"),
+        numericSize
+    );
+
+    if(request.headers.has("Range") && !range) {
+        return new Response(null,{
+            status:416,
+            headers:{
+                "Content-Range":
+                    `bytes */${numericSize}`
+            }
+        });
+    }
+
+    const info=createResponseHeaders(
+        numericSize,
+        range,
+        contentType,
+        fileName
+    );
+
+    if(request.method==="HEAD") {
+        return new Response(null,{
+            status:info.partial?206:200,
+            headers:info.headers
+        });
+    }
+
     const client=await getTelegramClient(env);
 
+    /*
+     * IMPORTANT:
+     *
+     * Do not disconnect here after returning the Response.
+     * The stream still needs the Telegram client.
+     *
+     * The stream's cancellation/completion lifecycle owns the client.
+     */
     try {
-        return await streamTelegramFile(
-            request,
-            client,
-            fileId,
-            Number(fileSize||0),
-            contentType||"application/octet-stream",
-            fileName||null,
-            isThumbnail,
-            isThumbnail
-        );
-    } finally {
+        let actualContentType=contentType;
+
+        /*
+         * Only thumbnails are MIME-sniffed.
+         *
+         * Full Telegram Photos are already explicitly image/jpeg.
+         * Full Documents retain their Telegram-provided MIME type.
+         */
+        if(isThumbnail) {
+            const probe=await client.downloadChunk(
+                fileId,
+                {
+                    chunkSize:Math.min(
+                        TELEGRAM_CHUNK_SIZE,
+                        info.length||TELEGRAM_CHUNK_SIZE
+                    ),
+                    offset:info.start,
+                    signal:request.signal
+                }
+            );
+
+            const detected=detectImageMimeType(probe);
+
+            if(detected)
+                actualContentType=detected;
+
+            info.headers["Content-Type"]=
+                actualContentType;
+
+            /*
+             * The probe already contains the first bytes.
+             * Rather than download them again, build a stream which
+             * emits the probe and then requests only the remainder.
+             */
+            const stream=new ReadableStream({
+                async start(controller) {
+                    let remaining=info.length;
+                    let offset=info.start;
+
+                    try {
+                        let first=probe;
+
+                        if(first.length>remaining)
+                            first=first.slice(0,remaining);
+
+                        if(first.length>0) {
+                            controller.enqueue(first);
+                            remaining-=first.length;
+                            offset+=first.length;
+                        }
+
+                        while(remaining>0) {
+                            const amount=Math.min(
+                                TELEGRAM_CHUNK_SIZE,
+                                remaining
+                            );
+
+                            const chunk=
+                                await client.downloadChunk(
+                                    fileId,
+                                    {
+                                        chunkSize:amount,
+                                        offset,
+                                        signal:request.signal
+                                    }
+                                );
+
+                            if(!chunk || chunk.length===0)
+                                throw new Error(
+                                    `Telegram returned an empty thumbnail chunk at offset ${offset}.`
+                                );
+
+                            const bytes=
+                                chunk.length>remaining
+                                    ?chunk.slice(0,remaining)
+                                    :chunk;
+
+                            controller.enqueue(bytes);
+
+                            offset+=bytes.length;
+                            remaining-=bytes.length;
+                        }
+
+                        controller.close();
+                    } catch(error) {
+                        controller.error(error);
+                    } finally {
+                        try {
+                            await client.disconnect();
+                        } catch {}
+                    }
+                },
+
+                async cancel() {
+                    try {
+                        await client.disconnect();
+                    } catch {}
+                }
+            });
+
+            return new Response(stream,{
+                status:info.partial?206:200,
+                headers:info.headers
+            });
+        }
+
+        /*
+         * Normal media.
+         *
+         * Keep the MTKruto client alive until the stream finishes.
+         */
+        const stream=new ReadableStream({
+            async start(controller) {
+                try {
+                    const body=await streamRange(
+                        request,
+                        client,
+                        fileId,
+                        info.start,
+                        info.length,
+                        request.signal
+                    );
+
+                    const reader=body.getReader();
+
+                    try {
+                        while(true) {
+                            const result=
+                                await reader.read();
+
+                            if(result.done)
+                                break;
+
+                            controller.enqueue(
+                                result.value
+                            );
+                        }
+
+                        controller.close();
+                    } finally {
+                        try {
+                            reader.releaseLock();
+                        } catch {}
+                    }
+                } catch(error) {
+                    controller.error(error);
+                } finally {
+                    try {
+                        await client.disconnect();
+                    } catch {}
+                }
+            },
+
+            async cancel() {
+                try {
+                    await client.disconnect();
+                } catch {}
+            }
+        });
+
+        return new Response(stream,{
+            status:info.partial?206:200,
+            headers:info.headers
+        });
+    } catch(error) {
         try {
             await client.disconnect();
         } catch {}
+
+        throw error;
     }
 }
 
-/*
- * Compatibility endpoint for old /media/chat/message URLs.
- *
- * New links do not use this path. It remains here so existing links
- * continue to work.
- */
 async function handleLegacyMediaRequest(
     request,
     env,
@@ -583,42 +711,61 @@ async function handleLegacyMediaRequest(
 
             const thumb=thumbnails[index];
 
-            return await streamTelegramFile(
+            const response=await handleDirectMediaRequest(
                 request,
-                client,
+                env,
                 thumb.fileId,
                 Number(thumb.fileSize||0),
                 "application/octet-stream",
                 null,
-                true,
                 true
             );
+
+            /*
+             * handleDirectMediaRequest creates its own client.
+             */
+            try {
+                await client.disconnect();
+            } catch {}
+
+            return response;
         }
 
-        /*
-         * IMPORTANT:
-         * Use the document/photo/video's original MIME type here.
-         * Do not sniff the full document just because its contents
-         * happen to be an image.
-         */
-        return await streamTelegramFile(
-            request,
-            client,
-            media.fileId,
-            Number(media.fileSize||0),
-            media.mimeType||"application/octet-stream",
-            media.fileName||null,
-            false,
-            false
-        );
-    } finally {
+        let mimeType=media.mimeType||
+            "application/octet-stream";
+
+        if(!mimeType &&
+           (message.type==="photo"||
+            message.type==="livePhoto"))
+            mimeType="image/jpeg";
+
         try {
             await client.disconnect();
         } catch {}
+
+        return handleDirectMediaRequest(
+            request,
+            env,
+            media.fileId,
+            Number(media.fileSize||0),
+            mimeType,
+            media.fileName||null,
+            false
+        );
+    } catch(error) {
+        try {
+            await client.disconnect();
+        } catch {}
+
+        throw error;
     }
 }
 
-async function testDownload(env,fileId,fileSize) {
+async function testDownload(
+    env,
+    fileId,
+    fileSize
+) {
     if(!fileId)
         return {
             success:false,
@@ -631,21 +778,47 @@ async function testDownload(env,fileId,fileSize) {
         const started=Date.now();
         let bytesDownloaded=0;
         let chunks=0;
+        let offset=0;
 
-        const download=client.download(fileId);
+        const size=Number(fileSize||0);
 
-        for await(const chunk of download) {
+        /*
+         * Use downloadChunk for the diagnostic as well, so this
+         * test exercises the same path as media requests.
+         */
+        while(offset<size) {
+            const amount=Math.min(
+                TELEGRAM_CHUNK_SIZE,
+                size-offset
+            );
+
+            const chunk=
+                await client.downloadChunk(
+                    fileId,
+                    {
+                        chunkSize:amount,
+                        offset
+                    }
+                );
+
+            if(!chunk || chunk.length===0)
+                throw new Error(
+                    `Telegram returned an empty chunk at offset ${offset}.`
+                );
+
             bytesDownloaded+=chunk.length;
+            offset+=chunk.length;
             chunks++;
         }
 
         return {
             success:true,
-            test:"mtkruto-download-discard",
+            test:"mtkruto-downloadChunk-discard",
             fileId,
-            fileSize:Number(fileSize||0),
+            fileSize:size,
             bytesDownloaded,
             chunks,
+            chunkSize:TELEGRAM_CHUNK_SIZE,
             elapsedMs:Date.now()-started
         };
     } catch(error) {
@@ -684,8 +857,8 @@ async function main(request,env) {
 body{
     margin:0;
     padding:32px;
-    background:#111315;
-    color:#e7e7e7;
+    background:#101214;
+    color:#e5e7eb;
     font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 }
 
@@ -699,17 +872,12 @@ h1{
     color:#fff;
 }
 
-h2{
-    margin-bottom:10px;
-}
-
-h3{
-    margin-top:0;
+h2,h3{
     color:#fff;
 }
 
 .panel{
-    background:#191c20;
+    background:#181b1f;
     border:1px solid #30343a;
     border-radius:8px;
     padding:18px;
@@ -717,8 +885,8 @@ h3{
 }
 
 .section{
-    margin-top:18px;
-    padding-top:16px;
+    margin-top:20px;
+    padding-top:18px;
     border-top:1px solid #30343a;
 }
 
@@ -746,9 +914,9 @@ select{
 }
 
 a{
-    color:#78b7ff;
     display:block;
     margin:9px 0;
+    color:#79b9ff;
     text-decoration:none;
 }
 
@@ -765,7 +933,7 @@ a:hover{
 pre{
     white-space:pre-wrap;
     word-break:break-word;
-    background:#0c0e10;
+    background:#0b0d0f;
     border:1px solid #292d32;
     border-radius:5px;
     padding:12px;
@@ -773,18 +941,13 @@ pre{
 }
 
 .warning{
-    color:#bbb;
+    color:#999;
     font-size:14px;
     line-height:1.5;
 }
 
-.meta{
-    color:#aaa;
-    font-size:14px;
-}
-
 .empty{
-    color:#888;
+    color:#777;
 }
 </style>
 </head>
@@ -850,7 +1013,9 @@ async function loadMessages(){
     const id=Number(chatSelect.value);
 
     details.innerHTML=
-        '<div class="panel"><div class="empty">Loading messages...</div></div>';
+        '<div class="panel">'+
+        '<div class="empty">Loading messages...</div>'+
+        '</div>';
 
     const r=await fetch(
         "/api/messages?chat="+encodeURIComponent(id)
@@ -901,44 +1066,6 @@ function escapeHtml(s){
     }[c]));
 }
 
-function mediaUrl(media){
-    if(!media?.fileId)
-        return null;
-
-    const params=new URLSearchParams();
-
-    params.set("file",media.fileId);
-
-    if(media.fileSize!=null)
-        params.set("size",String(media.fileSize));
-
-    if(media.mimeType)
-        params.set("type",media.mimeType);
-
-    if(media.fileName)
-        params.set("name",media.fileName);
-
-    return location.origin+"/media?"+params.toString();
-}
-
-function thumbnailUrl(media,index){
-    const thumb=media?.thumbnails?.[index];
-
-    if(!thumb?.fileId)
-        return null;
-
-    const params=new URLSearchParams();
-
-    params.set("file",thumb.fileId);
-
-    if(thumb.fileSize!=null)
-        params.set("size",String(thumb.fileSize));
-
-    params.set("thumb","1");
-
-    return location.origin+"/media?"+params.toString();
-}
-
 function showMessage(){
     const message=messages.find(
         m=>Number(m.id)===Number(messageSelect.value)
@@ -956,7 +1083,7 @@ function showMessage(){
     out+="<h2>Message #"+message.id+"</h2>";
 
     if(message.text){
-        out+="<div class=\\"section\\">";
+        out+='<div class="section">';
         out+="<h3>Message text</h3>";
         out+="<pre>"+
             escapeHtml(message.text)+
@@ -964,44 +1091,30 @@ function showMessage(){
         out+="</div>";
     }
 
-    /*
-     * CONTENT LINKS
-     */
     out+='<div class="section">';
     out+="<h3>Message content</h3>";
 
     if(!media) {
         out+='<div class="empty">No supported media.</div>';
     } else {
-        const fullUrl=mediaUrl(media);
-
-        if(fullUrl) {
+        if(media.url) {
             out+=
                 '<a class="media-link" '+
-                'href="'+fullUrl+'" '+
+                'href="'+media.url+'" '+
                 'target="_blank" '+
-                'rel="noopener">Open full media</a>';
-
-            out+=
-                '<a href="'+fullUrl+'" '+
-                'target="_blank" '+
-                'rel="noopener">Open media in new tab</a>';
+                'rel="noopener">'+
+                "Open full media</a>";
         }
 
         if(media.thumbnails?.length) {
             out+="<h3>Thumbnails</h3>";
 
             for(const thumb of media.thumbnails) {
-                const u=thumbnailUrl(
-                    media,
-                    thumb.index
-                );
-
-                if(!u)
+                if(!thumb.url)
                     continue;
 
                 out+=
-                    '<a href="'+u+'" '+
+                    '<a href="'+thumb.url+'" '+
                     'target="_blank" '+
                     'rel="noopener">'+
                     "Open thumbnail "+
@@ -1017,14 +1130,10 @@ function showMessage(){
 
     out+="</div>";
 
-    /*
-     * API LINKS
-     */
     out+='<div class="section">';
     out+="<h3>API / diagnostics</h3>";
 
     const chat=Number(chatSelect.value);
-    const id=Number(message.id);
 
     out+=
         '<a href="/api/messages?chat='+chat+'" '+
@@ -1051,21 +1160,20 @@ function showMessage(){
             params.set("name",media.fileName);
 
         out+=
-            '<a href="/media-info?'+params.toString()+'" '+
-            'target="_blank" rel="noopener">'+
+            '<a href="/media-info?'+
+            params.toString()+
+            '" target="_blank" rel="noopener">'+
             "Inspect media info</a>";
 
         out+=
-            '<a href="/test-download?'+params.toString()+'" '+
-            'target="_blank" rel="noopener">'+
+            '<a href="/test-download?'+
+            params.toString()+
+            '" target="_blank" rel="noopener">'+
             "Test full Telegram download</a>";
     }
 
     out+="</div>";
 
-    /*
-     * MEDIA METADATA
-     */
     out+='<div class="section">';
     out+="<h3>Media information</h3>";
 
@@ -1079,9 +1187,9 @@ function showMessage(){
 
     out+='<div class="section warning">';
     out+=
-        "<strong>Nothing above automatically loads media.</strong> "+
-        "Opening a media link starts the actual Telegram download "+
-        "in a separate tab.";
+        "<strong>Media is never loaded automatically.</strong> "+
+        "Clicking a content link starts the actual Telegram "+
+        "download in a separate tab.";
     out+="</div>";
 
     out+="</div>";
@@ -1106,9 +1214,6 @@ loadChats();
 </html>`);
     }
 
-    /*
-     * API: chat list
-     */
     if(path==="/api/chats") {
         const client=await getTelegramClient(env);
 
@@ -1151,9 +1256,6 @@ loadChats();
         }
     }
 
-    /*
-     * API: individual chat
-     */
     if(path==="/api/chat") {
         const chatId=url.searchParams.get("chat");
 
@@ -1187,9 +1289,6 @@ loadChats();
         }
     }
 
-    /*
-     * API: messages
-     */
     if(path==="/api/messages") {
         const chatId=url.searchParams.get("chat");
 
@@ -1232,12 +1331,6 @@ loadChats();
                             ?{
                                 ...media,
 
-                                /*
-                                 * The important part:
-                                 * media URLs contain the Telegram fileId,
-                                 * so subsequent Range requests don't need
-                                 * to retrieve the message again.
-                                 */
                                 url:
                                     `${url.origin}/media?`+
                                     `file=${encodeURIComponent(media.fileId)}`+
@@ -1247,15 +1340,16 @@ loadChats();
                                         ?`&name=${encodeURIComponent(media.fileName)}`
                                         :""),
 
-                                thumbnails:media.thumbnails.map(thumb=>({
-                                    ...thumb,
+                                thumbnails:
+                                    media.thumbnails.map(thumb=>({
+                                        ...thumb,
 
-                                    url:
-                                        `${url.origin}/media?`+
-                                        `file=${encodeURIComponent(thumb.fileId)}`+
-                                        `&size=${encodeURIComponent(thumb.fileSize??0)}`+
-                                        `&thumb=1`
-                                }))
+                                        url:
+                                            `${url.origin}/media?`+
+                                            `file=${encodeURIComponent(thumb.fileId)}`+
+                                            `&size=${encodeURIComponent(thumb.fileSize??0)}`+
+                                            `&thumb=1`
+                                    }))
                             }
                             :null
                     };
@@ -1275,13 +1369,7 @@ loadChats();
     }
 
     /*
-     * Direct media endpoint.
-     *
-     * This is now the preferred path:
-     *
-     * /media?file=<telegram-file-id>&size=<size>&type=<mime>
-     *
-     * No Telegram message lookup occurs here.
+     * Preferred media endpoint.
      */
     if(path==="/media") {
         const fileId=url.searchParams.get("file");
@@ -1318,11 +1406,6 @@ loadChats();
         );
     }
 
-    /*
-     * Media metadata endpoint.
-     *
-     * This does not download anything from Telegram.
-     */
     if(path==="/media-info") {
         const fileId=url.searchParams.get("file");
 
@@ -1348,9 +1431,6 @@ loadChats();
         });
     }
 
-    /*
-     * Full-download diagnostic.
-     */
     if(path==="/test-download") {
         const fileId=url.searchParams.get("file");
 
@@ -1367,7 +1447,7 @@ loadChats();
     }
 
     /*
-     * Old media URL compatibility.
+     * Old URL compatibility.
      */
     const legacyMediaMatch=
         path.match(/^\/media\/(-?\d+)\/(\d+)$/);

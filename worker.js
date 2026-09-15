@@ -801,7 +801,8 @@ async function handleDirectMediaRequest(
     }
 
     const thumbnail =
-        url.searchParams.get("thumbnail");
+        url.searchParams.has("thumb") ||
+        url.searchParams.has("thumbnail");
 
     const photo =
         url.searchParams.get("photo");

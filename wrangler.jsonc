@@ -15,9 +15,9 @@
       "secret_name": "API_HASH"
     },
     {
-      "binding": "TELEGRAM_SESSION",
+      "binding": "MTKRUTO_SESSION",
       "store_id": "c40cc3dcc6234fb98cab408bd2f302be",
-      "secret_name": "TELEGRAM_SESSION"
+      "secret_name": "MTKRUTO_SESSION"
     }
   ],
 

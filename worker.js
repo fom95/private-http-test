@@ -27,12 +27,11 @@ async function createClient(env) {
 
     const client = new Client({
         apiId,
-        apiHash
+        apiHash,
+        authString: session
     });
 
-    await client.start({
-        auth: session
-    });
+    await client.start();
 
     return client;
 }

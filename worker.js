@@ -317,95 +317,67 @@ async function createClient(env) {
 
 async function getChatForId(client, chatId) {
     const numericId = Number(chatId);
-    const start = Date.now();
 
-    const chatsStart = Date.now();
-
-    const chats = await client.getChats({
-        from: "main",
-        limit: 100
-    });
-
-    const chatsTime = Date.now() - chatsStart;
-
-    const item = chats.find(
-        item => item?.chat && Number(item.chat.id) === numericId
-    );
-
-    if (!item?.chat) {
-        throw new Error(`Chat ${chatId} was not found.`);
+    if (!Number.isSafeInteger(numericId)) {
+        throw new Error(`Invalid chat ID: ${chatId}`);
     }
 
-    return {
-        chat: item.chat,
-        timings: {
-            getChats: `${chatsTime} ms`,
-            total: `${Date.now() - start} ms`
-        }
+    const start = Date.now();
+
+    const chat =
+        await client.getChat(numericId);
+
+    if (!chat) {
+        throw new Error(
+            `Chat ${chatId} was not found.`
+        );
+    }
+
+    chat._debugTimings = {
+        getChat: `${Date.now() - start} ms`,
+        total: `${Date.now() - start} ms`
     };
+
+    return chat;
 }
 
 async function getMessages(client, chatId) {
-    const start = Date.now();
+    const numericChatId = Number(chatId);
 
-    const chatResult =
-        await getChatForId(
-            client,
-            chatId
+    if (!Number.isSafeInteger(numericChatId)) {
+        throw new Error(
+            `Invalid chat ID: ${chatId}`
         );
+    }
 
-    const inputPeerStart =
-        Date.now();
-
-    await client.getInputPeer(
-        chatResult.chat.id
-    );
-
-    const inputPeerTime =
-        Date.now() -
-        inputPeerStart;
-
-    const historyStart =
-        Date.now();
-
-    const messages =
-        await client.getHistory(
-            chatResult.chat.id,
-            {
-                limit: 100
-            }
-        );
-
-    const historyTime =
-        Date.now() -
-        historyStart;
-
-    return {
-        messages,
-        timings: {
-            getChats:
-                chatResult.timings.getChats,
-            getChatTotal:
-                chatResult.timings.total,
-            getInputPeer:
-                `${inputPeerTime} ms`,
-            getHistory:
-                `${historyTime} ms`,
-            total:
-                `${Date.now() - start} ms`
+    return await client.getHistory(
+        numericChatId,
+        {
+            limit: 100
         }
-    };
+    );
 }
 
-async function getMessage(client, chatId, messageId) {
-    const numericChatId = Number(chatId);
-    const numericMessageId = Number(messageId);
+async function getMessage(
+    client,
+    chatId,
+    messageId
+) {
+    const numericChatId =
+        Number(chatId);
+
+    const numericMessageId =
+        Number(messageId);
 
     if (
         !Number.isSafeInteger(numericChatId) ||
-        !Number.isSafeInteger(numericMessageId)
+        !Number.isSafeInteger(numericMessageId) ||
+        numericChatId === 0 ||
+        numericMessageId <= 0
     ) {
-        throw new Error("Invalid chat or message ID.");
+        throw new Error(
+            "Invalid chat or message ID."
+        );
     }
 
     const message =
@@ -559,7 +531,14 @@ function parseRange(rangeHeader, size) {
         return null;
     }
 
-    const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+    if (!Number.isSafeInteger(size) || size <= 0) {
+        return null;
+    }
+
+    const match =
+        /^bytes=(\d*)-(\d*)$/i.exec(
+            rangeHeader.trim()
+        );
 
     if (!match) {
         return null;
@@ -569,40 +548,64 @@ function parseRange(rangeHeader, size) {
     let end;
 
     if (match[1] === "") {
-        const suffixLength = Number(match[2]);
+        const suffixLength =
+            Number(match[2]);
 
-        if (!suffixLength || suffixLength < 0) {
+        if (
+            !Number.isSafeInteger(
+                suffixLength
+            ) ||
+            suffixLength <= 0
+        ) {
             return null;
         }
 
-        start = Math.max(0, size - suffixLength);
-        end = size - 1;
+        start =
+            Math.max(
+                0,
+                size - suffixLength
+            );
+
+        end =
+            size - 1;
     } else {
-        start = Number(match[1]);
+        start =
+            Number(match[1]);
+
+        if (
+            !Number.isSafeInteger(start) ||
+            start < 0 ||
+            start >= size
+        ) {
+            return null;
+        }
 
         if (match[2] === "") {
             end = size - 1;
         } else {
-            end = Number(match[2]);
+            end =
+                Number(match[2]);
+
+            if (
+                !Number.isSafeInteger(end) ||
+                end < start
+            ) {
+                return null;
+            }
+
+            end =
+                Math.min(
+                    end,
+                    size - 1
+                );
         }
     }
-
-    if (
-        !Number.isFinite(start) ||
-        !Number.isFinite(end) ||
-        start < 0 ||
-        end < start ||
-        start >= size
-    ) {
-        return null;
-    }
-
-    end = Math.min(end, size - 1);
 
     return {
         start,
         end,
-        length: end - start + 1
+        length:
+            end - start + 1
     };
 }
 
@@ -696,61 +699,91 @@ async function streamRangeDownload(
     signal
 ) {
     const alignedStart =
-        Math.floor(start / TELEGRAM_OFFSET_ALIGNMENT) *
+        Math.floor(
+            start /
+            TELEGRAM_OFFSET_ALIGNMENT
+        ) *
         TELEGRAM_OFFSET_ALIGNMENT;
 
-    const requestedLength = end - start + 1;
+    let currentOffset =
+        alignedStart;
 
-    let currentOffset = alignedStart;
-    let remaining =
-        requestedLength +
-        (start - alignedStart);
-
-    const stream = new ReadableStream({
+    return new ReadableStream({
         async pull(controller) {
-            if (remaining <= 0) {
+            if (
+                currentOffset > end
+            ) {
                 controller.close();
                 return;
             }
 
             try {
-                const bytes = await client.downloadChunk(fileId, {
-                    offset: currentOffset,
-                    limit: TELEGRAM_CHUNK_SIZE,
-                    chunkSize: TELEGRAM_CHUNK_SIZE,
-                    signal
-                });
+                const remaining =
+                    end -
+                    currentOffset +
+                    1;
 
-                if (!bytes || bytes.length === 0) {
-                    controller.close();
-                    return;
+                const requestSize =
+                    Math.min(
+                        TELEGRAM_CHUNK_SIZE,
+                        remaining
+                    );
+
+                const bytes =
+                    await client.downloadChunk(
+                        fileId,
+                        {
+                            offset:
+                                currentOffset,
+                            chunkSize:
+                                requestSize,
+                            signal
+                        }
+                    );
+
+                if (
+                    !bytes ||
+                    bytes.length === 0
+                ) {
+                    throw new Error(
+                        "Telegram returned no data at offset " +
+                        currentOffset +
+                        "."
+                    );
                 }
 
-                const chunkStart = currentOffset;
+                const chunkStart =
+                    currentOffset;
+
                 const chunkEnd =
                     currentOffset +
-                    bytes.length;
+                    bytes.length -
+                    1;
 
-                const wantedStart =
+                const outputStart =
                     Math.max(
                         start,
                         chunkStart
                     );
 
-                const wantedEnd =
+                const outputEnd =
                     Math.min(
-                        end + 1,
+                        end,
                         chunkEnd
                     );
 
-                if (wantedEnd > wantedStart) {
+                if (
+                    outputEnd >=
+                    outputStart
+                ) {
                     const sliceStart =
-                        wantedStart -
+                        outputStart -
                         chunkStart;
 
                     const sliceEnd =
-                        wantedEnd -
-                        chunkStart;
+                        outputEnd -
+                        chunkStart +
+                        1;
 
                     controller.enqueue(
                         bytes.slice(
@@ -760,38 +793,57 @@ async function streamRangeDownload(
                     );
                 }
 
-                currentOffset += bytes.length;
-                remaining -= bytes.length;
+                currentOffset =
+                    chunkEnd + 1;
 
                 if (
-                    currentOffset >= fileSize ||
-                    currentOffset > end
+                    currentOffset >
+                    end ||
+                    currentOffset >=
+                    fileSize
                 ) {
                     controller.close();
                 }
             } catch (error) {
-                controller.error(error);
+                controller.error(
+                    error
+                );
             }
+        },
+
+        async cancel() {
+            try {
+                await client.disconnect();
+            } catch {}
         }
     });
-
-    return stream;
 }
 
-async function getMessageMediaInfo(client, chatId, messageId) {
-    const message = await getMessage(
-        client,
-        chatId,
-        messageId
-    );
+async function getMessageMediaInfo(
+    client,
+    chatId,
+    messageId,
+    existingMessage = null
+) {
+    const message =
+        existingMessage ||
+        await getMessage(
+            client,
+            chatId,
+            messageId
+        );
 
-    const media = getMessageMedia(message);
+    const media =
+        getMessageMedia(message);
 
     if (!media) {
         return {
-            messageId: Number(messageId),
-            chatId: Number(chatId),
-            type: message?.type || null,
+            messageId:
+                Number(messageId),
+            chatId:
+                Number(chatId),
+            type:
+                message?.type || null,
             media: null
         };
     }
@@ -800,11 +852,15 @@ async function getMessageMediaInfo(client, chatId, messageId) {
         getMediaThumbnails(media);
 
     return {
-        messageId: Number(messageId),
-        chatId: Number(chatId),
-        messageType: message.type,
+        messageId:
+            Number(messageId),
+        chatId:
+            Number(chatId),
+        messageType:
+            message.type,
         mediaType:
-            media.constructor?.name || null,
+            media.constructor?.name ||
+            null,
         fileId:
             media.fileId ?? null,
         fileUniqueId:
@@ -825,18 +881,25 @@ async function getMessageMediaInfo(client, chatId, messageId) {
         fileName:
             media.fileName ?? null,
         thumbnails:
-            thumbnails.map(item => ({
-                fileId:
-                    item.fileId ?? null,
-                fileUniqueId:
-                    item.fileUniqueId ?? null,
-                fileSize:
-                    item.fileSize ?? null,
-                width:
-                    item.width ?? null,
-                height:
-                    item.height ?? null
-            }))
+            thumbnails.map(
+                item => ({
+                    fileId:
+                        item.fileId ??
+                        null,
+                    fileUniqueId:
+                        item.fileUniqueId ??
+                        null,
+                    fileSize:
+                        item.fileSize ??
+                        null,
+                    width:
+                        item.width ??
+                        null,
+                    height:
+                        item.height ??
+                        null
+                })
+            )
     };
 }
 
@@ -1146,16 +1209,20 @@ async function handleDirectMediaRequest(
         pathParts[0] === "media" &&
         pathParts.length >= 3
     ) {
-        chatId = pathParts[1];
-        messageId = pathParts[2];
+        chatId =
+            decodeURIComponent(
+                pathParts[1]
+            );
+
+        messageId =
+            decodeURIComponent(
+                pathParts[2]
+            );
     }
 
     const thumbnail =
         url.searchParams.has("thumb") ||
         url.searchParams.has("thumbnail");
-
-    const photo =
-        url.searchParams.get("photo");
 
     if (!chatId || !messageId) {
         return json({
@@ -1176,7 +1243,7 @@ async function handleDirectMediaRequest(
                 messageId
             );
 
-        let media =
+        const media =
             getMessageMedia(message);
 
         if (!media) {
@@ -1191,7 +1258,7 @@ async function handleDirectMediaRequest(
             media.fileId;
 
         let fileSize =
-            media.fileSize;
+            Number(media.fileSize);
 
         let mimeType =
             getMediaMimeType(
@@ -1205,7 +1272,9 @@ async function handleDirectMediaRequest(
 
         if (thumbnail) {
             const thumbnails =
-                getMediaThumbnails(media);
+                getMediaThumbnails(
+                    media
+                );
 
             if (!thumbnails.length) {
                 return json({
@@ -1218,32 +1287,29 @@ async function handleDirectMediaRequest(
             const selected =
                 thumbnails[
                     thumbnails.length - 1
-                ] || thumbnails[0];
+                ];
 
             fileId =
                 selected.fileId;
 
             fileSize =
-                selected.fileSize;
+                Number(
+                    selected.fileSize
+                );
 
             mimeType =
                 "image/jpeg";
 
             filename +=
                 "-thumbnail.jpg";
-        } else if (photo) {
-            mimeType =
-                "image/jpeg";
-
-            filename += ".jpg";
         }
 
         if (
             !fileId ||
             !Number.isSafeInteger(
-                Number(fileSize)
+                fileSize
             ) ||
-            Number(fileSize) <= 0
+            fileSize <= 0
         ) {
             return json({
                 success: false,
@@ -1252,16 +1318,83 @@ async function handleDirectMediaRequest(
             }, 500);
         }
 
-        fileSize =
-            Number(fileSize);
+        const rangeHeader =
+            request.headers.get(
+                "Range"
+            );
 
-        if (request.method === "HEAD") {
+        if (rangeHeader) {
+            const range =
+                parseRange(
+                    rangeHeader,
+                    fileSize
+                );
+
+            if (!range) {
+                return new Response(null, {
+                    status: 416,
+                    headers: {
+                        "Content-Range":
+                            `bytes */${fileSize}`,
+                        "Accept-Ranges":
+                            "bytes",
+                        "Cache-Control":
+                            CACHE_CONTROL
+                    }
+                });
+            }
+
+            const headers =
+                createMediaHeaders({
+                    mimeType,
+                    size:
+                        fileSize,
+                    filename,
+                    start:
+                        range.start,
+                    end:
+                        range.end
+                });
+
+            if (
+                request.method ===
+                "HEAD"
+            ) {
+                return new Response(null, {
+                    status: 206,
+                    headers
+                });
+            }
+
+            const stream =
+                await streamRangeDownload(
+                    client,
+                    fileId,
+                    fileSize,
+                    range.start,
+                    range.end,
+                    request.signal
+                );
+
+            return new Response(
+                stream,
+                {
+                    status: 206,
+                    headers
+                }
+            );
+        }
+
+        if (
+            request.method === "HEAD"
+        ) {
             return new Response(null, {
                 status: 200,
                 headers:
                     createMediaHeaders({
                         mimeType,
-                        size: fileSize,
+                        size:
+                            fileSize,
                         filename
                     })
             });
@@ -1281,17 +1414,18 @@ async function handleDirectMediaRequest(
                 headers:
                     createMediaHeaders({
                         mimeType,
-                        size: fileSize,
+                        size:
+                            fileSize,
                         filename
                     })
             }
         );
-    } finally {
-        if (request.method !== "GET") {
-            try {
-                await client.disconnect();
-            } catch {}
-        }
+    } catch (error) {
+        try {
+            await client.disconnect();
+        } catch {}
+
+        throw error;
     }
 }
 
@@ -1313,42 +1447,44 @@ async function handlePieceRequest(
     }
 
     const fileId =
-        url.searchParams.get("fileId");
+        url.searchParams.get(
+            "fileId"
+        );
 
-    const fileSizeParam =
-        url.searchParams.get("fileSize");
+    const fileSize =
+        Number(
+            url.searchParams.get(
+                "fileSize"
+            )
+        );
 
-    const offsetParam =
-        url.searchParams.get("offset");
+    const offset =
+        Number(
+            url.searchParams.get(
+                "offset"
+            )
+        );
 
-    const lengthParam =
-        url.searchParams.get("length");
+    const length =
+        Number(
+            url.searchParams.get(
+                "length"
+            )
+        );
 
     const mimeType =
-        url.searchParams.get("mime") ||
+        url.searchParams.get(
+            "mime"
+        ) ||
         "application/octet-stream";
 
-    if (
-        !fileId ||
-        fileSizeParam === null ||
-        offsetParam === null ||
-        lengthParam === null
-    ) {
+    if (!fileId) {
         return json({
             success: false,
             error:
-                "Missing fileId, fileSize, offset, or length."
+                "Missing fileId."
         }, 400);
     }
-
-    const fileSize =
-        Number(fileSizeParam);
-
-    const offset =
-        Number(offsetParam);
-
-    const length =
-        Number(lengthParam);
 
     if (
         !Number.isSafeInteger(fileSize) ||
@@ -1366,16 +1502,8 @@ async function handlePieceRequest(
     }
 
     if (
-        offset % TELEGRAM_OFFSET_ALIGNMENT !== 0
+        offset >= fileSize
     ) {
-        return json({
-            success: false,
-            error:
-                `Offset must be divisible by ${TELEGRAM_OFFSET_ALIGNMENT}.`
-        }, 400);
-    }
-
-    if (offset >= fileSize) {
         return new Response(null, {
             status: 416,
             headers: {
@@ -1387,27 +1515,48 @@ async function handlePieceRequest(
         });
     }
 
+    if (
+        offset %
+        TELEGRAM_OFFSET_ALIGNMENT !==
+        0
+    ) {
+        return json({
+            success: false,
+            error:
+                `Offset must be divisible by ${TELEGRAM_OFFSET_ALIGNMENT}.`
+        }, 400);
+    }
+
     const actualLength =
         Math.min(
             length,
             fileSize - offset
         );
 
-    if (request.method === "HEAD") {
+    const end =
+        offset +
+        actualLength -
+        1;
+
+    const headers = {
+        "Content-Type":
+            mimeType,
+        "Content-Length":
+            String(actualLength),
+        "Cache-Control":
+            CACHE_CONTROL,
+        "Accept-Ranges":
+            "bytes",
+        "Content-Range":
+            `bytes ${offset}-${end}/${fileSize}`
+    };
+
+    if (
+        request.method === "HEAD"
+    ) {
         return new Response(null, {
-            status: 200,
-            headers: {
-                "Content-Type":
-                    mimeType,
-                "Content-Length":
-                    String(actualLength),
-                "Cache-Control":
-                    CACHE_CONTROL,
-                "Accept-Ranges":
-                    "bytes",
-                "Content-Range":
-                    `bytes ${offset}-${offset + actualLength - 1}/${fileSize}`
-            }
+            status: 206,
+            headers
         });
     }
 
@@ -1420,18 +1569,24 @@ async function handlePieceRequest(
         let currentOffset = offset;
 
         while (
-            downloaded < actualLength
+            downloaded <
+            actualLength
         ) {
+            const requestLength =
+                Math.min(
+                    TELEGRAM_CHUNK_SIZE,
+                    actualLength -
+                        downloaded
+                );
+
             const bytes =
                 await client.downloadChunk(
                     fileId,
                     {
                         offset:
                             currentOffset,
-                        limit:
-                            TELEGRAM_CHUNK_SIZE,
                         chunkSize:
-                            TELEGRAM_CHUNK_SIZE,
+                            requestLength,
                         signal:
                             request.signal
                     }
@@ -1448,7 +1603,7 @@ async function handlePieceRequest(
                 );
             }
 
-            const needed =
+            const usableLength =
                 Math.min(
                     bytes.length,
                     actualLength -
@@ -1456,22 +1611,24 @@ async function handlePieceRequest(
                 );
 
             chunks.push(
-                needed === bytes.length
+                usableLength ===
+                bytes.length
                     ? bytes
                     : bytes.slice(
                         0,
-                        needed
+                        usableLength
                     )
             );
 
             downloaded +=
-                needed;
+                usableLength;
 
             currentOffset +=
-                bytes.length;
+                usableLength;
 
             if (
-                needed < bytes.length
+                usableLength <
+                bytes.length
             ) {
                 break;
             }
@@ -1496,28 +1653,21 @@ async function handlePieceRequest(
                 chunk.length;
         }
 
+        headers[
+            "Content-Length"
+        ] =
+            String(output.length);
+
+        headers[
+            "Content-Range"
+        ] =
+            `bytes ${offset}-${offset + output.length - 1}/${fileSize}`;
+
         return new Response(
             output,
             {
-                status: 200,
-                headers: {
-                    "Content-Type":
-                        mimeType,
-                    "Content-Length":
-                        String(
-                            output.length
-                        ),
-                    "Cache-Control":
-                        CACHE_CONTROL,
-                    "Accept-Ranges":
-                        "bytes",
-                    "Content-Range":
-                        `bytes ${offset}-${offset + output.length - 1}/${fileSize}`,
-                    "X-Telegram-File-Size":
-                        String(fileSize),
-                    "X-Telegram-Piece-Offset":
-                        String(offset)
-                }
+                status: 206,
+                headers
             }
         );
     } finally {
@@ -1906,7 +2056,8 @@ async function handleApi(
                         await getMessageMediaInfo(
                             client,
                             chatId,
-                            messageId
+                            messageId,
+                            message
                         )
                 }
             });
@@ -2607,124 +2758,225 @@ async function fetchImageParts(
     const parts =
         new Array(partCount);
 
-    async function fetchPart(
-        index
-    ) {
-        if (
-            token !==
-            mediaLoadToken
-        ) {
-            throw new Error(
-                "Media load cancelled."
-            );
+    let nextIndex = 0;
+    let completed = 0;
+    let completedBytes = 0;
+
+    async function worker() {
+        while (true) {
+            const index =
+                nextIndex++;
+
+            if (
+                index >= partCount
+            ) {
+                return;
+            }
+
+            if (
+                token !==
+                mediaLoadToken
+            ) {
+                throw new Error(
+                    "Media load cancelled."
+                );
+            }
+
+            const start =
+                boundaries[index];
+
+            const end =
+                boundaries[index + 1];
+
+            const buffer =
+                await fetchPiece(
+                    fileId,
+                    fileSize,
+                    mimeType,
+                    start,
+                    end - start
+                );
+
+            if (
+                token !==
+                mediaLoadToken
+            ) {
+                throw new Error(
+                    "Media load cancelled."
+                );
+            }
+
+            parts[index] =
+                buffer;
+
+            completed++;
+            completedBytes +=
+                buffer.byteLength;
+
+            mediaProgress.style.width =
+                (
+                    completedBytes /
+                    fileSize *
+                    100
+                ) +
+                "%";
+
+            mediaStatus.textContent =
+                "Downloaded " +
+                formatBytes(
+                    completedBytes
+                ) +
+                " / " +
+                formatBytes(
+                    fileSize
+                ) +
+                " (" +
+                completed +
+                " / " +
+                partCount +
+                " parts)";
         }
-
-        const start =
-            boundaries[index];
-
-        const end =
-            boundaries[index + 1];
-
-        const length =
-            end - start;
-
-        const buffer =
-            await fetchPiece(
-                fileId,
-                fileSize,
-                mimeType,
-                start,
-                length
-            );
-
-        if (
-            token !==
-            mediaLoadToken
-        ) {
-            throw new Error(
-                "Media load cancelled."
-            );
-        }
-
-        return buffer;
     }
 
-    mediaStatus.textContent =
-        partCount === 4
-            ? "Downloading image in 4 parts..."
-            : "Downloading image...";
+    const workerCount =
+        Math.min(
+            PIECE_CONCURRENCY,
+            partCount
+        );
 
-    const completed =
-        new Array(partCount);
+    await Promise.all(
+        Array.from(
+            {
+                length:
+                    workerCount
+            },
+            () => worker()
+        )
+    );
 
-    const results =
-        await Promise.all(
-            Array.from(
-                {
-                    length:
-                        partCount
-                },
-                (_, index) =>
-                    fetchPart(
-                        index
-                    ).then(
-                        buffer => {
-                            completed[
-                                index
-                            ] = buffer;
+    return parts;
+}
 
-                            const total =
-                                completed
-                                    .filter(
-                                        Boolean
-                                    )
-                                    .reduce(
-                                        (
-                                            sum,
-                                            part
-                                        ) =>
-                                            sum +
-                                            part.byteLength,
-                                        0
-                                    );
-
-                            const count =
-                                completed
-                                    .filter(
-                                        Boolean
-                                    )
-                                    .length;
-
-                            mediaProgress.style.width =
-                                (
-                                    total /
-                                    fileSize *
-                                    100
-                                ) +
-                                "%";
-
-                            mediaStatus.textContent =
-                                "Downloaded " +
-                                formatBytes(
-                                    total
-                                ) +
-                                " / " +
-                                formatBytes(
-                                    fileSize
-                                ) +
-                                " (" +
-                                count +
-                                " / " +
-                                partCount +
-                                " parts)";
-
-                            return buffer;
-                        }
-                    )
+async function fetchMediaPieces(
+    fileId,
+    fileSize,
+    mimeType,
+    token
+) {
+    const pieceCount =
+        Math.max(
+            1,
+            Math.ceil(
+                fileSize /
+                PIECE_SIZE
             )
         );
 
-    return results;
+    const pieces =
+        new Array(pieceCount);
+
+    let completed = 0;
+    let completedBytes = 0;
+    let nextIndex = 0;
+
+    async function worker() {
+        while (true) {
+            const index =
+                nextIndex++;
+
+            if (
+                index >= pieceCount
+            ) {
+                return;
+            }
+
+            if (
+                token !==
+                mediaLoadToken
+            ) {
+                throw new Error(
+                    "Media load cancelled."
+                );
+            }
+
+            const offset =
+                index *
+                PIECE_SIZE;
+
+            const length =
+                Math.min(
+                    PIECE_SIZE,
+                    fileSize -
+                        offset
+                );
+
+            const buffer =
+                await fetchPiece(
+                    fileId,
+                    fileSize,
+                    mimeType,
+                    offset,
+                    length
+                );
+
+            if (
+                token !==
+                mediaLoadToken
+            ) {
+                throw new Error(
+                    "Media load cancelled."
+                );
+            }
+
+            pieces[index] =
+                buffer;
+
+            completed++;
+            completedBytes +=
+                buffer.byteLength;
+
+            mediaProgress.style.width =
+                (
+                    completedBytes /
+                    fileSize *
+                    100
+                ) +
+                "%";
+
+            mediaStatus.textContent =
+                "Downloaded " +
+                formatBytes(
+                    completedBytes
+                ) +
+                " / " +
+                formatBytes(
+                    fileSize
+                ) +
+                " (" +
+                completed +
+                " / " +
+                pieceCount +
+                " pieces)";
+        }
+    }
+
+    const workerCount =
+        Math.min(
+            PIECE_CONCURRENCY,
+            pieceCount
+        );
+
+    await Promise.all(
+        Array.from(
+            {
+                length:
+                    workerCount
+            },
+            () => worker()
+        )
+    );
+
+    return pieces;
 }
 
 function combinePieces(
@@ -2758,106 +3010,98 @@ async function loadMedia(
             currentObjectUrl
         );
 
-        currentObjectUrl =
-            null;
+        currentObjectUrl = null;
     }
 
     mediaContainer.innerHTML = "";
     mediaInfo.innerHTML = "";
     mediaStatus.textContent = "";
-    mediaProgress.style.width =
-        "0%";
+    mediaProgress.style.width = "0%";
 
     mediaPanel.classList.remove(
         "hidden"
     );
 
-    mediaStatus.textContent =
-        "Getting media information...";
-
-    const info =
-        await api(
-            "/api/media-info?chat=" +
-            encodeURIComponent(
-                chatId
-            ) +
-            "&message=" +
-            encodeURIComponent(
-                messageId
-            )
-        );
-
-    if (
-        token !==
-        mediaLoadToken
-    ) {
-        return;
-    }
-
-    if (
-        !info.success ||
-        !info.fileId
-    ) {
-        mediaInfo.textContent =
-            "This message has no supported media.";
-
-        mediaStatus.textContent =
-            "";
-
-        return;
-    }
-
-    const size =
-        Number(
-            info.fileSize
-        );
-
-    mediaInfo.innerHTML =
-        "<div><b>Type:</b> " +
-        escapeHtml(
-            info.messageType
-        ) +
-        "</div>" +
-        "<div><b>Size:</b> " +
-        escapeHtml(
-            formatBytes(size)
-        ) +
-        "</div>" +
-        "<div><b>MIME:</b> " +
-        escapeHtml(
-            info.mimeType || ""
-        ) +
-        "</div>" +
-        (
-            info.width &&
-            info.height
-                ? "<div><b>Dimensions:</b> " +
-                  escapeHtml(
-                      info.width +
-                      " × " +
-                      info.height
-                  ) +
-                  "</div>"
-                : ""
-        );
-
-    if (
-        !Number.isFinite(size) ||
-        size <= 0
-    ) {
-        mediaStatus.textContent =
-            "Invalid media size.";
-
-        return;
-    }
-
-    mediaStatus.textContent =
-        "Downloading media in separate pieces...";
-
     try {
+        mediaStatus.textContent =
+            "Getting media information...";
+
+        const info =
+            await api(
+                "/api/media-info?chat=" +
+                encodeURIComponent(chatId) +
+                "&message=" +
+                encodeURIComponent(messageId)
+            );
+
+        if (
+            token !==
+            mediaLoadToken
+        ) {
+            return;
+        }
+
+        if (
+            !info.success ||
+            !info.fileId
+        ) {
+            mediaInfo.textContent =
+                "This message has no supported media.";
+
+            mediaStatus.textContent = "";
+            return;
+        }
+
+        const size =
+            Number(info.fileSize);
+
         const mime =
             info.mimeType || "";
-        
+
+        mediaInfo.innerHTML =
+            "<div><b>Type:</b> " +
+            escapeHtml(
+                info.messageType
+            ) +
+            "</div>" +
+            "<div><b>Size:</b> " +
+            escapeHtml(
+                formatBytes(size)
+            ) +
+            "</div>" +
+            "<div><b>MIME:</b> " +
+            escapeHtml(mime) +
+            "</div>" +
+            (
+                info.width &&
+                info.height
+                    ? "<div><b>Dimensions:</b> " +
+                      escapeHtml(
+                          info.width +
+                          " × " +
+                          info.height
+                      ) +
+                      "</div>"
+                    : ""
+            );
+
+        if (
+            !Number.isSafeInteger(size) ||
+            size <= 0
+        ) {
+            throw new Error(
+                "Invalid media size."
+            );
+        }
+
+        if (
+            !mime
+        ) {
+            throw new Error(
+                "Media MIME type is missing."
+            );
+        }
+
         if (
             mime.startsWith("image/")
         ) {
@@ -2868,14 +3112,14 @@ async function loadMedia(
                     mime,
                     token
                 );
-        
+
             if (
                 token !==
                 mediaLoadToken
             ) {
                 return;
             }
-        
+
             const blob =
                 new Blob(
                     parts,
@@ -2883,122 +3127,124 @@ async function loadMedia(
                         type: mime
                     }
                 );
-        
+
             currentObjectUrl =
                 URL.createObjectURL(
                     blob
                 );
-        
+
             const img =
                 document.createElement(
                     "img"
                 );
-        
+
             img.src =
                 currentObjectUrl;
-        
+
             img.alt = "";
-        
+
             mediaContainer.appendChild(
                 img
             );
-        
+
             mediaStatus.textContent =
                 "Image loaded.";
+
+            return;
+        }
+
+        const pieces =
+            await fetchMediaPieces(
+                info.fileId,
+                size,
+                mime,
+                token
+            );
+
+        if (
+            token !==
+            mediaLoadToken
+        ) {
+            return;
+        }
+
+        const blob =
+            new Blob(
+                pieces,
+                {
+                    type: mime
+                }
+            );
+
+        currentObjectUrl =
+            URL.createObjectURL(
+                blob
+            );
+
+        if (
+            mime.startsWith("video/")
+        ) {
+            const video =
+                document.createElement(
+                    "video"
+                );
+
+            video.controls = true;
+            video.preload =
+                "metadata";
+            video.src =
+                currentObjectUrl;
+
+            mediaContainer.appendChild(
+                video
+            );
+
+            mediaStatus.textContent =
+                "Video loaded.";
+        } else if (
+            mime.startsWith("audio/")
+        ) {
+            const audio =
+                document.createElement(
+                    "audio"
+                );
+
+            audio.controls = true;
+            audio.preload =
+                "metadata";
+            audio.src =
+                currentObjectUrl;
+
+            mediaContainer.appendChild(
+                audio
+            );
+
+            mediaStatus.textContent =
+                "Audio loaded.";
         } else {
-            const pieces =
-                await fetchMediaPieces(
-                    info.fileId,
-                    size,
-                    info.mimeType,
-                    token
+            const link =
+                document.createElement(
+                    "a"
                 );
-        
-            if (
-                token !==
-                mediaLoadToken
-            ) {
-                return;
-            }
-        
-            const blob =
-                combinePieces(
-                    pieces,
-                    info.mimeType
-                );
-        
-            currentObjectUrl =
-                URL.createObjectURL(
-                    blob
-                );
-        
-            if (
-                mime.startsWith(
-                    "video/"
-                )
-            ) {
-                const video =
-                    document.createElement(
-                        "video"
-                    );
-        
-                video.controls = true;
-                video.preload =
-                    "metadata";
-                video.src =
-                    currentObjectUrl;
-        
-                mediaContainer.appendChild(
-                    video
-                );
-        
-                mediaStatus.textContent =
-                    "Video loaded.";
-            } else if (
-                mime.startsWith(
-                    "audio/"
-                )
-            ) {
-                const audio =
-                    document.createElement(
-                        "audio"
-                    );
-        
-                audio.controls = true;
-                audio.src =
-                    currentObjectUrl;
-        
-                mediaContainer.appendChild(
-                    audio
-                );
-        
-                mediaStatus.textContent =
-                    "Audio loaded.";
-            } else {
-                const link =
-                    document.createElement(
-                        "a"
-                    );
-        
-                link.href =
-                    currentObjectUrl;
-        
-                link.textContent =
-                    "Open downloaded file";
-        
-                link.target =
-                    "_blank";
-        
-                link.rel =
-                    "noopener";
-        
-                mediaContainer.appendChild(
-                    link
-                );
-        
-                mediaStatus.textContent =
-                    "File loaded.";
-            }
+
+            link.href =
+                currentObjectUrl;
+
+            link.textContent =
+                "Open downloaded file";
+
+            link.target =
+                "_blank";
+
+            link.rel =
+                "noopener";
+
+            mediaContainer.appendChild(
+                link
+            );
+
+            mediaStatus.textContent =
+                "File loaded.";
         }
     } catch (error) {
         if (
@@ -3010,7 +3256,10 @@ async function loadMedia(
 
         mediaStatus.textContent =
             "Media error: " +
-            error.message;
+            (
+                error?.message ||
+                String(error)
+            );
     }
 }
 

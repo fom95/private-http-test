@@ -465,6 +465,256 @@ async function getMessageMediaInfo(client, chatId, messageId) {
     };
 }
 
+async function handleImageViewer(
+    request,
+    url
+) {
+    if (
+        request.method !== "GET"
+    ) {
+        return new Response(null, {
+            status: 405,
+            headers: {
+                Allow: "GET"
+            }
+        });
+    }
+
+    const chat =
+        url.searchParams.get("chat");
+
+    const message =
+        url.searchParams.get("message");
+
+    if (!chat || !message) {
+        return new Response(
+            "Missing chat or message.",
+            {
+                status: 400,
+                headers: {
+                    "Content-Type":
+                        "text/plain; charset=utf-8"
+                }
+            }
+        );
+    }
+
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Image</title>
+<style>
+html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    background: #111;
+}
+body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: auto;
+}
+img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+}
+#status {
+    color: #ccc;
+    font-family: sans-serif;
+}
+</style>
+</head>
+<body>
+<div id="status">Loading image...</div>
+<script>
+(async () => {
+    const chat =
+        ${JSON.stringify(chat)};
+
+    const message =
+        ${JSON.stringify(message)};
+
+    const status =
+        document.getElementById("status");
+
+    try {
+        const infoResponse =
+            await fetch(
+                "/api/media-info?chat=" +
+                encodeURIComponent(chat) +
+                "&message=" +
+                encodeURIComponent(message),
+                {
+                    cache: "force-cache"
+                }
+            );
+
+        if (!infoResponse.ok) {
+            throw new Error(
+                "Media information request failed: HTTP " +
+                infoResponse.status
+            );
+        }
+
+        const info =
+            await infoResponse.json();
+
+        if (
+            !info.media ||
+            !info.fileId
+        ) {
+            throw new Error(
+                "This message has no supported media."
+            );
+        }
+
+        const fileSize =
+            Number(info.fileSize);
+
+        const mimeType =
+            info.mimeType ||
+            "application/octet-stream";
+
+        if (
+            !Number.isSafeInteger(fileSize) ||
+            fileSize <= 0
+        ) {
+            throw new Error(
+                "Invalid media size."
+            );
+        }
+
+        if (
+            !mimeType.startsWith("image/")
+        ) {
+            throw new Error(
+                "This viewer only supports images."
+            );
+        }
+
+        const partCount = 4;
+        const parts =
+            new Array(partCount);
+
+        async function fetchPart(index) {
+            const start =
+                Math.floor(
+                    fileSize *
+                    index /
+                    partCount
+                );
+
+            const end =
+                Math.floor(
+                    fileSize *
+                    (index + 1) /
+                    partCount
+                );
+
+            const params =
+                new URLSearchParams({
+                    fileId:
+                        info.fileId,
+                    fileSize:
+                        String(fileSize),
+                    mime:
+                        mimeType,
+                    offset:
+                        String(start),
+                    length:
+                        String(end - start)
+                });
+
+            const response =
+                await fetch(
+                    "/piece?" +
+                    params.toString(),
+                    {
+                        cache:
+                            "force-cache"
+                    }
+                );
+
+            if (!response.ok) {
+                throw new Error(
+                    "Image part " +
+                    (index + 1) +
+                    " failed: HTTP " +
+                    response.status
+                );
+            }
+
+            return await response.arrayBuffer();
+        }
+
+        status.textContent =
+            "Downloading image in 4 parts...";
+
+        const results =
+            await Promise.all(
+                Array.from(
+                    {
+                        length:
+                            partCount
+                    },
+                    (_, index) =>
+                        fetchPart(index)
+                )
+            );
+
+        const blob =
+            new Blob(
+                results,
+                {
+                    type:
+                        mimeType
+                }
+            );
+
+        const image =
+            document.createElement(
+                "img"
+            );
+
+        image.src =
+            URL.createObjectURL(
+                blob
+            );
+
+        image.onload = () => {
+            status.remove();
+        };
+
+        document.body.appendChild(
+            image
+        );
+    } catch (error) {
+        status.textContent =
+            error.message ||
+            String(error);
+    }
+})();
+</script>
+</body>
+</html>`;
+
+    return new Response(
+        html,
+        {
+            headers: {
+                "Content-Type":
+                    "text/html; charset=utf-8",
+                "Cache-Control":
+                    "no-store"
+            }
+        }
+    );
+}
+
 async function handleDirectMediaRequest(
     request,
     env,
@@ -2388,7 +2638,7 @@ async function selectMessage(
 
     addLink(
         "Direct media URL",
-        "/media?chat=" +
+        "/image?chat=" +
         encodeURIComponent(
             selectedChatId
         ) +
@@ -2516,6 +2766,13 @@ export default {
                 return await handlePieceRequest(
                     request,
                     env,
+                    url
+                );
+            }
+
+            if (url.pathname === "/image") {
+                return handleImageViewer(
+                    request,
                     url
                 );
             }

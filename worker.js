@@ -241,9 +241,42 @@ async function getMessages(
             );
         }
 
+        const chats =
+            await client.getChats({
+                from:
+                    "main",
+
+                limit:
+                    100
+            });
+
+        const chatItem =
+            chats.find(
+                item =>
+                    Number(
+                        item.chat.id
+                    ) ===
+                    numericChatId
+            );
+
+        if (!chatItem) {
+
+            throw new Error(
+                `Chat ${numericChatId} was not found in MTKruto getChats().`
+            );
+        }
+
+        const chat =
+            chatItem.chat;
+
+        const inputPeer =
+            await client.getInputPeer(
+                chat.id
+            );
+
         const messages =
             await client.getHistory(
-                numericChatId,
+                chat.id,
                 {
                     limit:
                         100
@@ -256,8 +289,17 @@ async function getMessages(
 
             chatId:
                 String(
-                    numericChatId
+                    chat.id
                 ),
+
+            chatTitle:
+                chat.title ||
+                chat.firstName ||
+                null,
+
+            chatType:
+                chat.type ||
+                null,
 
             count:
                 messages.length,

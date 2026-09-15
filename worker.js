@@ -1,8 +1,19 @@
-import { Client } from "@mtkruto/mtkruto";
+import {
+    Client,
+    StorageMemory
+} from "@mtkruto/mtkruto";
 
-function json(data, status = 200) {
+function json(
+    data,
+    status = 200
+) {
+
     return new Response(
-        JSON.stringify(data, null, 2),
+        JSON.stringify(
+            data,
+            null,
+            2
+        ),
         {
             status,
             headers: {
@@ -13,7 +24,10 @@ function json(data, status = 200) {
     );
 }
 
-function html(body) {
+function html(
+    body
+) {
+
     return new Response(
         body,
         {
@@ -25,7 +39,10 @@ function html(body) {
     );
 }
 
-function errorInfo(error) {
+function errorInfo(
+    error
+) {
+
     return {
         error:
             error?.message ||
@@ -41,7 +58,9 @@ function errorInfo(error) {
     };
 }
 
-async function getTelegramClient(env) {
+async function getTelegramClient(
+    env
+) {
 
     const apiId =
         Number(
@@ -57,20 +76,22 @@ async function getTelegramClient(env) {
     const client =
         new Client({
             apiId,
+
             apiHash,
+
             authString,
+
+            storage:
+                new StorageMemory(),
+
+            persistCache:
+                false,
 
             defaultHandlers:
                 false,
 
             disableUpdates:
-                true,
-
-            persistCache:
-                false,
-
-            storage:
-                "memory"
+                true
         });
 
     await client.connect();
@@ -108,7 +129,7 @@ function getMessageMediaInfo(
         };
     }
 
-    const result = {
+    return {
         hasMedia:
             true,
 
@@ -134,8 +155,6 @@ function getMessageMediaInfo(
             media.mimeType ||
             null
     };
-
-    return result;
 }
 
 async function getChatList(
@@ -232,10 +251,7 @@ async function getMessages(
                     media.fileName,
 
                 mimeType:
-                    media.mimeType,
-
-                rawMedia:
-                    media
+                    media.mimeType
             };
         }
     );
@@ -259,7 +275,9 @@ async function testDownload(
     const message =
         await client.getMessage(
             chatId,
-            Number(messageId)
+            Number(
+                messageId
+            )
         );
 
     if (!message) {
@@ -346,11 +364,7 @@ async function testDownload(
 
         /*
          * Deliberately discard
-         * the downloaded bytes.
-         *
-         * We do NOT put them into
-         * an array and we do NOT
-         * return them to the browser.
+         * every downloaded chunk.
          */
     }
 
@@ -415,7 +429,7 @@ async function handleRequest(
 <meta charset="utf-8">
 
 <title>
-MTKruto Telegram HTTP Test
+MTKruto Telegram Test
 </title>
 
 <style>
@@ -432,11 +446,6 @@ select {
     max-width: 750px;
     padding: 8px;
     margin: 6px 0 16px;
-}
-
-button {
-    padding: 10px 16px;
-    cursor: pointer;
 }
 
 a {
@@ -463,10 +472,13 @@ pre {
 <body>
 
 <h1>
-MTKruto Telegram HTTP Test
+MTKruto Telegram Test
 </h1>
 
-<div class="status" id="status">
+<div
+    class="status"
+    id="status"
+>
 Loading chats...
 </div>
 
@@ -475,7 +487,6 @@ Chat
 </label>
 
 <select id="chat">
-
 </select>
 
 <label>
@@ -483,11 +494,9 @@ Message
 </label>
 
 <select id="message">
-
 </select>
 
 <div id="buttons">
-
 </div>
 
 <pre id="info">
@@ -534,14 +543,50 @@ async function loadChats() {
             "/api/chats"
         );
 
-    const data =
-        await response.json();
+    const text =
+        await response.text();
+
+    let data;
+
+    try {
+
+        data =
+            JSON.parse(
+                text
+            );
+
+    } catch {
+
+        throw new Error(
+            "Non-JSON response from /api/chats:\\n\\n" +
+            text
+        );
+    }
 
     if (!response.ok) {
 
         throw new Error(
-            data.error ||
-            "Failed to load chats."
+            JSON.stringify(
+                data,
+                null,
+                2
+            )
+        );
+    }
+
+    if (
+        !Array.isArray(
+            data
+        )
+    ) {
+
+        throw new Error(
+            "Unexpected /api/chats response:\\n\\n" +
+            JSON.stringify(
+                data,
+                null,
+                2
+            )
         );
     }
 
@@ -567,7 +612,10 @@ async function loadChats() {
         option.textContent =
             chat.title +
             " [" +
-            chat.type +
+            (
+                chat.type ||
+                "unknown"
+            ) +
             "]";
 
         chatSelect.appendChild(
@@ -603,14 +651,34 @@ async function loadMessages() {
             )
         );
 
-    const data =
-        await response.json();
+    const text =
+        await response.text();
+
+    let data;
+
+    try {
+
+        data =
+            JSON.parse(
+                text
+            );
+
+    } catch {
+
+        throw new Error(
+            "Non-JSON response from /api/messages:\\n\\n" +
+            text
+        );
+    }
 
     if (!response.ok) {
 
         throw new Error(
-            data.error ||
-            "Failed to load messages."
+            JSON.stringify(
+                data,
+                null,
+                2
+            )
         );
     }
 
@@ -783,7 +851,7 @@ loadChats()
         error => {
 
             status.textContent =
-                "ERROR";
+                "LOAD CHATS ERROR";
 
             info.textContent =
                 error.stack ||
@@ -852,7 +920,7 @@ loadChats()
 
     const testMatch =
         path.match(
-            /^\/test-download\/([^/]+)\/([^/]+)$/
+            /^\\/test-download\\/([^/]+)\\/([^/]+)$/
         );
 
     if (testMatch) {
@@ -894,11 +962,9 @@ export default {
         } catch (error) {
 
             return json(
-                {
-                    ...errorInfo(
-                        error
-                    )
-                },
+                errorInfo(
+                    error
+                ),
                 500
             );
         }

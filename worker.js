@@ -1,6 +1,5 @@
 import {
-    Client,
-    StorageMemory
+    Client
 } from "@mtkruto/mtkruto";
 
 function json(
@@ -76,20 +75,17 @@ async function getTelegramClient(
     const client =
         new Client({
             apiId,
-
+    
             apiHash,
-
+    
             authString,
-
-            storage:
-                new StorageMemory(),
-
+    
             persistCache:
                 false,
-
+    
             defaultHandlers:
                 false,
-
+    
             disableUpdates:
                 true
         });

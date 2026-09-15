@@ -21,6 +21,10 @@
     }
   ],
 
+  "cache": {
+      "enabled": true
+  },
+
   "observability": {
     "enabled": true,
     "logs": {

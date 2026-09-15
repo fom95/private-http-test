@@ -295,52 +295,40 @@ async function createClient(env) {
     mtkrutoClientPromise =
         (async () => {
             const apiId =
-                Number(env.API_ID);
+                Number(
+                    await env.API_ID.get()
+                );
 
             const apiHash =
-                env.API_HASH;
+                await env.API_HASH.get();
 
-            const authString =
-                env.MTKRUTO_SESSION;
+            const session =
+                await env.MTKRUTO_SESSION.get();
 
-            const cache =
-                env.MTKRUTO_CACHE;
-
-            if (!apiId) {
+            if (!apiId || !apiHash || !session) {
                 throw new Error(
-                    "Missing API_ID."
+                    "Telegram credentials are not configured."
                 );
             }
 
-            if (!apiHash) {
+            if (!env.MTKRUTO_CACHE) {
                 throw new Error(
-                    "Missing API_HASH."
-                );
-            }
-
-            if (!authString) {
-                throw new Error(
-                    "Missing MTKRUTO_SESSION."
-                );
-            }
-
-            if (!cache) {
-                throw new Error(
-                    "Missing MTKRUTO_CACHE KV namespace."
+                    "MTKRUTO_CACHE KV binding is not configured."
                 );
             }
 
             const storage =
                 new CloudflareKVStorage(
-                    cache
+                    env.MTKRUTO_CACHE
                 );
 
             const client =
                 new Client({
                     apiId,
                     apiHash,
+                    authString:
+                        session,
                     storage,
-                    authString,
                     persistCache:
                         true
                 });

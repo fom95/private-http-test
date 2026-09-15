@@ -1600,52 +1600,65 @@ export default {
                     client.iterDownload({
                         file:
                             location,
-
+                
                         offset:
                             bigInt(
                                 start
                             ),
-
+                
                         limit:
                             bigInt(
                                 contentLength
                             ),
-
+                
                         requestSize:
-                            512 * 1024
+                            2 * 1024 * 1024
                     });
-
+                
                 const stream =
                     new ReadableStream({
-
+                
                         async start(
                             controller
                         ) {
-
+                
                             try {
-
+                
                                 for await (
                                     const chunk
                                     of iter
                                 ) {
-
+                
+                                    if (
+                                        request.signal.aborted
+                                    ) {
+                                        return;
+                                    }
+                
                                     controller.enqueue(
-                                        new Uint8Array(
-                                            chunk
-                                        )
+                                        chunk
                                     );
                                 }
-
+                
                                 controller.close();
-
+                
                             } catch (error) {
-
-                                controller.error(
-                                    error
-                                );
+                
+                                if (
+                                    !request.signal.aborted
+                                ) {
+                                    controller.error(
+                                        error
+                                    );
+                                }
                             }
+                        },
+                
+                        cancel() {
+                
+                            return;
                         }
-
+                
                     });
 
                 const headers =

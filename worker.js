@@ -920,7 +920,7 @@ loadChats()
 
     const testMatch =
         path.match(
-            /^\\/test-download\\/([^/]+)\\/([^/]+)$/
+            /^\/test-download\/([^/]+)\/([^/]+)$/
         );
 
     if (testMatch) {

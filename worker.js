@@ -2,6 +2,11 @@ import {
     Client
 } from "@mtkruto/mtkruto";
 
+let telegramClientPromise = null;
+
+const inputPeerCache =
+    new Map();
+
 function json(
     data,
     status = 200
@@ -61,38 +66,98 @@ async function getTelegramClient(
     env
 ) {
 
-    const apiId =
+    if (
+        telegramClientPromise
+    ) {
+
+        return telegramClientPromise;
+    }
+
+    telegramClientPromise =
+        (async () => {
+
+            const apiId =
+                Number(
+                    await env.API_ID.get()
+                );
+
+            const apiHash =
+                await env.API_HASH.get();
+
+            const authString =
+                await env.MTKRUTO_SESSION.get();
+
+            const client =
+                new Client({
+                    apiId,
+
+                    apiHash,
+
+                    authString,
+
+                    persistCache:
+                        false,
+
+                    defaultHandlers:
+                        false,
+
+                    disableUpdates:
+                        true
+                });
+
+            await client.connect();
+
+            return client;
+
+        })();
+
+    try {
+
+        return await telegramClientPromise;
+
+    } catch (
+        error
+    ) {
+
+        telegramClientPromise =
+            null;
+
+        throw error;
+    }
+}
+
+async function getInputPeerCached(
+    client,
+    chatId
+) {
+
+    const numericChatId =
         Number(
-            await env.API_ID.get()
+            chatId
         );
 
-    const apiHash =
-        await env.API_HASH.get();
+    if (
+        inputPeerCache.has(
+            numericChatId
+        )
+    ) {
 
-    const authString =
-        await env.MTKRUTO_SESSION.get();
+        return inputPeerCache.get(
+            numericChatId
+        );
+    }
 
-    const client =
-        new Client({
-            apiId,
+    const peer =
+        await client.getInputPeer(
+            numericChatId
+        );
 
-            apiHash,
+    inputPeerCache.set(
+        numericChatId,
+        peer
+    );
 
-            authString,
-
-            persistCache:
-                false,
-
-            defaultHandlers:
-                false,
-
-            disableUpdates:
-                true
-        });
-
-    await client.connect();
-
-    return client;
+    return peer;
 }
 
 function getMessageMedia(
@@ -288,6 +353,112 @@ function getMessageMediaInfo(
     };
 }
 
+function detectImageMimeType(
+    bytes
+) {
+
+    if (
+        !bytes ||
+        bytes.byteLength < 4
+    ) {
+
+        return null;
+    }
+
+    const b =
+        bytes instanceof Uint8Array
+            ? bytes
+            : new Uint8Array(
+                bytes
+            );
+
+    if (
+        b[0] === 0xFF &&
+        b[1] === 0xD8 &&
+        b[2] === 0xFF
+    ) {
+
+        return "image/jpeg";
+    }
+
+    if (
+        b[0] === 0x89 &&
+        b[1] === 0x50 &&
+        b[2] === 0x4E &&
+        b[3] === 0x47 &&
+        b.length >= 8 &&
+        b[4] === 0x0D &&
+        b[5] === 0x0A &&
+        b[6] === 0x1A &&
+        b[7] === 0x0A
+    ) {
+
+        return "image/png";
+    }
+
+    if (
+        b[0] === 0x47 &&
+        b[1] === 0x49 &&
+        b[2] === 0x46 &&
+        b[3] === 0x38
+    ) {
+
+        return "image/gif";
+    }
+
+    if (
+        b.length >= 12 &&
+        b[0] === 0x52 &&
+        b[1] === 0x49 &&
+        b[2] === 0x46 &&
+        b[3] === 0x46 &&
+        b[8] === 0x57 &&
+        b[9] === 0x45 &&
+        b[10] === 0x42 &&
+        b[11] === 0x50
+    ) {
+
+        return "image/webp";
+    }
+
+    if (
+        b.length >= 12 &&
+        b[4] === 0x66 &&
+        b[5] === 0x74 &&
+        b[6] === 0x79 &&
+        b[7] === 0x70
+    ) {
+
+        const brand =
+            String.fromCharCode(
+                b[8],
+                b[9],
+                b[10],
+                b[11]
+            );
+
+        if (
+            brand === "avif" ||
+            brand === "avis"
+        ) {
+
+            return "image/avif";
+        }
+
+        if (
+            brand === "heic" ||
+            brand === "heix" ||
+            brand === "hevc" ||
+            brand === "hevx"
+        ) {
+
+            return "image/heic";
+        }
+    }
+
+    return null;
+}
+
 async function getChatList(
     client
 ) {
@@ -407,7 +578,8 @@ async function getMessages(
         const chat =
             chatItem.chat;
 
-        await client.getInputPeer(
+        await getInputPeerCached(
+            client,
             chat.id
         );
 
@@ -661,44 +833,14 @@ async function handleMediaRequest(
             env
         );
 
-    const chats =
-        await client.getChats({
-            from:
-                "main",
-
-            limit:
-                100
-        });
-
-    const chatItem =
-        chats.find(
-            item =>
-                Number(
-                    item.chat.id
-                ) ===
-                numericChatId
-        );
-
-    if (!chatItem) {
-
-        return new Response(
-            "Chat cannot be accessed.",
-            {
-                status: 404
-            }
-        );
-    }
-
-    const chat =
-        chatItem.chat;
-
-    await client.getInputPeer(
-        chat.id
+    await getInputPeerCached(
+        client,
+        numericChatId
     );
 
     const message =
         await client.getMessage(
-            chat.id,
+            numericChatId,
             numericMessageId
         );
 
@@ -749,6 +891,9 @@ async function handleMediaRequest(
             media.fileSize ||
             0
         );
+
+    let isThumbnail =
+        false;
 
     if (
         thumbParam !== null
@@ -807,8 +952,8 @@ async function handleMediaRequest(
                 0
             );
 
-        contentType =
-            "image/jpeg";
+        isThumbnail =
+            true;
     }
 
     if (!fileId) {
@@ -1022,73 +1167,171 @@ async function handleMediaRequest(
             }
         );
 
+    let firstChunk =
+        null;
+
+    if (
+        isThumbnail
+    ) {
+
+        const firstResult =
+            await iterator.next();
+
+        if (
+            firstResult.done
+        ) {
+
+            return new Response(
+                "Thumbnail download returned no data.",
+                {
+                    status: 502
+                }
+            );
+        }
+
+        firstChunk =
+            firstResult.value;
+
+        const detectedType =
+            detectImageMimeType(
+                firstChunk
+            );
+
+        if (
+            detectedType
+        ) {
+
+            contentType =
+                detectedType;
+
+        } else if (
+            !contentType ||
+            contentType ===
+                "application/octet-stream"
+        ) {
+
+            contentType =
+                "image/jpeg";
+        }
+
+        headers.set(
+            "Content-Type",
+            contentType
+        );
+    }
+
     let bytesSent =
         0;
 
     const stream =
         new ReadableStream({
 
-            async pull(
+            async start(
                 controller
             ) {
 
                 try {
 
                     if (
-                        bytesSent >=
-                        responseLength
+                        firstChunk
                     ) {
 
-                        controller.close();
+                        let chunk =
+                            firstChunk;
 
-                        return;
-                    }
+                        const remaining =
+                            responseLength -
+                            bytesSent;
 
-                    const result =
-                        await iterator.next();
+                        if (
+                            chunk.byteLength >
+                            remaining
+                        ) {
 
-                    if (
-                        result.done
-                    ) {
+                            chunk =
+                                chunk.slice(
+                                    0,
+                                    remaining
+                                );
+                        }
 
-                        controller.close();
+                        if (
+                            chunk.byteLength
+                        ) {
 
-                        return;
-                    }
-
-                    let chunk =
-                        result.value;
-
-                    const remaining =
-                        responseLength -
-                        bytesSent;
-
-                    if (
-                        chunk.byteLength >
-                        remaining
-                    ) {
-
-                        chunk =
-                            chunk.slice(
-                                0,
-                                remaining
+                            controller.enqueue(
+                                chunk
                             );
+
+                            bytesSent +=
+                                chunk.byteLength;
+                        }
+
+                        if (
+                            bytesSent >=
+                            responseLength
+                        ) {
+
+                            controller.close();
+
+                            return;
+                        }
                     }
 
-                    controller.enqueue(
-                        chunk
-                    );
-
-                    bytesSent +=
-                        chunk.byteLength;
-
-                    if (
-                        bytesSent >=
-                        responseLength
+                    for await (
+                        const chunk
+                        of iterator
                     ) {
 
-                        controller.close();
+                        if (
+                            bytesSent >=
+                            responseLength
+                        ) {
+
+                            break;
+                        }
+
+                        const remaining =
+                            responseLength -
+                            bytesSent;
+
+                        let output =
+                            chunk;
+
+                        if (
+                            output.byteLength >
+                            remaining
+                        ) {
+
+                            output =
+                                output.slice(
+                                    0,
+                                    remaining
+                                );
+                        }
+
+                        if (
+                            output.byteLength
+                        ) {
+
+                            controller.enqueue(
+                                output
+                            );
+
+                            bytesSent +=
+                                output.byteLength;
+                        }
+
+                        if (
+                            bytesSent >=
+                            responseLength
+                        ) {
+
+                            break;
+                        }
                     }
+
+                    controller.close();
 
                 } catch (
                     error
@@ -1135,41 +1378,14 @@ async function testDownload(
             messageId
         );
 
-    const chats =
-        await client.getChats({
-            from:
-                "main",
-
-            limit:
-                100
-        });
-
-    const chatItem =
-        chats.find(
-            item =>
-                Number(
-                    item.chat.id
-                ) ===
-                numericChatId
-        );
-
-    if (!chatItem) {
-
-        throw new Error(
-            `Chat ${numericChatId} was not found.`
-        );
-    }
-
-    const chat =
-        chatItem.chat;
-
-    await client.getInputPeer(
-        chat.id
+    await getInputPeerCached(
+        client,
+        numericChatId
     );
 
     const message =
         await client.getMessage(
-            chat.id,
+            numericChatId,
             numericMessageId
         );
 
@@ -1951,6 +2167,16 @@ loadChats()
                     env
                 );
 
+            const numericChatId =
+                Number(
+                    chatId
+                );
+
+            await getInputPeerCached(
+                client,
+                numericChatId
+            );
+
             const chats =
                 await client.getChats({
                     from:
@@ -1966,9 +2192,7 @@ loadChats()
                         Number(
                             item.chat.id
                         ) ===
-                        Number(
-                            chatId
-                        )
+                        numericChatId
                 );
 
             if (!chatItem) {
@@ -1980,10 +2204,6 @@ loadChats()
 
             const chat =
                 chatItem.chat;
-
-            await client.getInputPeer(
-                chat.id
-            );
 
             return json({
                 success:

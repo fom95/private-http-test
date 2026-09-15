@@ -76,12 +76,18 @@ async function getMessage(client, chatId, messageId) {
         throw new Error("Invalid chat or message ID.");
     }
 
-    await client.getInputPeer(numericChatId);
-
-    return await client.getMessage(
+    const message = await client.getMessage(
         numericChatId,
         numericMessageId
     );
+
+    if (!message) {
+        throw new Error(
+            `Message ${numericMessageId} was not found in chat ${numericChatId}.`
+        );
+    }
+
+    return message;
 }
 
 function getMessageMedia(message) {

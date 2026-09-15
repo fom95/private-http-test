@@ -4,7 +4,6 @@ const TELEGRAM_CHUNK_SIZE = 256 * 1024;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 
 const CACHE_CONTROL = "public, max-age=31536000, immutable";
-let mtkrutoClientPromise = null;
 
 function json(data, status = 200, extraHeaders = {}) {
     return new Response(JSON.stringify(data, null, 2), {
@@ -284,66 +283,48 @@ class CloudflareKVStorage {
 }
 
 async function createClient(env) {
-    if (mtkrutoClientPromise) {
-        try {
-            return await mtkrutoClientPromise;
-        } catch {
-            mtkrutoClientPromise = null;
-        }
+    const apiId =
+        Number(
+            await env.API_ID.get()
+        );
+
+    const apiHash =
+        await env.API_HASH.get();
+
+    const session =
+        await env.MTKRUTO_SESSION.get();
+
+    if (!apiId || !apiHash || !session) {
+        throw new Error(
+            "Telegram credentials are not configured."
+        );
     }
 
-    mtkrutoClientPromise =
-        (async () => {
-            const apiId =
-                Number(
-                    await env.API_ID.get()
-                );
-
-            const apiHash =
-                await env.API_HASH.get();
-
-            const session =
-                await env.MTKRUTO_SESSION.get();
-
-            if (!apiId || !apiHash || !session) {
-                throw new Error(
-                    "Telegram credentials are not configured."
-                );
-            }
-
-            if (!env.MTKRUTO_CACHE) {
-                throw new Error(
-                    "MTKRUTO_CACHE KV binding is not configured."
-                );
-            }
-
-            const storage =
-                new CloudflareKVStorage(
-                    env.MTKRUTO_CACHE
-                );
-
-            const client =
-                new Client({
-                    apiId,
-                    apiHash,
-                    authString:
-                        session,
-                    storage,
-                    persistCache:
-                        true
-                });
-
-            await client.start();
-
-            return client;
-        })();
-
-    try {
-        return await mtkrutoClientPromise;
-    } catch (error) {
-        mtkrutoClientPromise = null;
-        throw error;
+    if (!env.MTKRUTO_CACHE) {
+        throw new Error(
+            "MTKRUTO_CACHE KV binding is not configured."
+        );
     }
+
+    const storage =
+        new CloudflareKVStorage(
+            env.MTKRUTO_CACHE
+        );
+
+    const client =
+        new Client({
+            apiId,
+            apiHash,
+            authString:
+                session,
+            storage,
+            persistCache:
+                true
+        });
+
+    await client.start();
+
+    return client;
 }
 
 async function getChatForId(client, chatId) {

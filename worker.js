@@ -139,6 +139,7 @@ function detectImageMimeType(bytes) {
 
     if(bytes.length>=6) {
         const s=new TextDecoder().decode(bytes.slice(0,6));
+
         if(s==="GIF87a"||s==="GIF89a")
             return "image/gif";
     }
@@ -156,6 +157,7 @@ function detectImageMimeType(bytes) {
 
     if(bytes.length>=12) {
         const s=new TextDecoder().decode(bytes.slice(4,12));
+
         if(s==="ftypavif"||s==="ftypavis")
             return "image/avif";
 
@@ -180,7 +182,9 @@ async function getChatForId(client,chatId) {
         limit:100
     });
 
-    const items=Array.isArray(result)?result:(result?.chats||[]);
+    const items=Array.isArray(result)
+        ?result
+        :(result?.chats||[]);
 
     for(const item of items) {
         const chat=item?.chat||item;
@@ -189,7 +193,9 @@ async function getChatForId(client,chatId) {
             return chat;
     }
 
-    throw new Error(`Chat ${numericChatId} was not found in the accessible chat list.`);
+    throw new Error(
+        `Chat ${numericChatId} was not found in the accessible chat list.`
+    );
 }
 
 async function getMessages(client,chatId) {
@@ -226,11 +232,6 @@ async function handleMediaRequest(request,env,chatId,messageId) {
     const client=await getTelegramClient(env);
 
     try {
-        /*
-         * Do NOT call getInputPeer(numericChatId) directly here.
-         * A fresh MTKruto client cannot always resolve the raw channel ID.
-         * Resolve it through getChats(), which is also how /api/messages works.
-         */
         const chat=await getChatForId(client,numericChatId);
 
         await client.getInputPeer(chat.id);
@@ -286,15 +287,9 @@ async function handleMediaRequest(request,env,chatId,messageId) {
 
             fileId=thumb.fileId;
             fileSize=Number(thumb.fileSize||0);
-
-            /*
-             * MTKruto does not necessarily provide a useful MIME type for
-             * Telegram document thumbnails, so these are sniffed below.
-             */
             contentType=thumb.mimeType||
                 media.mimeType||
                 "application/octet-stream";
-
             fileName=null;
         }
 
@@ -407,17 +402,10 @@ async function handleMediaRequest(request,env,chatId,messageId) {
             });
         }
 
-        /*
-         * Start downloading at the requested Telegram offset.
-         * Do not specify chunkSize here: MTKruto rejects the previously
-         * attempted 2 MiB value.
-         */
         const download=client.download(fileId,{
             offset:rangeStart,
             signal:request.signal
         });
-
-        let firstChunk=null;
 
         if(isThumbnail) {
             const iterator=download[Symbol.asyncIterator]();
@@ -431,8 +419,7 @@ async function handleMediaRequest(request,env,chatId,messageId) {
                     }
                 });
 
-            firstChunk=first.value;
-
+            const firstChunk=first.value;
             const detected=detectImageMimeType(firstChunk);
 
             if(detected) {
@@ -440,36 +427,30 @@ async function handleMediaRequest(request,env,chatId,messageId) {
                 headers["Content-Type"]=detected;
             }
 
-            /*
-             * Return the first bytes that were already consumed for MIME
-             * detection, followed by the remainder of the generator.
-             */
             const stream=new ReadableStream({
                 async start(controller) {
                     let remaining=requestedLength;
 
                     try {
-                        if(firstChunk) {
-                            let bytes=firstChunk;
+                        let bytes=firstChunk;
 
-                            if(remaining!==null) {
-                                if(remaining<=0) {
-                                    controller.close();
-                                    return;
-                                }
-
-                                if(bytes.length>remaining)
-                                    bytes=bytes.slice(0,remaining);
-
-                                remaining-=bytes.length;
-                            }
-
-                            controller.enqueue(bytes);
-
-                            if(remaining===0) {
+                        if(remaining!==null) {
+                            if(remaining<=0) {
                                 controller.close();
                                 return;
                             }
+
+                            if(bytes.length>remaining)
+                                bytes=bytes.slice(0,remaining);
+
+                            remaining-=bytes.length;
+                        }
+
+                        controller.enqueue(bytes);
+
+                        if(remaining===0) {
+                            controller.close();
+                            return;
                         }
 
                         while(true) {
@@ -478,7 +459,7 @@ async function handleMediaRequest(request,env,chatId,messageId) {
                             if(next.done)
                                 break;
 
-                            let bytes=next.value;
+                            bytes=next.value;
 
                             if(remaining!==null) {
                                 if(remaining<=0)
@@ -586,9 +567,7 @@ async function testDownload(env,chatId,messageId) {
         let bytesDownloaded=0;
         let chunks=0;
 
-        const download=client.download(media.fileId,{
-            signal:undefined
-        });
+        const download=client.download(media.fileId);
 
         for await(const chunk of download) {
             bytesDownloaded+=chunk.length;
@@ -629,25 +608,49 @@ async function main(request,env) {
 <meta charset="utf-8">
 <title>Telegram Media Test</title>
 <style>
-body{font-family:system-ui,sans-serif;margin:30px;max-width:1100px}
-select,button{font-size:16px;padding:6px;margin:4px}
-a{display:block;margin:6px 0}
-pre{white-space:pre-wrap;word-break:break-word}
-img{max-width:500px;max-height:500px}
-video{max-width:800px;max-height:600px}
+body{
+    font-family:system-ui,sans-serif;
+    margin:30px;
+    max-width:1100px
+}
+select,button{
+    font-size:16px;
+    padding:6px;
+    margin:4px
+}
+a{
+    display:block;
+    margin:8px 0
+}
+pre{
+    white-space:pre-wrap;
+    word-break:break-word
+}
+.media-link{
+    font-weight:bold;
+    font-size:18px
+}
+.warning{
+    margin-top:20px;
+    padding:12px;
+    border:1px solid #888
+}
 </style>
 </head>
 <body>
+
 <h1>Telegram Media Test</h1>
 
 <div>
-<label>Chat:
+<label>
+Chat:
 <select id="chat"></select>
 </label>
 </div>
 
 <div>
-<label>Message:
+<label>
+Message:
 <select id="message"></select>
 </label>
 </div>
@@ -672,11 +675,16 @@ async function loadChats(){
 
     for(const chat of chats){
         const o=document.createElement("option");
+
         o.value=chat.id;
+
         o.textContent=
             chat.title||
-            [chat.firstName,chat.lastName].filter(Boolean).join(" ")||
+            [chat.firstName,chat.lastName]
+                .filter(Boolean)
+                .join(" ")||
             String(chat.id);
+
         chatSelect.appendChild(o);
     }
 
@@ -686,11 +694,17 @@ async function loadChats(){
 async function loadMessages(){
     const id=Number(chatSelect.value);
 
-    const r=await fetch("/api/messages?chat="+encodeURIComponent(id));
+    const r=await fetch(
+        "/api/messages?chat="+encodeURIComponent(id)
+    );
+
     const data=await r.json();
 
     if(!data.success){
-        details.innerHTML="<pre>"+escapeHtml(JSON.stringify(data,null,2))+"</pre>";
+        details.innerHTML=
+            "<pre>"+
+            escapeHtml(JSON.stringify(data,null,2))+
+            "</pre>";
         return;
     }
 
@@ -699,13 +713,19 @@ async function loadMessages(){
 
     for(const message of messages){
         const o=document.createElement("option");
+
         o.value=message.id;
 
         const media=message.media;
+
         const label=
             "#"+message.id+
-            (media?.fileName?" - "+media.fileName:"")+
-            (media?.type?" ["+media.type+"]":"");
+            (media?.fileName
+                ?" - "+media.fileName
+                :"")+
+            (media?.type
+                ?" ["+media.type+"]"
+                :"");
 
         o.textContent=label;
         messageSelect.appendChild(o);
@@ -737,50 +757,92 @@ function showMessage(){
     const media=message.media;
     const chat=Number(chatSelect.value);
     const id=Number(message.id);
+
     const mediaUrl=
         location.origin+
         "/media/"+chat+"/"+id;
 
-    let html="<h2>Message #"+id+"</h2>";
+    let out="<h2>Message #"+id+"</h2>";
 
-    html+="<p><a href=\\""+mediaUrl+"\\">Open media</a></p>";
+    /*
+     * Deliberately no <img> or <video> element is created here.
+     * Media only loads when one of these links is clicked.
+     */
+    out+=
+        "<p><a class=\\"media-link\\" "+
+        "href=\\""+mediaUrl+"\\" "+
+        "target=\\"_blank\\" "+
+        "rel=\\"noopener\\">"+
+        "Open media in new tab"+
+        "</a></p>";
 
-    html+="<p><a href=\\"/api/messages?chat="+chat+"\\">Open Messages API</a></p>";
-    html+="<p><a href=\\"/api/chat?chat="+chat+"\\">Open Chat API</a></p>";
+    /*
+     * This version asks Cloudflare for structured JSON if the request
+     * itself is tested manually, which makes a Cloudflare-generated
+     * error easier to inspect.
+     */
+    out+=
+        "<p><a href=\\""+mediaUrl+
+        "\\" target=\\"_blank\\" rel=\\"noopener\\">"+
+        "Open media request"+
+        "</a></p>";
+
+    out+=
+        "<p><a href=\\"/api/messages?chat="+chat+"\\">"+
+        "Open Messages API"+
+        "</a></p>";
+
+    out+=
+        "<p><a href=\\"/api/chat?chat="+chat+"\\">"+
+        "Open Chat API"+
+        "</a></p>";
 
     if(media?.thumbnails?.length){
-        html+="<h3>Thumbnails</h3>";
+        out+="<h3>Thumbnails</h3>";
 
         for(const thumb of media.thumbnails){
             const u=
                 "/media/"+chat+"/"+id+
                 "?thumb="+thumb.index;
 
-            html+=
-                "<a href=\\""+u+"\\">"+
-                "Thumbnail "+thumb.index+
-                " ("+thumb.width+"x"+thumb.height+")"+
+            out+=
+                "<a href=\\""+u+
+                "\\" target=\\"_blank\\" rel=\\"noopener\\">"+
+                "Open thumbnail "+thumb.index+
+                " ("+
+                thumb.width+
+                "x"+
+                thumb.height+
+                ")"+
                 "</a>";
         }
     }
 
-    html+="<h3>Media JSON</h3>";
-    html+="<pre>"+
+    out+="<h3>Media JSON</h3>";
+
+    out+=
+        "<pre>"+
         escapeHtml(JSON.stringify(media,null,2))+
         "</pre>";
 
-    html+="<p><a href=\\"/test-download/"+chat+"/"+id+"\\">Test full download</a></p>";
+    out+=
+        "<p><a href=\\"/test-download/"+
+        chat+
+        "/"+
+        id+
+        "\\" target=\\"_blank\\" rel=\\"noopener\\">"+
+        "Test full download"+
+        "</a></p>";
 
-    if(media?.mimeType?.startsWith("image/"))
-        html+="<img src=\\""+mediaUrl+"\\">";
+    out+=
+        "<div class=\\"warning\\">"+
+        "<strong>Media is not loaded automatically.</strong><br>"+
+        "Click the media link when you want to test the request. "+
+        "It opens in a separate tab so a Cloudflare 1102 error "+
+        "will not destroy this test page."+
+        "</div>";
 
-    if(media?.mimeType?.startsWith("video/"))
-        html+=
-            "<video controls preload=\\"metadata\\" src=\\""+
-            mediaUrl+
-            "\\"></video>";
-
-    details.innerHTML=html;
+    details.innerHTML=out;
 }
 
 chatSelect.addEventListener("change",loadMessages);
@@ -788,6 +850,7 @@ messageSelect.addEventListener("change",showMessage);
 
 loadChats();
 </script>
+
 </body>
 </html>`);
 
@@ -845,7 +908,10 @@ loadChats();
         const client=await getTelegramClient(env);
 
         try {
-            const chat=await getChatForId(client,Number(chatId));
+            const chat=await getChatForId(
+                client,
+                Number(chatId)
+            );
 
             return json({
                 success:true,
@@ -950,7 +1016,10 @@ loadChats();
             testMatch[2]
         );
 
-        return json(result,result.success?200:500);
+        return json(
+            result,
+            result.success?200:500
+        );
     }
 
     return new Response("Not found",{

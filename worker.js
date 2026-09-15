@@ -4,6 +4,7 @@ const TELEGRAM_CHUNK_SIZE = 256 * 1024;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 
 const CACHE_CONTROL = "public, max-age=31536000, immutable";
+let mtkrutoClientPromise = null;
 
 function json(data, status = 200, extraHeaders = {}) {
     return new Response(JSON.stringify(data, null, 2), {
@@ -283,36 +284,78 @@ class CloudflareKVStorage {
 }
 
 async function createClient(env) {
-    const apiId = Number(await env.API_ID.get());
-    const apiHash = await env.API_HASH.get();
-    const session = await env.MTKRUTO_SESSION.get();
-
-    if (!apiId || !apiHash || !session) {
-        throw new Error("Telegram credentials are not configured.");
+    if (mtkrutoClientPromise) {
+        try {
+            return await mtkrutoClientPromise;
+        } catch {
+            mtkrutoClientPromise = null;
+        }
     }
 
-    if (!env.MTKRUTO_CACHE) {
-        throw new Error(
-            "MTKRUTO_CACHE KV binding is not configured."
-        );
+    mtkrutoClientPromise =
+        (async () => {
+            const apiId =
+                Number(env.API_ID);
+
+            const apiHash =
+                env.API_HASH;
+
+            const authString =
+                env.MTKRUTO_SESSION;
+
+            const cache =
+                env.MTKRUTO_CACHE;
+
+            if (!apiId) {
+                throw new Error(
+                    "Missing API_ID."
+                );
+            }
+
+            if (!apiHash) {
+                throw new Error(
+                    "Missing API_HASH."
+                );
+            }
+
+            if (!authString) {
+                throw new Error(
+                    "Missing MTKRUTO_SESSION."
+                );
+            }
+
+            if (!cache) {
+                throw new Error(
+                    "Missing MTKRUTO_CACHE KV namespace."
+                );
+            }
+
+            const storage =
+                new CloudflareKVStorage(
+                    cache
+                );
+
+            const client =
+                new Client({
+                    apiId,
+                    apiHash,
+                    storage,
+                    authString,
+                    persistCache:
+                        true
+                });
+
+            await client.start();
+
+            return client;
+        })();
+
+    try {
+        return await mtkrutoClientPromise;
+    } catch (error) {
+        mtkrutoClientPromise = null;
+        throw error;
     }
-
-    const storage =
-        new CloudflareKVStorage(
-            env.MTKRUTO_CACHE
-        );
-
-    const client = new Client({
-        apiId,
-        apiHash,
-        authString: session,
-        storage,
-        persistCache: true
-    });
-
-    await client.start();
-
-    return client;
 }
 
 async function getChatForId(client, chatId) {
@@ -340,20 +383,33 @@ async function getChatForId(client, chatId) {
 }
 
 async function getMessages(client, chatId) {
-    const numericChatId = Number(chatId);
+    const numericId =
+        Number(chatId);
 
-    if (!Number.isSafeInteger(numericChatId)) {
+    if (!Number.isSafeInteger(numericId)) {
         throw new Error(
             `Invalid chat ID: ${chatId}`
         );
     }
 
-    return await client.getHistory(
-        numericChatId,
-        {
-            limit: 100
-        }
+    const start =
+        Date.now();
+
+    const messages =
+        await client.getHistory(
+            numericId,
+            {
+                limit: 100
+            }
+        );
+
+    console.log(
+        "getHistory:",
+        Date.now() - start,
+        "ms"
     );
+
+    return messages;
 }
 
 async function getMessage(

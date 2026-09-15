@@ -227,9 +227,23 @@ async function getMessages(
 
     try {
 
+        const numericChatId =
+            Number(chatId);
+
+        if (
+            !Number.isSafeInteger(
+                numericChatId
+            )
+        ) {
+
+            throw new Error(
+                `Invalid numeric chat ID: ${chatId}`
+            );
+        }
+
         const messages =
             await client.getHistory(
-                chatId,
+                numericChatId,
                 {
                     limit:
                         100
@@ -242,7 +256,7 @@ async function getMessages(
 
             chatId:
                 String(
-                    chatId
+                    numericChatId
                 ),
 
             count:
@@ -1080,7 +1094,7 @@ loadChats()
     
             const chat =
                 await client.getChat(
-                    chatId
+                    Number(chatId)
                 );
     
             return json({

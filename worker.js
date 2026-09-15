@@ -987,6 +987,11 @@ img {
     color: #ccc;
     font-family: sans-serif;
 }
+.piece-timing {
+    padding: 4px 0;
+    font-size: 13px;
+    color: #aaa;
+}
 </style>
 </head>
 <body>
@@ -1469,6 +1474,9 @@ async function handlePieceRequest(
         });
     }
 
+    const requestStart =
+        Date.now();
+
     const fileId =
         url.searchParams.get(
             "fileId"
@@ -1583,10 +1591,20 @@ async function handlePieceRequest(
         });
     }
 
+    const clientStart =
+        Date.now();
+
     const client =
         await createClient(env);
 
+    const clientTime =
+        Date.now() -
+        clientStart;
+
     try {
+        const downloadStart =
+            Date.now();
+
         const chunks = [];
         let downloaded = 0;
         let currentOffset = offset;
@@ -1657,6 +1675,10 @@ async function handlePieceRequest(
             }
         }
 
+        const downloadTime =
+            Date.now() -
+            downloadStart;
+
         const output =
             new Uint8Array(
                 downloaded
@@ -1676,6 +1698,10 @@ async function handlePieceRequest(
                 chunk.length;
         }
 
+        const totalTime =
+            Date.now() -
+            requestStart;
+
         headers[
             "Content-Length"
         ] =
@@ -1685,6 +1711,31 @@ async function handlePieceRequest(
             "Content-Range"
         ] =
             `bytes ${offset}-${offset + output.length - 1}/${fileSize}`;
+
+        headers[
+            "X-Timing-Create-Client"
+        ] =
+            `${clientTime} ms`;
+
+        headers[
+            "X-Timing-Download"
+        ] =
+            `${downloadTime} ms`;
+
+        headers[
+            "X-Timing-Total"
+        ] =
+            `${totalTime} ms`;
+
+        headers[
+            "X-Piece-Offset"
+        ] =
+            String(offset);
+
+        headers[
+            "X-Piece-Bytes"
+        ] =
+            String(output.length);
 
         return new Response(
             output,
@@ -2707,6 +2758,9 @@ async function fetchPiece(
                 String(length)
         });
 
+    const start =
+        performance.now();
+
     const response =
         await fetch(
             "/piece?" +
@@ -2742,7 +2796,80 @@ async function fetchPiece(
         );
     }
 
-    return await response.arrayBuffer();
+    const buffer =
+        await response.arrayBuffer();
+
+    const browserTime =
+        Math.round(
+            performance.now() -
+            start
+        );
+
+    const createClientTime =
+        response.headers.get(
+            "X-Timing-Create-Client"
+        ) ||
+        "unknown";
+
+    const downloadTime =
+        response.headers.get(
+            "X-Timing-Download"
+        ) ||
+        "unknown";
+
+    const serverTotal =
+        response.headers.get(
+            "X-Timing-Total"
+        ) ||
+        "unknown";
+
+    const pieceOffset =
+        response.headers.get(
+            "X-Piece-Offset"
+        ) ||
+        String(offset);
+
+    const pieceBytes =
+        response.headers.get(
+            "X-Piece-Bytes"
+        ) ||
+        String(buffer.byteLength);
+
+    const timing =
+        document.createElement(
+            "div"
+        );
+
+    timing.className =
+        "piece-timing";
+
+    timing.textContent =
+        "Piece " +
+        pieceOffset +
+        " (" +
+        formatBytes(
+            Number(pieceBytes)
+        ) +
+        "): " +
+        "createClient " +
+        createClientTime +
+        ", download " +
+        downloadTime +
+        ", server total " +
+        serverTotal +
+        ", browser total " +
+        browserTime +
+        " ms";
+
+    apiPanel.classList.remove(
+        "hidden"
+    );
+
+    apiLinks.appendChild(
+        timing
+    );
+
+    return buffer;
 }
 
 async function fetchImageParts(
@@ -3357,6 +3484,8 @@ async function selectMessage(
         "hidden"
     );
 
+    apiLinks.innerHTML = "";
+
     addLink(
         "Messages API",
         "/api/messages?chat=" +
@@ -3407,6 +3536,19 @@ async function selectMessage(
         encodeURIComponent(
             selectedMessageId
         )
+    );
+
+    addLink(
+        "Direct thumbnail URL",
+        "/media/" +
+        encodeURIComponent(
+            selectedChatId
+        ) +
+        "/" +
+        encodeURIComponent(
+            selectedMessageId
+        ) +
+        "?thumb=1"
     );
 
     addLink(

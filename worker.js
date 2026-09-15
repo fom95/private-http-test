@@ -1795,7 +1795,9 @@ async function fetchImageParts(
                 (index + 1) +
                 " failed: HTTP " +
                 response.status +
-                (errorText ? " - " + errorText : "")
+                (errorText
+                    ? " - " + errorText
+                    : "")
             );
         }
 
@@ -1987,99 +1989,100 @@ async function loadMedia(
     try {
         const mime = info.mimeType || "";
 
-if (mime.startsWith("image/")) {
-    const parts =
-        await fetchImageParts(
-            info.fileId,
-            size,
-            mime,
-            token
-        );
-
-    if (token !== mediaLoadToken) {
-        return;
-    }
-
-    const blob =
-        new Blob(parts, {
-            type: mime
-        });
-
-    currentObjectUrl =
-        URL.createObjectURL(blob);
-
-    const img =
-        document.createElement("img");
-
-    img.src =
-        currentObjectUrl;
-
-    img.alt = "";
-
-    mediaContainer.appendChild(img);
-
-    mediaStatus.textContent =
-        "Image loaded.";
-} else {
-    const pieces =
-        await fetchMediaPieces(
-            info.fileId,
-            size,
-            info.mimeType,
-            token
-        );
-
-    if (token !== mediaLoadToken) {
-        return;
-    }
-
-    const blob =
-        combinePieces(
-            pieces,
-            info.mimeType
-        );
-
-    currentObjectUrl =
-        URL.createObjectURL(blob);
-
-    if (mime.startsWith("video/")) {
-        const video =
-            document.createElement("video");
-
-        video.controls = true;
-        video.preload = "metadata";
-        video.src = currentObjectUrl;
-
-        mediaContainer.appendChild(video);
-
-        mediaStatus.textContent =
-            "Video loaded.";
-    } else if (mime.startsWith("audio/")) {
-        const audio =
-            document.createElement("audio");
-
-        audio.controls = true;
-        audio.src = currentObjectUrl;
-
-        mediaContainer.appendChild(audio);
-
-        mediaStatus.textContent =
-            "Audio loaded.";
-    } else {
-        const link =
-            document.createElement("a");
-
-        link.href = currentObjectUrl;
-        link.textContent = "Open downloaded file";
-        link.target = "_blank";
-        link.rel = "noopener";
-
-        mediaContainer.appendChild(link);
-
-        mediaStatus.textContent =
-            "File loaded.";
-    }
-} catch (error) {
+        if (mime.startsWith("image/")) {
+            const parts =
+                await fetchImageParts(
+                    info.fileId,
+                    size,
+                    mime,
+                    token
+                );
+        
+            if (token !== mediaLoadToken) {
+                return;
+            }
+        
+            const blob =
+                new Blob(parts, {
+                    type: mime
+                });
+        
+            currentObjectUrl =
+                URL.createObjectURL(blob);
+        
+            const img =
+                document.createElement("img");
+        
+            img.src =
+                currentObjectUrl;
+        
+            img.alt = "";
+        
+            mediaContainer.appendChild(img);
+        
+            mediaStatus.textContent =
+                "Image loaded.";
+        } else {
+            const pieces =
+                await fetchMediaPieces(
+                    info.fileId,
+                    size,
+                    info.mimeType,
+                    token
+                );
+        
+            if (token !== mediaLoadToken) {
+                return;
+            }
+        
+            const blob =
+                combinePieces(
+                    pieces,
+                    info.mimeType
+                );
+        
+            currentObjectUrl =
+                URL.createObjectURL(blob);
+        
+            if (mime.startsWith("video/")) {
+                const video =
+                    document.createElement("video");
+        
+                video.controls = true;
+                video.preload = "metadata";
+                video.src = currentObjectUrl;
+        
+                mediaContainer.appendChild(video);
+        
+                mediaStatus.textContent =
+                    "Video loaded.";
+            } else if (mime.startsWith("audio/")) {
+                const audio =
+                    document.createElement("audio");
+        
+                audio.controls = true;
+                audio.src = currentObjectUrl;
+        
+                mediaContainer.appendChild(audio);
+        
+                mediaStatus.textContent =
+                    "Audio loaded.";
+            } else {
+                const link =
+                    document.createElement("a");
+        
+                link.href = currentObjectUrl;
+                link.textContent = "Open downloaded file";
+                link.target = "_blank";
+                link.rel = "noopener";
+        
+                mediaContainer.appendChild(link);
+        
+                mediaStatus.textContent =
+                    "File loaded.";
+            }
+        }
+    } catch (error) {
         if (
             token !==
             mediaLoadToken

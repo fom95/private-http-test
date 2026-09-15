@@ -66,11 +66,22 @@ async function getMessages(client, chatId) {
 }
 
 async function getMessage(client, chatId, messageId) {
-    const chat = await getChatForId(client, chatId);
+    const numericChatId = Number(chatId);
+    const numericMessageId = Number(messageId);
 
-    await client.getInputPeer(chat.id);
+    if (
+        !Number.isSafeInteger(numericChatId) ||
+        !Number.isSafeInteger(numericMessageId)
+    ) {
+        throw new Error("Invalid chat or message ID.");
+    }
 
-    return await client.getMessage(chat.id, Number(messageId));
+    await client.getInputPeer(numericChatId);
+
+    return await client.getMessage(
+        numericChatId,
+        numericMessageId
+    );
 }
 
 function getMessageMedia(message) {

@@ -70,7 +70,7 @@ async function getTelegramClient(
         await env.API_HASH.get();
 
     const authString =
-        await env.TELEGRAM_SESSION.get();
+        await env.MTKRUTO_SESSION.get();
 
     const client =
         new Client({

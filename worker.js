@@ -1008,9 +1008,6 @@ async function handleMediaRequest(
         client.download(
             fileId,
             {
-                chunkSize:
-                    2 * 1024 * 1024,
-
                 offset:
                     start,
 
@@ -1191,9 +1188,6 @@ async function testDownload(
         client.download(
             media.fileId,
             {
-                chunkSize:
-                    2 * 1024 * 1024,
-
                 signal:
                     request.signal
             }

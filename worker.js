@@ -2,11 +2,6 @@ import {
     Client
 } from "@mtkruto/mtkruto";
 
-let telegramClientPromise = null;
-
-const inputPeerCache =
-    new Map();
-
 function json(
     data,
     status = 200
@@ -66,98 +61,38 @@ async function getTelegramClient(
     env
 ) {
 
-    if (
-        telegramClientPromise
-    ) {
-
-        return telegramClientPromise;
-    }
-
-    telegramClientPromise =
-        (async () => {
-
-            const apiId =
-                Number(
-                    await env.API_ID.get()
-                );
-
-            const apiHash =
-                await env.API_HASH.get();
-
-            const authString =
-                await env.MTKRUTO_SESSION.get();
-
-            const client =
-                new Client({
-                    apiId,
-
-                    apiHash,
-
-                    authString,
-
-                    persistCache:
-                        false,
-
-                    defaultHandlers:
-                        false,
-
-                    disableUpdates:
-                        true
-                });
-
-            await client.connect();
-
-            return client;
-
-        })();
-
-    try {
-
-        return await telegramClientPromise;
-
-    } catch (
-        error
-    ) {
-
-        telegramClientPromise =
-            null;
-
-        throw error;
-    }
-}
-
-async function getInputPeerCached(
-    client,
-    chatId
-) {
-
-    const numericChatId =
+    const apiId =
         Number(
-            chatId
+            await env.API_ID.get()
         );
 
-    if (
-        inputPeerCache.has(
-            numericChatId
-        )
-    ) {
+    const apiHash =
+        await env.API_HASH.get();
 
-        return inputPeerCache.get(
-            numericChatId
-        );
-    }
+    const authString =
+        await env.MTKRUTO_SESSION.get();
 
-    const peer =
-        await client.getInputPeer(
-            numericChatId
-        );
+    const client =
+        new Client({
+            apiId,
 
-    inputPeerCache.set(
-        numericChatId,
-        peer
-    );
+            apiHash,
 
-    return peer;
+            authString,
+
+            persistCache:
+                false,
+
+            defaultHandlers:
+                false,
+
+            disableUpdates:
+                true
+        });
+
+    await client.connect();
+
+    return client;
 }
 
 function getMessageMedia(
@@ -382,11 +317,11 @@ function detectImageMimeType(
     }
 
     if (
+        b.length >= 8 &&
         b[0] === 0x89 &&
         b[1] === 0x50 &&
         b[2] === 0x4E &&
         b[3] === 0x47 &&
-        b.length >= 8 &&
         b[4] === 0x0D &&
         b[5] === 0x0A &&
         b[6] === 0x1A &&
@@ -550,6 +485,15 @@ async function getMessages(
             );
         }
 
+        /*
+         * Keep the known-working getChats()
+         * resolution here.
+         *
+         * This is intentionally NOT cached
+         * globally because the MTKruto client
+         * itself is request-scoped.
+         */
+
         const chats =
             await client.getChats({
                 from:
@@ -578,8 +522,7 @@ async function getMessages(
         const chat =
             chatItem.chat;
 
-        await getInputPeerCached(
-            client,
+        await client.getInputPeer(
             chat.id
         );
 
@@ -833,8 +776,16 @@ async function handleMediaRequest(
             env
         );
 
-    await getInputPeerCached(
-        client,
+    /*
+     * Unlike /api/messages, do not call
+     * getChats() here.
+     *
+     * This is important for video seeking:
+     * every Range request can go directly
+     * through getInputPeer() and getMessage().
+     */
+
+    await client.getInputPeer(
         numericChatId
     );
 
@@ -1167,6 +1118,15 @@ async function handleMediaRequest(
             }
         );
 
+    /*
+     * For thumbnails, inspect the first
+     * downloaded bytes before sending them.
+     *
+     * The bytes are then immediately placed
+     * back into the HTTP stream, so detection
+     * does not discard anything.
+     */
+
     let firstChunk =
         null;
 
@@ -1378,8 +1338,7 @@ async function testDownload(
             messageId
         );
 
-    await getInputPeerCached(
-        client,
+    await client.getInputPeer(
         numericChatId
     );
 
@@ -2018,7 +1977,7 @@ function updateMessage() {
             const link =
                 document.createElement(
                     "a"
-                );
+            );
 
             link.href =
                 thumbnail.url;
@@ -2172,8 +2131,7 @@ loadChats()
                     chatId
                 );
 
-            await getInputPeerCached(
-                client,
+            await client.getInputPeer(
                 numericChatId
             );
 

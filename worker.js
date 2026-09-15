@@ -336,22 +336,65 @@ async function getChatForId(client, chatId) {
         throw new Error(`Chat ${chatId} was not found.`);
     }
 
-    item.chat._debugTimings = {
-        getChats: `${chatsTime} ms`,
-        total: `${Date.now() - start} ms`
+    return {
+        chat: item.chat,
+        timings: {
+            getChats: `${chatsTime} ms`,
+            total: `${Date.now() - start} ms`
+        }
     };
-
-    return item.chat;
 }
 
 async function getMessages(client, chatId) {
-    const chat = await getChatForId(client, chatId);
+    const start = Date.now();
 
-    await client.getInputPeer(chat.id);
+    const chatResult =
+        await getChatForId(
+            client,
+            chatId
+        );
 
-    return await client.getHistory(chat.id, {
-        limit: 100
-    });
+    const inputPeerStart =
+        Date.now();
+
+    await client.getInputPeer(
+        chatResult.chat.id
+    );
+
+    const inputPeerTime =
+        Date.now() -
+        inputPeerStart;
+
+    const historyStart =
+        Date.now();
+
+    const messages =
+        await client.getHistory(
+            chatResult.chat.id,
+            {
+                limit: 100
+            }
+        );
+
+    const historyTime =
+        Date.now() -
+        historyStart;
+
+    return {
+        messages,
+        timings: {
+            getChats:
+                chatResult.timings.getChats,
+            getChatTotal:
+                chatResult.timings.total,
+            getInputPeer:
+                `${inputPeerTime} ms`,
+            getHistory:
+                `${historyTime} ms`,
+            total:
+                `${Date.now() - start} ms`
+        }
+    };
 }
 
 async function getMessage(client, chatId, messageId) {
@@ -1606,118 +1649,168 @@ async function handleApi(
     }
 
     if (path === "/api/chat") {
-        const chatId =
-            url.searchParams.get(
-                "chat"
+    const chatId =
+        url.searchParams.get(
+            "chat"
+        );
+
+    if (!chatId) {
+        return json({
+            success: false,
+            error: "Missing chat."
+        }, 400);
+    }
+
+    const start =
+        Date.now();
+
+    const clientStart =
+        Date.now();
+
+    const client =
+        await createClient(env);
+
+    const clientTime =
+        Date.now() -
+        clientStart;
+
+    try {
+        const result =
+            await getChatForId(
+                client,
+                chatId
             );
 
-        if (!chatId) {
-            return json({
-                success: false,
-                error: "Missing chat."
-            }, 400);
-        }
+        return json({
+            success: true,
 
-        const client =
-            await createClient(env);
+            timings: {
+                createClient:
+                    `${clientTime} ms`,
+                getChats:
+                    result.timings.getChats,
+                getChatTotal:
+                    result.timings.total,
+                total:
+                    `${Date.now() - start} ms`
+            },
 
+            chat: {
+                id:
+                    result.chat.id,
+                title:
+                    result.chat.title ??
+                    null,
+                firstName:
+                    result.chat.firstName ??
+                    null,
+                lastName:
+                    result.chat.lastName ??
+                    null,
+                type:
+                    result.chat.type ??
+                    null,
+                username:
+                    result.chat.username ??
+                    null
+            }
+        });
+    } finally {
         try {
-            const chat =
-                await getChatForId(
-                    client,
-                    chatId
-                );
-
-            return json({
-                success: true,
-                chat: {
-                    id: chat.id,
-                    title:
-                        chat.title ??
-                        null,
-                    firstName:
-                        chat.firstName ??
-                        null,
-                    lastName:
-                        chat.lastName ??
-                        null,
-                    type:
-                        chat.type ??
-                        null,
-                    username:
-                        chat.username ??
-                        null
-                }
-            });
-        } finally {
-            try {
-                await client.disconnect();
-            } catch {}
-        }
+            await client.disconnect();
+        } catch {}
     }
+}
 
     if (path === "/api/messages") {
-        const chatId =
-            url.searchParams.get(
-                "chat"
+    const chatId =
+        url.searchParams.get(
+            "chat"
+        );
+
+    if (!chatId) {
+        return json({
+            success: false,
+            error: "Missing chat."
+        }, 400);
+    }
+
+    const start =
+        Date.now();
+
+    const clientStart =
+        Date.now();
+
+    const client =
+        await createClient(env);
+
+    const clientTime =
+        Date.now() -
+        clientStart;
+
+    try {
+        const result =
+            await getMessages(
+                client,
+                chatId
             );
 
-        if (!chatId) {
-            return json({
-                success: false,
-                error: "Missing chat."
-            }, 400);
-        }
+        return json({
+            success: true,
 
-        const client =
-            await createClient(env);
+            timings: {
+                createClient:
+                    `${clientTime} ms`,
+                getChats:
+                    result.timings.getChats,
+                getChatTotal:
+                    result.timings.getChatTotal,
+                getInputPeer:
+                    result.timings.getInputPeer,
+                getHistory:
+                    result.timings.getHistory,
+                total:
+                    `${Date.now() - start} ms`
+            },
 
-        try {
-            const messages =
-                await getMessages(
-                    client,
-                    chatId
-                );
+            chatId:
+                Number(chatId),
 
-            return json({
-                success: true,
-                chatId:
-                    Number(chatId),
-                messages:
-                    messages.map(
-                        message => ({
-                            id:
-                                message.id,
-                            date:
-                                message.date ??
-                                null,
-                            type:
-                                message.type ??
-                                null,
-                            text:
-                                message.text ??
-                                "",
-                            caption:
-                                message.caption ??
-                                "",
-                            senderId:
-                                message.sender?.id ??
-                                null,
-                            hasMedia:
-                                Boolean(
-                                    getMessageMedia(
-                                        message
-                                    )
+            messages:
+                result.messages.map(
+                    message => ({
+                        id:
+                            message.id,
+                        date:
+                            message.date ??
+                            null,
+                        type:
+                            message.type ??
+                            null,
+                        text:
+                            message.text ??
+                            "",
+                        caption:
+                            message.caption ??
+                            "",
+                        senderId:
+                            message.sender?.id ??
+                            null,
+                        hasMedia:
+                            Boolean(
+                                getMessageMedia(
+                                    message
                                 )
-                        })
-                    )
-            });
-        } finally {
-            try {
-                await client.disconnect();
-            } catch {}
-        }
+                            )
+                    })
+                )
+        });
+    } finally {
+        try {
+            await client.disconnect();
+        } catch {}
     }
+}
 
     if (path === "/api/media-info") {
         const chatId =
@@ -2304,6 +2397,28 @@ async function loadChats() {
             option
         );
     }
+
+    if (data.timings) {
+        apiPanel.classList.remove(
+            "hidden"
+        );
+
+        apiLinks.innerHTML =
+            "<pre>" +
+            escapeHtml(
+                Object.entries(
+                    data.timings
+                )
+                    .map(
+                        ([key, value]) =>
+                            key +
+                            ": " +
+                            value
+                    )
+                    .join("\n")
+            ) +
+            "</pre>";
+    }
 }
 
 async function loadMessages(chatId) {
@@ -2337,7 +2452,7 @@ async function loadMessages(chatId) {
 
         const preview =
             text
-                .replace(/\\s+/g, " ")
+                .replace(/\s+/g, " ")
                 .slice(0, 80);
 
         const mediaMarker =
@@ -2368,6 +2483,28 @@ async function loadMessages(chatId) {
 
     messageSelect.disabled =
         false;
+
+    if (data.timings) {
+        apiPanel.classList.remove(
+            "hidden"
+        );
+
+        apiLinks.innerHTML =
+            "<pre>" +
+            escapeHtml(
+                Object.entries(
+                    data.timings
+                )
+                    .map(
+                        ([key, value]) =>
+                            key +
+                            ": " +
+                            value
+                    )
+                    .join("\n")
+            ) +
+            "</pre>";
+    }
 }
 
 async function fetchPiece(

@@ -24,7 +24,7 @@
   "kv_namespaces": [
     {
       "binding": "MTKRUTO_CACHE",
-      "id": "YOUR_KV_NAMESPACE_ID"
+      "id": "MTKRUTO_CACHE"
     }
   ],
 

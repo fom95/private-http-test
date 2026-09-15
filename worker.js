@@ -33,38 +33,25 @@ async function getTelegramClient(env) {
 function json(data, status = 200) {
 
     return new Response(
-        JSON.stringify(
-            data,
-            null,
-            2
-        ),
+        JSON.stringify(data, null, 2),
         {
             status,
-
             headers: {
                 "Content-Type":
-                    "application/json; charset=utf-8",
-
-                "Access-Control-Allow-Origin":
-                    "*"
+                    "application/json; charset=utf-8"
             }
         }
     );
 }
 
-function html(content, status = 200) {
+function html(body) {
 
     return new Response(
-        content,
+        body,
         {
-            status,
-
             headers: {
                 "Content-Type":
-                    "text/html; charset=utf-8",
-
-                "Access-Control-Allow-Origin":
-                    "*"
+                    "text/html; charset=utf-8"
             }
         }
     );
@@ -73,110 +60,145 @@ function html(content, status = 200) {
 function errorInfo(error) {
 
     return {
-        message:
-            error?.message ??
+        error:
+            error?.message ||
             String(error),
 
         name:
-            error?.name ??
+            error?.name ||
             null,
 
         stack:
-            error?.stack ??
-            null,
-
-        constructor:
-            error?.constructor?.name ??
+            error?.stack ||
             null
     };
 }
 
-function parseRange(rangeHeader, size) {
+function getPhotoSizes(message) {
 
-    if (!rangeHeader) {
-        return null;
-    }
+    const sizes =
+        message?.media?.photo?.sizes ||
+        message?.media?.sizes ||
+        [];
 
-    const match =
-        /^bytes=(\d*)-(\d*)$/i.exec(
-            rangeHeader.trim()
+    return sizes
+        .filter(
+            size =>
+                size &&
+                (
+                    size.className ===
+                        "PhotoSize" ||
+                    size.className ===
+                        "PhotoCachedSize"
+                )
+        )
+        .sort(
+            (a, b) =>
+                (a.w * a.h) -
+                (b.w * b.h)
         );
+}
 
-    if (!match) {
-        return null;
+function getLargestPhotoSize(message) {
+
+    const sizes =
+        getPhotoSizes(message);
+
+    return sizes.length
+        ? sizes[sizes.length - 1]
+        : null;
+}
+
+function getThumbnailPhotoSize(message) {
+
+    const sizes =
+        getPhotoSizes(message);
+
+    return sizes.length
+        ? sizes[0]
+        : null;
+}
+
+function getMediaInfo(message) {
+
+    if (!message?.media) {
+
+        return {
+            supported: false,
+            type: null,
+            size: 0,
+            hasThumbnail: false
+        };
     }
 
-    let start;
-    let end;
+    if (
+        message.media.document
+    ) {
 
-    if (match[1] === "") {
+        const document =
+            message.media.document;
 
-        const suffixLength =
-            Number(match[2]);
+        const thumbnail =
+            document.thumbs?.find(
+                thumb =>
+                    thumb &&
+                    (
+                        thumb.className ===
+                            "PhotoSize" ||
+                        thumb.className ===
+                            "PhotoCachedSize"
+                    )
+            ) || null;
 
-        if (
-            !Number.isSafeInteger(
-                suffixLength
-            ) ||
-            suffixLength <= 0
-        ) {
-            return null;
-        }
+        return {
+            supported: true,
+            type: "document",
+            size:
+                Number(
+                    document.size ||
+                    0
+                ),
+            hasThumbnail:
+                !!thumbnail
+        };
+    }
 
-        start =
-            Math.max(
-                0,
-                size - suffixLength
+    if (
+        message.media.photo
+    ) {
+
+        const largest =
+            getLargestPhotoSize(
+                message
             );
 
-        end =
-            size - 1;
+        return {
+            supported:
+                !!largest,
 
-    } else {
+            type:
+                "photo",
 
-        start =
-            Number(match[1]);
+            size:
+                Number(
+                    largest?.size ||
+                    0
+                ),
 
-        if (
-            !Number.isSafeInteger(
-                start
-            ) ||
-            start < 0 ||
-            start >= size
-        ) {
-            return null;
-        }
-
-        if (match[2] === "") {
-
-            end =
-                size - 1;
-
-        } else {
-
-            end =
-                Number(match[2]);
-
-            if (
-                !Number.isSafeInteger(
-                    end
-                ) ||
-                end < start
-            ) {
-                return null;
-            }
-
-            end =
-                Math.min(
-                    end,
-                    size - 1
-                );
-        }
+            hasThumbnail:
+                getPhotoSizes(
+                    message
+                ).length > 1
+        };
     }
 
     return {
-        start,
-        end
+        supported: false,
+        type:
+            message.media.className ||
+            null,
+        size: 0,
+        hasThumbnail: false
     };
 }
 
@@ -187,1554 +209,1172 @@ async function findTelegramMessage(
 ) {
 
     const dialogs =
-        await client.getDialogs(
-            {}
-        );
+        await client.getDialogs({
+            limit: undefined
+        });
+
+    const wantedChatId =
+        String(chatId);
 
     const dialog =
         dialogs.find(
             item =>
                 String(
                     item.id
-                ) ===
-                String(
-                    chatId
-                )
+                ) === wantedChatId
         );
 
     if (!dialog) {
-        return null;
-    }
 
-    const inputEntity =
-        await client.getInputEntity(
-            dialog
+        throw new Error(
+            `Telegram chat not found: ${chatId}`
         );
+    }
 
     const messages =
         await client.getMessages(
-            inputEntity,
+            dialog,
             {
                 ids:
-                    Number(
-                        messageId
-                    )
+                    Number(messageId)
             }
         );
 
+    const message =
+        messages?.[0];
+
+    if (!message) {
+
+        throw new Error(
+            `Telegram message not found: ${messageId}`
+        );
+    }
+
     return {
         dialog,
-
-        message:
-            messages?.[0] ??
-            null
+        message
     };
 }
 
-function getPhotoSizes(photo) {
+function getDocumentLocation(
+    document,
+    thumbSize = ""
+) {
 
-    return Array.isArray(
-        photo?.sizes
-    )
-        ? photo.sizes.filter(
-            item =>
-                item &&
-                item.type
-        )
-        : [];
+    return new Api.InputDocumentFileLocation({
+        id:
+            document.id,
+
+        accessHash:
+            document.accessHash,
+
+        fileReference:
+            document.fileReference,
+
+        thumbSize
+    });
 }
 
-function getLargestPhotoSize(photo) {
+function getPhotoLocation(
+    photo,
+    size
+) {
 
-    const sizes =
-        getPhotoSizes(
-            photo
-        );
+    return new Api.InputPhotoFileLocation({
+        id:
+            photo.id,
 
-    if (!sizes.length) {
-        return null;
-    }
+        accessHash:
+            photo.accessHash,
 
-    return sizes.reduce(
-        (largest, current) => {
+        fileReference:
+            photo.fileReference,
 
-            const largestArea =
-                Number(
-                    largest?.w ?? 0
-                ) *
-                Number(
-                    largest?.h ?? 0
-                );
-
-            const currentArea =
-                Number(
-                    current?.w ?? 0
-                ) *
-                Number(
-                    current?.h ?? 0
-                );
-
-            return currentArea >
-                largestArea
-                ? current
-                : largest;
-        }
-    );
+        thumbSize:
+            size?.type || ""
+    });
 }
 
-function getThumbnailPhotoSize(photo) {
-
-    const sizes =
-        getPhotoSizes(
-            photo
-        );
-
-    if (!sizes.length) {
-        return null;
-    }
-
-    return (
-        sizes.find(
-            item =>
-                item.type === "m"
-        ) ||
-
-        sizes.find(
-            item =>
-                item.type === "x"
-        ) ||
-
-        sizes.find(
-            item =>
-                item.type === "s"
-        ) ||
-
-        sizes[0]
-    );
-}
-
-function getPhotoSizeBytes(photoSize) {
-
-    if (!photoSize) {
-        return null;
-    }
+function getMediaDownloadInfo(
+    message,
+    thumbnail = false
+) {
 
     if (
-        photoSize.size != null
+        message?.media?.document
     ) {
 
-        return Number(
-            photoSize.size
-        );
+        const document =
+            message.media.document;
+
+        let thumb = null;
+
+        if (thumbnail) {
+
+            thumb =
+                document.thumbs?.find(
+                    item =>
+                        item &&
+                        (
+                            item.className ===
+                                "PhotoSize" ||
+                            item.className ===
+                                "PhotoCachedSize"
+                        )
+                );
+        }
+
+        if (thumb) {
+
+            return {
+                location:
+                    getDocumentLocation(
+                        document,
+                        thumb.type || ""
+                    ),
+
+                size:
+                    Number(
+                        thumb.size ||
+                        0
+                    ),
+
+                mimeType:
+                    "image/jpeg",
+
+                source:
+                    "document-thumbnail"
+            };
+        }
+
+        return {
+            location:
+                getDocumentLocation(
+                    document
+                ),
+
+            size:
+                Number(
+                    document.size ||
+                    0
+                ),
+
+            mimeType:
+                document.mimeType ||
+                "application/octet-stream",
+
+            source:
+                "document"
+        };
     }
 
     if (
-        Array.isArray(
-            photoSize.sizes
-        )
+        message?.media?.photo
     ) {
 
         const sizes =
-            photoSize.sizes;
+            getPhotoSizes(
+                message
+            );
 
         if (!sizes.length) {
+
+            throw new Error(
+                "Telegram photo has no downloadable PhotoSize."
+            );
+        }
+
+        const size =
+            thumbnail
+                ? sizes[0]
+                : sizes[sizes.length - 1];
+
+        return {
+            location:
+                getPhotoLocation(
+                    message.media.photo,
+                    size
+                ),
+
+            size:
+                Number(
+                    size.size ||
+                    0
+                ),
+
+            mimeType:
+                "image/jpeg",
+
+            source:
+                "photo"
+        };
+    }
+
+    throw new Error(
+        "Unsupported Telegram media type."
+    );
+}
+
+function parseRange(
+    request,
+    fileSize
+) {
+
+    const header =
+        request.headers.get(
+            "Range"
+        );
+
+    if (!header) {
+
+        return {
+            start: 0,
+            end:
+                fileSize - 1
+        };
+    }
+
+    const match =
+        /^bytes=(\d*)-(\d*)$/i.exec(
+            header
+        );
+
+    if (!match) {
+
+        return null;
+    }
+
+    const startText =
+        match[1];
+
+    const endText =
+        match[2];
+
+    let start;
+    let end;
+
+    if (!startText) {
+
+        const suffix =
+            Number(endText);
+
+        if (
+            !Number.isFinite(
+                suffix
+            ) ||
+            suffix <= 0
+        ) {
             return null;
         }
 
-        return Number(
-            sizes[
-                sizes.length - 1
-            ]
+        start =
+            Math.max(
+                0,
+                fileSize - suffix
+            );
+
+        end =
+            fileSize - 1;
+
+    } else {
+
+        start =
+            Number(startText);
+
+        end =
+            endText
+                ? Number(endText)
+                : fileSize - 1;
+    }
+
+    if (
+        !Number.isFinite(start) ||
+        !Number.isFinite(end) ||
+        start < 0 ||
+        end < start ||
+        start >= fileSize
+    ) {
+        return null;
+    }
+
+    end =
+        Math.min(
+            end,
+            fileSize - 1
         );
-    }
-
-    return null;
-}
-
-function getMediaInfo(message) {
-
-    const media =
-        message?.media;
-
-    if (!media) {
-
-        return {
-            type: null,
-
-            supported: false,
-
-            hasThumbnail: false
-        };
-    }
-
-    if (media.document) {
-
-        const document =
-            media.document;
-
-        return {
-            type:
-                "document",
-
-            supported:
-                true,
-
-            hasThumbnail:
-                Array.isArray(
-                    document.thumbs
-                ) &&
-                document.thumbs.length >
-                    0
-        };
-    }
-
-    if (media.photo) {
-
-        const photo =
-            media.photo;
-
-        return {
-            type:
-                "photo",
-
-            supported:
-                true,
-
-            hasThumbnail:
-                getThumbnailPhotoSize(
-                    photo
-                ) !== null
-        };
-    }
 
     return {
-        type:
-            media.className ??
-            null,
-
-        supported:
-            false,
-
-        hasThumbnail:
-            false
+        start,
+        end
     };
 }
 
-const PAGE = `<!DOCTYPE html>
+async function testDownload(
+    request,
+    env,
+    chatId,
+    messageId
+) {
+
+    const started =
+        Date.now();
+
+    const client =
+        await getTelegramClient(
+            env
+        );
+
+    const {
+        message
+    } =
+        await findTelegramMessage(
+            client,
+            chatId,
+            messageId
+        );
+
+    const media =
+        getMediaDownloadInfo(
+            message,
+            false
+        );
+
+    const fileSize =
+        media.size;
+
+    if (
+        !fileSize
+    ) {
+
+        throw new Error(
+            "Telegram returned a media object with no file size."
+        );
+    }
+
+    let bytes =
+        0;
+
+    let chunks =
+        0;
+
+    const iter =
+        client.iterDownload({
+            file:
+                media.location,
+
+            offset:
+                bigInt(0),
+
+            limit:
+                bigInt(fileSize),
+
+            requestSize:
+                2 * 1024 * 1024
+        });
+
+    for await (
+        const chunk
+        of iter
+    ) {
+
+        if (
+            request.signal.aborted
+        ) {
+
+            return new Response(
+                JSON.stringify({
+                    success: false,
+                    aborted: true,
+                    bytes,
+                    chunks,
+                    fileSize,
+                    elapsedMs:
+                        Date.now() -
+                        started
+                }),
+                {
+                    status: 499,
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    }
+                }
+            );
+        }
+
+        bytes +=
+            chunk.byteLength ||
+            chunk.length ||
+            0;
+
+        chunks++;
+
+        /*
+         * Deliberately discard the
+         * downloaded data.
+         *
+         * Nothing is stored in an
+         * array and nothing is sent
+         * to the browser.
+         */
+    }
+
+    return json({
+        success: true,
+
+        test:
+            "telegram-download-discard",
+
+        chatId:
+            String(chatId),
+
+        messageId:
+            String(messageId),
+
+        fileSize,
+
+        bytesDownloaded:
+            bytes,
+
+        chunks,
+
+        elapsedMs:
+            Date.now() -
+            started
+    });
+}
+
+async function handleMedia(
+    request,
+    env,
+    chatId,
+    messageId,
+    thumbnail
+) {
+
+    const client =
+        await getTelegramClient(
+            env
+        );
+
+    const {
+        message
+    } =
+        await findTelegramMessage(
+            client,
+            chatId,
+            messageId
+        );
+
+    const media =
+        getMediaDownloadInfo(
+            message,
+            thumbnail
+        );
+
+    const range =
+        thumbnail
+            ? {
+                start: 0,
+                end:
+                    media.size - 1
+            }
+            : parseRange(
+                request,
+                media.size
+            );
+
+    if (!range) {
+
+        return new Response(
+            "Invalid Range",
+            {
+                status: 416,
+                headers: {
+                    "Content-Range":
+                        `bytes */${media.size}`
+                }
+            }
+        );
+    }
+
+    const start =
+        range.start;
+
+    const end =
+        range.end;
+
+    const contentLength =
+        end -
+        start +
+        1;
+
+    const iter =
+        client.iterDownload({
+            file:
+                media.location,
+
+            offset:
+                bigInt(start),
+
+            limit:
+                bigInt(contentLength),
+
+            requestSize:
+                2 * 1024 * 1024
+        });
+
+    const stream =
+        new ReadableStream({
+
+            async start(
+                controller
+            ) {
+
+                try {
+
+                    for await (
+                        const chunk
+                        of iter
+                    ) {
+
+                        if (
+                            request.signal.aborted
+                        ) {
+                            return;
+                        }
+
+                        controller.enqueue(
+                            chunk
+                        );
+                    }
+
+                    controller.close();
+
+                } catch (error) {
+
+                    if (
+                        !request.signal.aborted
+                    ) {
+                        controller.error(
+                            error
+                        );
+                    }
+                }
+            },
+
+            cancel() {}
+        });
+
+    const headers =
+        new Headers();
+
+    headers.set(
+        "Content-Type",
+        media.mimeType
+    );
+
+    headers.set(
+        "Accept-Ranges",
+        "bytes"
+    );
+
+    headers.set(
+        "Content-Length",
+        String(
+            contentLength
+        )
+    );
+
+    headers.set(
+        "Cache-Control",
+        "public, max-age=31536000, immutable"
+    );
+
+    if (!thumbnail) {
+
+        headers.set(
+            "Content-Range",
+            `bytes ${start}-${end}/${media.size}`
+        );
+    }
+
+    return new Response(
+        stream,
+        {
+            status:
+                thumbnail
+                    ? 200
+                    : (
+                        start === 0 &&
+                        end === media.size - 1
+                    )
+                        ? 200
+                        : 206,
+
+            headers
+        }
+    );
+}
+
+async function handleRequest(
+    request,
+    env
+) {
+
+    const url =
+        new URL(
+            request.url
+        );
+
+    const path =
+        url.pathname;
+
+    if (
+        path === "/"
+    ) {
+
+        return html(`
+<!doctype html>
 <html>
-
 <head>
-
-<meta charset="UTF-8">
-
-<meta
-    name="viewport"
-    content="width=device-width, initial-scale=1"
->
-
+<meta charset="utf-8">
 <title>Telegram HTTP Test</title>
-
 <style>
-
 body {
-    font-family: Arial, sans-serif;
+    font-family: sans-serif;
     max-width: 900px;
     margin: 40px auto;
     padding: 0 20px;
-    background: #111;
-    color: #eee;
 }
-
-h1 {
-    margin-bottom: 30px;
-}
-
-label {
-    display: block;
-    margin: 20px 0 8px;
-    font-weight: bold;
-}
-
 select {
     width: 100%;
-    padding: 10px;
-    font-size: 16px;
-    background: #222;
-    color: #eee;
-    border: 1px solid #555;
-    border-radius: 4px;
+    max-width: 700px;
+    padding: 8px;
+    margin: 6px 0 16px;
 }
-
-a {
-    color: #6cb6ff;
-}
-
-#status {
-    margin-top: 20px;
-    color: #aaa;
-}
-
-#error {
-    margin-top: 20px;
-    padding: 12px;
-    background: #401515;
-    color: #ffaaaa;
-    white-space: pre-wrap;
-    display: none;
-}
-
-#chatInfo,
-#messageInfo {
-    margin-top: 20px;
-    padding: 15px;
-    background: #1c1c1c;
-    border-radius: 5px;
-    display: none;
-}
-
 pre {
     white-space: pre-wrap;
     word-break: break-word;
 }
-
+a {
+    display: inline-block;
+    margin: 6px 10px 6px 0;
+}
 </style>
-
 </head>
 
 <body>
 
 <h1>Telegram HTTP Test</h1>
 
-<label for="chatSelect">
-    Chat
-</label>
+<label>Chat</label>
+<select id="chat"></select>
 
-<select id="chatSelect">
+<label>Message</label>
+<select id="message"></select>
 
-    <option value="">
-        Loading chats...
-    </option>
+<pre id="info">Loading...</pre>
 
-</select>
-
-<div id="chatInfo"></div>
-
-<label for="messageSelect">
-    Message
-</label>
-
-<select
-    id="messageSelect"
-    disabled
->
-
-    <option value="">
-        Messages will appear here
-    </option>
-
-</select>
-
-<div id="messageInfo"></div>
-
-<div id="status"></div>
-
-<div id="error"></div>
+<div id="links"></div>
 
 <script>
 
 const chatSelect =
-    document.getElementById(
-        "chatSelect"
-    );
+    document.getElementById("chat");
 
 const messageSelect =
-    document.getElementById(
-        "messageSelect"
-    );
+    document.getElementById("message");
 
-const chatInfo =
-    document.getElementById(
-        "chatInfo"
-    );
+const info =
+    document.getElementById("info");
 
-const messageInfo =
-    document.getElementById(
-        "messageInfo"
-    );
+const links =
+    document.getElementById("links");
 
-const status =
-    document.getElementById(
-        "status"
-    );
-
-const errorBox =
-    document.getElementById(
-        "error"
-    );
-
-let currentMessages = [];
+let chats = [];
+let messages = [];
 
 async function loadChats() {
 
-    try {
+    const response =
+        await fetch(
+            "/api/chats"
+        );
 
-        status.textContent =
-            "Loading chats...";
+    chats =
+        await response.json();
 
-        errorBox.style.display =
-            "none";
+    chatSelect.innerHTML =
+        "";
 
-        const response =
-            await fetch(
-                "/api/chats"
+    for (
+        const chat
+        of chats
+    ) {
+
+        const option =
+            document.createElement(
+                "option"
             );
 
-        const text =
-            await response.text();
+        option.value =
+            chat.id;
 
-        if (!response.ok) {
+        option.textContent =
+            chat.title ||
+            chat.name ||
+            chat.id;
 
-            throw new Error(
-                "HTTP " +
-                response.status +
-                "\\n\\n" +
-                text
-            );
-        }
-
-        const chats =
-            JSON.parse(text);
-
-        if (!Array.isArray(chats)) {
-
-            throw new Error(
-                "Unexpected chats response:\\n\\n" +
-                text
-            );
-        }
-
-        chatSelect.innerHTML =
-            '<option value="">Select a chat...</option>';
-
-        for (
-            const chat of chats
-        ) {
-
-            const option =
-                document.createElement(
-                    "option"
-                );
-
-            option.value =
-                chat.id;
-
-            option.textContent =
-                chat.name +
-                " [" +
-                chat.id +
-                "]";
-
-            chatSelect.appendChild(
-                option
-            );
-        }
-
-        status.textContent =
-            chats.length +
-            " chats loaded.";
-
-    } catch (error) {
-
-        status.textContent =
-            "Failed to load chats.";
-
-        errorBox.textContent =
-            error.stack ||
-            error.message ||
-            String(error);
-
-        errorBox.style.display =
-            "block";
+        chatSelect.appendChild(
+            option
+        );
     }
+
+    await loadMessages();
 }
 
-async function loadMessages(chatId) {
+async function loadMessages() {
 
-    try {
+    const chatId =
+        chatSelect.value;
 
-        status.textContent =
-            "Loading messages...";
+    if (!chatId) {
+        return;
+    }
 
-        errorBox.style.display =
-            "none";
+    info.textContent =
+        "Loading messages...";
 
-        messageSelect.disabled =
-            true;
-
-        messageSelect.innerHTML =
-            '<option value="">Loading messages...</option>';
-
-        messageInfo.style.display =
-            "none";
-
-        const response =
-            await fetch(
-                "/api/messages?chatId=" +
-                encodeURIComponent(
-                    chatId
-                )
-            );
-
-        const text =
-            await response.text();
-
-        if (!response.ok) {
-
-            throw new Error(
-                "HTTP " +
-                response.status +
-                "\\n\\n" +
-                text
-            );
-        }
-
-        currentMessages =
-            JSON.parse(text);
-
-        if (
-            !Array.isArray(
-                currentMessages
+    const response =
+        await fetch(
+            "/api/messages?chatId=" +
+            encodeURIComponent(
+                chatId
             )
-        ) {
+        );
 
-            throw new Error(
-                "Unexpected messages response:\\n\\n" +
-                text
+    messages =
+        await response.json();
+
+    messageSelect.innerHTML =
+        "";
+
+    for (
+        const message
+        of messages
+    ) {
+
+        const option =
+            document.createElement(
+                "option"
             );
-        }
 
-        messageSelect.innerHTML =
-            '<option value="">Select a message...</option>';
+        option.value =
+            message.id;
 
-        for (
-            const message of currentMessages
-        ) {
+        option.textContent =
+            "#" +
+            message.id +
+            " " +
+            (
+                message.text ||
+                "[" +
+                (
+                    message.mediaType ||
+                    "media"
+                ) +
+                "]"
+            ).slice(0, 100);
 
-            const option =
-                document.createElement(
-                    "option"
-                );
+        messageSelect.appendChild(
+            option
+        );
+    }
 
-            option.value =
-                message.id;
+    updateMessage();
+}
 
-            let label =
-                "#" +
-                message.id;
+function updateMessage() {
 
-            if (message.hasMedia) {
+    const message =
+        messages.find(
+            item =>
+                String(item.id) ===
+                String(messageSelect.value)
+        );
 
-                label +=
-                    " [" +
-                    (
-                        message.mediaType ||
-                        "Media"
-                    ) +
-                    "]";
-            }
+    if (!message) {
+        return;
+    }
 
-            if (message.text) {
+    const chatId =
+        chatSelect.value;
 
-                const messageText =
-                    message.text
-                        .replace(
-                            /\\s+/g,
-                            " "
-                        )
-                        .trim();
+    const messageId =
+        message.id;
 
-                if (messageText) {
+    const mediaURL =
+        "/media/" +
+        encodeURIComponent(
+            chatId
+        ) +
+        "/" +
+        encodeURIComponent(
+            messageId
+        );
 
-                    label +=
-                        " " +
-                        messageText.slice(
-                            0,
-                            100
-                        );
-                }
-            }
+    const thumbURL =
+        mediaURL +
+        "?thumb=1";
 
-            option.textContent =
-                label;
+    const testURL =
+        "/test-download/" +
+        encodeURIComponent(
+            chatId
+        ) +
+        "/" +
+        encodeURIComponent(
+            messageId
+        );
 
-            messageSelect.appendChild(
-                option
+    info.textContent =
+        JSON.stringify(
+            message,
+            null,
+            2
+        );
+
+    links.innerHTML =
+        "";
+
+    if (
+        message.hasFullMedia
+    ) {
+
+        const media =
+            document.createElement(
+                "a"
             );
-        }
 
-        messageSelect.disabled =
-            false;
+        media.href =
+            mediaURL;
 
-        status.textContent =
-            currentMessages.length +
-            " messages loaded.";
+        media.target =
+            "_blank";
 
-    } catch (error) {
+        media.textContent =
+            "Open media";
 
-        messageSelect.disabled =
-            true;
+        links.appendChild(
+            media
+        );
 
-        messageSelect.innerHTML =
-            '<option value="">Failed to load messages</option>';
+        const test =
+            document.createElement(
+                "a"
+            );
 
-        status.textContent =
-            "Failed to load messages.";
+        test.href =
+            testURL;
 
-        errorBox.textContent =
-            error.stack ||
-            error.message ||
-            String(error);
+        test.target =
+            "_blank";
 
-        errorBox.style.display =
-            "block";
+        test.textContent =
+            "Test full download";
+
+        links.appendChild(
+            test
+        );
+    }
+
+    if (
+        message.hasThumbnail
+    ) {
+
+        const thumb =
+            document.createElement(
+                "a"
+            );
+
+        thumb.href =
+            thumbURL;
+
+        thumb.target =
+            "_blank";
+
+        thumb.textContent =
+            "Open thumbnail";
+
+        links.appendChild(
+            thumb
+        );
     }
 }
 
 chatSelect.addEventListener(
     "change",
-    async () => {
-
-        if (!chatSelect.value) {
-
-            chatInfo.style.display =
-                "none";
-
-            messageSelect.disabled =
-                true;
-
-            messageSelect.innerHTML =
-                '<option value="">Messages will appear here</option>';
-
-            messageInfo.style.display =
-                "none";
-
-            return;
-        }
-
-        const chatId =
-            chatSelect.value;
-
-        const selected =
-            chatSelect.options[
-                chatSelect.selectedIndex
-            ];
-
-        chatInfo.style.display =
-            "block";
-
-        chatInfo.innerHTML =
-            "<strong>Chat ID:</strong> " +
-            escapeHtml(chatId) +
-            "<br><strong>Name:</strong> " +
-            escapeHtml(
-                selected.textContent
-            ) +
-            "<br><br>" +
-            '<a href="/api/chat?chatId=' +
-            encodeURIComponent(chatId) +
-            '" target="_blank">' +
-            "Open chat diagnostic" +
-            "</a>" +
-            "<br>" +
-            '<a href="/api/messages?chatId=' +
-            encodeURIComponent(chatId) +
-            '" target="_blank">' +
-            "Open messages API" +
-            "</a>";
-
-        await loadMessages(
-            chatId
-        );
-    }
+    loadMessages
 );
 
 messageSelect.addEventListener(
     "change",
-    () => {
-
-        if (!messageSelect.value) {
-
-            messageInfo.style.display =
-                "none";
-
-            return;
-        }
-
-        const message =
-            currentMessages.find(
-                item =>
-                    String(item.id) ===
-                    String(
-                        messageSelect.value
-                    )
-            );
-
-        if (!message) {
-            return;
-        }
-
-        let mediaLinks =
-            "";
-
-        if (
-            message.hasFullMedia
-        ) {
-
-            const baseURL =
-                "/media/" +
-                encodeURIComponent(
-                    chatSelect.value
-                ) +
-                "/" +
-                encodeURIComponent(
-                    message.id
-                );
-
-            mediaLinks =
-                "<br><br>" +
-                '<a href="' +
-                baseURL +
-                '" target="_blank">' +
-                "Open media" +
-                "</a>";
-
-            if (
-                message.hasThumbnail
-            ) {
-
-                mediaLinks +=
-                    "<br>" +
-                    '<a href="' +
-                    baseURL +
-                    '?thumb=1" target="_blank">' +
-                    "Open thumbnail" +
-                    "</a>";
-            }
-        }
-
-        messageInfo.style.display =
-            "block";
-
-        messageInfo.innerHTML =
-            "<strong>Message ID:</strong> " +
-            escapeHtml(message.id) +
-            "<br><strong>Date:</strong> " +
-            escapeHtml(
-                message.date ||
-                "Unknown"
-            ) +
-            "<br><strong>Media:</strong> " +
-            escapeHtml(
-                message.hasMedia
-                    ? message.mediaType
-                    : "None"
-            ) +
-            mediaLinks +
-            "<br><br><strong>Text:</strong>" +
-            "<pre>" +
-            escapeHtml(
-                message.text ||
-                ""
-            ) +
-            "</pre>";
-    }
+    updateMessage
 );
 
-function escapeHtml(value) {
-
-    return String(value)
-        .replace(
-            /&/g,
-            "&amp;"
-        )
-        .replace(
-            /</g,
-            "&lt;"
-        )
-        .replace(
-            />/g,
-            "&gt;"
-        )
-        .replace(
-            /"/g,
-            "&quot;"
-        )
-        .replace(
-            /'/g,
-            "&#039;"
-        );
-}
-
-loadChats();
+loadChats()
+    .catch(
+        error => {
+            info.textContent =
+                error.stack ||
+                String(error);
+        }
+    );
 
 </script>
 
 </body>
+</html>
+        `);
+    }
 
-</html>`;
+    if (
+        path === "/api/chats"
+    ) {
+
+        const client =
+            await getTelegramClient(
+                env
+            );
+
+        const dialogs =
+            await client.getDialogs({
+                limit: undefined
+            });
+
+        return json(
+            dialogs.map(
+                dialog => ({
+                    id:
+                        String(
+                            dialog.id
+                        ),
+
+                    title:
+                        dialog.title ||
+                        dialog.name ||
+                        String(
+                            dialog.id
+                        ),
+
+                    name:
+                        dialog.name ||
+                        null,
+
+                    isUser:
+                        !!dialog.isUser,
+
+                    isGroup:
+                        !!dialog.isGroup,
+
+                    isChannel:
+                        !!dialog.isChannel
+                })
+            )
+        );
+    }
+
+    if (
+        path === "/api/messages"
+    ) {
+
+        const chatId =
+            url.searchParams.get(
+                "chatId"
+            );
+
+        if (!chatId) {
+
+            return json(
+                {
+                    error:
+                        "Missing chatId"
+                },
+                400
+            );
+        }
+
+        const client =
+            await getTelegramClient(
+                env
+            );
+
+        const {
+            dialog
+        } =
+            await findTelegramMessage(
+                client,
+                chatId,
+                1
+            ).catch(
+                async error => {
+
+                    /*
+                     * Message 1 may not exist,
+                     * so resolve the dialog directly.
+                     */
+
+                    const dialogs =
+                        await client.getDialogs({
+                            limit: undefined
+                        });
+
+                    const dialog =
+                        dialogs.find(
+                            item =>
+                                String(
+                                    item.id
+                                ) ===
+                                String(
+                                    chatId
+                                )
+                        );
+
+                    if (!dialog) {
+                        throw error;
+                    }
+
+                    return {
+                        dialog
+                    };
+                }
+            );
+
+        const messages =
+            await client.getMessages(
+                dialog,
+                {
+                    limit:
+                        undefined
+                }
+            );
+
+        return json(
+            messages.map(
+                message => {
+
+                    const mediaInfo =
+                        getMediaInfo(
+                            message
+                        );
+
+                    return {
+                        id:
+                            String(
+                                message.id
+                            ),
+
+                        date:
+                            message.date
+                                ? new Date(
+                                    message.date *
+                                    1000
+                                ).toISOString()
+                                : null,
+
+                        text:
+                            message.message ||
+                            "",
+
+                        hasMedia:
+                            !!message.media,
+
+                        mediaType:
+                            message.media?.className ||
+                            null,
+
+                        hasFullMedia:
+                            mediaInfo.supported,
+
+                        hasThumbnail:
+                            mediaInfo.hasThumbnail
+                    };
+                }
+            )
+        );
+    }
+
+    const testMatch =
+        path.match(
+            /^\/test-download\/([^/]+)\/([^/]+)$/
+        );
+
+    if (testMatch) {
+
+        return testDownload(
+            request,
+            env,
+            decodeURIComponent(
+                testMatch[1]
+            ),
+            decodeURIComponent(
+                testMatch[2]
+            )
+        );
+    }
+
+    const mediaMatch =
+        path.match(
+            /^\/media\/([^/]+)\/([^/]+)$/
+        );
+
+    if (mediaMatch) {
+
+        return handleMedia(
+            request,
+            env,
+            decodeURIComponent(
+                mediaMatch[1]
+            ),
+            decodeURIComponent(
+                mediaMatch[2]
+            ),
+            url.searchParams.get(
+                "thumb"
+            ) === "1"
+        );
+    }
+
+    return new Response(
+        "Not Found",
+        {
+            status: 404
+        }
+    );
+}
 
 export default {
 
-    async fetch(request, env) {
+    async fetch(
+        request,
+        env
+    ) {
 
         try {
 
-            const url =
-                new URL(
-                    request.url
-                );
-
-            if (
-                url.pathname === "/" ||
-                url.pathname === "/index.html"
-            ) {
-
-                return html(
-                    PAGE
-                );
-            }
-
-            if (
-                url.pathname === "/api/chats"
-            ) {
-
-                const client =
-                    await getTelegramClient(
-                        env
-                    );
-
-                const dialogs =
-                    await client.getDialogs(
-                        {}
-                    );
-
-                const chats =
-                    dialogs.map(
-                        dialog => ({
-                            id:
-                                dialog.id?.toString() ??
-                                null,
-
-                            name:
-                                dialog.title ??
-                                dialog.name ??
-                                dialog.id?.toString() ??
-                                "Unknown"
-                        })
-                    );
-
-                return json(
-                    chats
-                );
-            }
-
-            if (
-                url.pathname === "/api/chat"
-            ) {
-
-                const chatId =
-                    url.searchParams.get(
-                        "chatId"
-                    );
-
-                if (!chatId) {
-
-                    return json(
-                        {
-                            error:
-                                "Missing chatId"
-                        },
-                        400
-                    );
-                }
-
-                const client =
-                    await getTelegramClient(
-                        env
-                    );
-
-                const dialogs =
-                    await client.getDialogs(
-                        {}
-                    );
-
-                const dialog =
-                    dialogs.find(
-                        item =>
-                            String(
-                                item.id
-                            ) ===
-                            String(
-                                chatId
-                            )
-                    );
-
-                if (!dialog) {
-
-                    return json(
-                        {
-                            error:
-                                "Chat not found",
-
-                            chatId
-                        },
-                        404
-                    );
-                }
-
-                const entity =
-                    dialog.entity;
-
-                return json({
-                    id:
-                        dialog.id?.toString() ??
-                        null,
-
-                    name:
-                        dialog.title ??
-                        dialog.name ??
-                        null,
-
-                    username:
-                        entity?.username ??
-                        null,
-
-                    type:
-                        entity?.className ??
-                        entity?.constructor?.name ??
-                        null,
-
-                    unreadCount:
-                        dialog.unreadCount ??
-                        0
-                });
-            }
-
-            if (
-                url.pathname === "/api/messages"
-            ) {
-
-                const chatId =
-                    url.searchParams.get(
-                        "chatId"
-                    );
-
-                if (!chatId) {
-
-                    return json(
-                        {
-                            error:
-                                "Missing chatId"
-                        },
-                        400
-                    );
-                }
-
-                const client =
-                    await getTelegramClient(
-                        env
-                    );
-
-                const dialogs =
-                    await client.getDialogs(
-                        {}
-                    );
-
-                const dialog =
-                    dialogs.find(
-                        item =>
-                            String(
-                                item.id
-                            ) ===
-                            String(
-                                chatId
-                            )
-                    );
-
-                if (!dialog) {
-
-                    return json(
-                        {
-                            error:
-                                "Chat not found",
-
-                            chatId
-                        },
-                        404
-                    );
-                }
-
-                const inputEntity =
-                    await client.getInputEntity(
-                        dialog
-                    );
-
-                const messages =
-                    await client.getMessages(
-                        inputEntity,
-                        {
-                            limit:
-                                undefined
-                        }
-                    );
-
-                const output =
-                    messages.map(
-                        message => {
-
-                            const mediaInfo =
-                                getMediaInfo(
-                                    message
-                                );
-
-                            return {
-
-                                id:
-                                    String(
-                                        message.id
-                                    ),
-
-                                date:
-                                    message.date
-                                        ? new Date(
-                                            message.date
-                                        ).toISOString()
-                                        : null,
-
-                                text:
-                                    message.message ??
-                                    "",
-
-                                hasMedia:
-                                    !!message.media,
-
-                                mediaType:
-                                    message.media
-                                        ?.className ??
-                                    null,
-
-                                hasFullMedia:
-                                    mediaInfo.supported,
-
-                                hasThumbnail:
-                                    mediaInfo.hasThumbnail
-                            };
-                        }
-                    );
-
-                return json(
-                    output
-                );
-            }
-
-            if (
-                url.pathname.startsWith(
-                    "/media/"
-                )
-            ) {
-
-                const parts =
-                    url.pathname
-                        .split("/")
-                        .filter(Boolean);
-
-                if (
-                    parts.length !== 3
-                ) {
-
-                    return new Response(
-                        "Invalid media URL",
-                        {
-                            status: 400
-                        }
-                    );
-                }
-
-                const chatId =
-                    decodeURIComponent(
-                        parts[1]
-                    );
-
-                const messageId =
-                    decodeURIComponent(
-                        parts[2]
-                    );
-
-                const requestedThumb =
-                    url.searchParams.get(
-                        "thumb"
-                    ) === "1";
-
-                if (
-                    !chatId ||
-                    !messageId
-                ) {
-
-                    return new Response(
-                        "Missing chat or message ID",
-                        {
-                            status: 400
-                        }
-                    );
-                }
-
-                const client =
-                    await getTelegramClient(
-                        env
-                    );
-
-                const found =
-                    await findTelegramMessage(
-                        client,
-                        chatId,
-                        messageId
-                    );
-
-                if (!found) {
-
-                    return new Response(
-                        "Chat not found",
-                        {
-                            status: 404
-                        }
-                    );
-                }
-
-                const message =
-                    found.message;
-
-                if (!message) {
-
-                    return new Response(
-                        "Message not found",
-                        {
-                            status: 404
-                        }
-                    );
-                }
-
-                const media =
-                    message.media;
-
-                if (!media) {
-
-                    return new Response(
-                        "Message does not contain media",
-                        {
-                            status: 415
-                        }
-                    );
-                }
-
-                let location;
-                let size;
-                let mimeType;
-
-                if (
-                    media.document
-                ) {
-
-                    const document =
-                        media.document;
-
-                    if (
-                        requestedThumb
-                    ) {
-
-                        const thumbs =
-                            Array.isArray(
-                                document.thumbs
-                            )
-                                ? document.thumbs
-                                : [];
-
-                        if (
-                            !thumbs.length
-                        ) {
-
-                            return new Response(
-                                "Document has no thumbnail",
-                                {
-                                    status: 404
-                                }
-                            );
-                        }
-
-                        const thumbnail =
-                            thumbs.find(
-                                item =>
-                                    item.type ===
-                                    "m"
-                            ) ||
-                            thumbs.find(
-                                item =>
-                                    item.type ===
-                                    "x"
-                            ) ||
-                            thumbs[
-                                thumbs.length - 1
-                            ];
-
-                        if (
-                            thumbnail.type ===
-                            "i"
-                        ) {
-
-                            return new Response(
-                                "Stripped thumbnails are not directly supported by this endpoint",
-                                {
-                                    status: 415
-                                }
-                            );
-                        }
-
-                        size =
-                            Number(
-                                thumbnail.size
-                            );
-
-                        if (
-                            !Number.isSafeInteger(
-                                size
-                            ) ||
-                            size < 0
-                        ) {
-
-                            return new Response(
-                                "Unsupported thumbnail size",
-                                {
-                                    status: 500
-                                }
-                            );
-                        }
-
-                        location =
-                            new Api.InputDocumentFileLocation({
-                                id:
-                                    document.id,
-
-                                accessHash:
-                                    document.accessHash,
-
-                                fileReference:
-                                    document.fileReference,
-
-                                thumbSize:
-                                    thumbnail.type
-                            });
-
-                        mimeType =
-                            "image/jpeg";
-
-                    } else {
-
-                        size =
-                            Number(
-                                document.size.toString()
-                            );
-
-                        if (
-                            !Number.isSafeInteger(
-                                size
-                            ) ||
-                            size < 0
-                        ) {
-
-                            return new Response(
-                                "Unsupported file size",
-                                {
-                                    status: 500
-                                }
-                            );
-                        }
-
-                        location =
-                            new Api.InputDocumentFileLocation({
-                                id:
-                                    document.id,
-
-                                accessHash:
-                                    document.accessHash,
-
-                                fileReference:
-                                    document.fileReference,
-
-                                thumbSize:
-                                    ""
-                            });
-
-                        mimeType =
-                            document.mimeType ||
-                            "application/octet-stream";
-                    }
-
-                } else if (
-                    media.photo
-                ) {
-
-                    const photo =
-                        media.photo;
-
-                    const selectedSize =
-                        requestedThumb
-                            ? getThumbnailPhotoSize(
-                                photo
-                            )
-                            : getLargestPhotoSize(
-                                photo
-                            );
-
-                    if (!selectedSize) {
-
-                        return new Response(
-                            "Telegram photo has no downloadable size",
-                            {
-                                status: 404
-                            }
-                        );
-                    }
-
-                    size =
-                        getPhotoSizeBytes(
-                            selectedSize
-                        );
-
-                    if (
-                        !Number.isSafeInteger(
-                            size
-                        ) ||
-                        size < 0
-                    ) {
-
-                        return new Response(
-                            "Unsupported Telegram photo size",
-                            {
-                                status: 500
-                            }
-                        );
-                    }
-
-                    location =
-                        new Api.InputPhotoFileLocation({
-                            id:
-                                photo.id,
-
-                            accessHash:
-                                photo.accessHash,
-
-                            fileReference:
-                                photo.fileReference,
-
-                            thumbSize:
-                                selectedSize.type
-                        });
-
-                    mimeType =
-                        "image/jpeg";
-
-                } else {
-
-                    return new Response(
-                        "Unsupported Telegram media type",
-                        {
-                            status: 415
-                        }
-                    );
-                }
-
-                const range =
-                    parseRange(
-                        request.headers.get(
-                            "Range"
-                        ),
-                        size
-                    );
-
-                if (
-                    request.headers.has(
-                        "Range"
-                    ) &&
-                    !range
-                ) {
-
-                    return new Response(
-                        null,
-                        {
-                            status: 416,
-
-                            headers: {
-                                "Content-Range":
-                                    "bytes */" +
-                                    size
-                            }
-                        }
-                    );
-                }
-
-                const start =
-                    range
-                        ? range.start
-                        : 0;
-
-                const end =
-                    range
-                        ? range.end
-                        : size - 1;
-
-                const contentLength =
-                    end -
-                    start +
-                    1;
-
-                const iter =
-                    client.iterDownload({
-                        file:
-                            location,
-                
-                        offset:
-                            bigInt(
-                                start
-                            ),
-                
-                        limit:
-                            bigInt(
-                                contentLength
-                            ),
-                
-                        requestSize:
-                            2 * 1024 * 1024
-                    });
-                
-                const stream =
-                    new ReadableStream({
-                
-                        async start(
-                            controller
-                        ) {
-                
-                            try {
-                
-                                for await (
-                                    const chunk
-                                    of iter
-                                ) {
-                
-                                    if (
-                                        request.signal.aborted
-                                    ) {
-                                        return;
-                                    }
-                
-                                    controller.enqueue(
-                                        chunk
-                                    );
-                                }
-                
-                                controller.close();
-                
-                            } catch (error) {
-                
-                                if (
-                                    !request.signal.aborted
-                                ) {
-                                    controller.error(
-                                        error
-                                    );
-                                }
-                            }
-                        },
-                
-                        cancel() {
-                
-                            return;
-                        }
-                
-                    });
-
-                const headers =
-                    new Headers();
-
-                headers.set(
-                    "Content-Type",
-                    mimeType
-                );
-
-                headers.set(
-                    "Accept-Ranges",
-                    "bytes"
-                );
-
-                headers.set(
-                    "Content-Length",
-                    String(
-                        contentLength
-                    )
-                );
-
-                headers.set(
-                    "Cache-Control",
-                    "public, max-age=31536000, immutable"
-                );
-
-                if (range) {
-
-                    headers.set(
-                        "Content-Range",
-                        "bytes " +
-                        start +
-                        "-" +
-                        end +
-                        "/" +
-                        size
-                    );
-                }
-
-                return new Response(
-                    stream,
-                    {
-                        status:
-                            range
-                                ? 206
-                                : 200,
-
-                        headers
-                    }
-                );
-            }
-
-            return new Response(
-                "Not found",
-                {
-                    status: 404,
-
-                    headers: {
-                        "Access-Control-Allow-Origin":
-                            "*"
-                    }
-                }
+            return await handleRequest(
+                request,
+                env
             );
 
         } catch (error) {
 
             return json(
                 {
-                    stage:
-                        "outer-worker-catch",
-
-                    error:
-                        errorInfo(
-                            error
-                        )
+                    ...errorInfo(
+                        error
+                    )
                 },
                 500
             );

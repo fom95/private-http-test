@@ -564,10 +564,11 @@ img {
             await infoResponse.json();
 
         if (
-            !info.media ||
+            !info.success ||
             !info.fileId
         ) {
             throw new Error(
+                info.error ||
                 "This message has no supported media."
             );
         }
@@ -596,24 +597,45 @@ img {
             );
         }
 
-        const partCount = 4;
-        const parts =
-            new Array(partCount);
+        const alignment =
+            ${TELEGRAM_OFFSET_ALIGNMENT};
+
+        const partCount =
+            fileSize >= alignment * 4
+                ? 4
+                : 1;
+
+        const boundaries =
+            [0];
+
+        for (
+            let i = 1;
+            i < partCount;
+            i++
+        ) {
+            boundaries.push(
+                Math.floor(
+                    (
+                        fileSize *
+                        i /
+                        partCount
+                    ) /
+                    alignment
+                ) *
+                alignment
+            );
+        }
+
+        boundaries.push(
+            fileSize
+        );
 
         async function fetchPart(index) {
             const start =
-                Math.floor(
-                    fileSize *
-                    index /
-                    partCount
-                );
+                boundaries[index];
 
             const end =
-                Math.floor(
-                    fileSize *
-                    (index + 1) /
-                    partCount
-                );
+                boundaries[index + 1];
 
             const params =
                 new URLSearchParams({
@@ -652,9 +674,11 @@ img {
         }
 
         status.textContent =
-            "Downloading image in 4 parts...";
+            partCount === 4
+                ? "Downloading image in 4 parts..."
+                : "Downloading image...";
 
-        const results =
+        const parts =
             await Promise.all(
                 Array.from(
                     {
@@ -668,7 +692,7 @@ img {
 
         const blob =
             new Blob(
-                results,
+                parts,
                 {
                     type:
                         mimeType

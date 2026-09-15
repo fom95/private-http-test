@@ -75,17 +75,17 @@ async function getTelegramClient(
     const client =
         new Client({
             apiId,
-    
+
             apiHash,
-    
+
             authString,
-    
+
             persistCache:
                 false,
-    
+
             defaultHandlers:
                 false,
-    
+
             disableUpdates:
                 true
         });
@@ -114,6 +114,9 @@ function getMessageMediaInfo(
             fileId:
                 null,
 
+            fileUniqueId:
+                null,
+
             fileSize:
                 0,
 
@@ -121,9 +124,58 @@ function getMessageMediaInfo(
                 null,
 
             mimeType:
-                null
+                null,
+
+            width:
+                null,
+
+            height:
+                null,
+
+            duration:
+                null,
+
+            thumbnails:
+                []
         };
     }
+
+    const thumbnails =
+        Array.isArray(
+            media.thumbnails
+        )
+            ? media.thumbnails.map(
+                (
+                    thumbnail,
+                    index
+                ) => ({
+
+                    index,
+
+                    fileId:
+                        thumbnail.fileId ||
+                        null,
+
+                    fileUniqueId:
+                        thumbnail.fileUniqueId ||
+                        null,
+
+                    width:
+                        thumbnail.width ||
+                        null,
+
+                    height:
+                        thumbnail.height ||
+                        null,
+
+                    fileSize:
+                        Number(
+                            thumbnail.fileSize ||
+                            0
+                        )
+                })
+            )
+            : [];
 
     return {
         hasMedia:
@@ -135,6 +187,10 @@ function getMessageMediaInfo(
 
         fileId:
             media.fileId ||
+            null,
+
+        fileUniqueId:
+            media.fileUniqueId ||
             null,
 
         fileSize:
@@ -149,7 +205,21 @@ function getMessageMediaInfo(
 
         mimeType:
             media.mimeType ||
-            null
+            null,
+
+        width:
+            media.width ||
+            null,
+
+        height:
+            media.height ||
+            null,
+
+        duration:
+            media.duration ||
+            null,
+
+        thumbnails
     };
 }
 
@@ -222,13 +292,16 @@ async function getChatList(
 
 async function getMessages(
     client,
-    chatId
+    chatId,
+    requestUrl
 ) {
 
     try {
 
         const numericChatId =
-            Number(chatId);
+            Number(
+                chatId
+            );
 
         if (
             !Number.isSafeInteger(
@@ -269,10 +342,9 @@ async function getMessages(
         const chat =
             chatItem.chat;
 
-        const inputPeer =
-            await client.getInputPeer(
-                chat.id
-            );
+        await client.getInputPeer(
+            chat.id
+        );
 
         const messages =
             await client.getHistory(
@@ -282,6 +354,11 @@ async function getMessages(
                         100
                 }
             );
+
+        const origin =
+            new URL(
+                requestUrl
+            ).origin;
 
         return {
             success:
@@ -294,7 +371,16 @@ async function getMessages(
 
             chatTitle:
                 chat.title ||
-                chat.firstName ||
+                [
+                    chat.firstName,
+                    chat.lastName
+                ]
+                    .filter(
+                        Boolean
+                    )
+                    .join(
+                        " "
+                    ) ||
                 null,
 
             chatType:
@@ -311,6 +397,58 @@ async function getMessages(
                         const media =
                             getMessageMediaInfo(
                                 message
+                            );
+
+                        let mediaUrl =
+                            null;
+
+                        if (
+                            media.fileId
+                        ) {
+
+                            mediaUrl =
+                                `${origin}/media/` +
+                                `${encodeURIComponent(
+                                    chat.id
+                                )}/` +
+                                `${encodeURIComponent(
+                                    message.id
+                                )}`;
+                        }
+
+                        const thumbnailUrls =
+                            media.thumbnails.map(
+                                thumbnail => ({
+
+                                    index:
+                                        thumbnail.index,
+
+                                    fileId:
+                                        thumbnail.fileId,
+
+                                    fileUniqueId:
+                                        thumbnail.fileUniqueId,
+
+                                    width:
+                                        thumbnail.width,
+
+                                    height:
+                                        thumbnail.height,
+
+                                    fileSize:
+                                        thumbnail.fileSize,
+
+                                    url:
+                                        thumbnail.fileId
+                                            ? `${origin}/media/` +
+                                              `${encodeURIComponent(
+                                                  chat.id
+                                              )}/` +
+                                              `${encodeURIComponent(
+                                                  message.id
+                                              )}?thumb=${thumbnail.index}`
+                                            : null
+                                })
                             );
 
                         return {
@@ -348,6 +486,9 @@ async function getMessages(
                             fileId:
                                 media.fileId,
 
+                            fileUniqueId:
+                                media.fileUniqueId,
+
                             fileSize:
                                 media.fileSize,
 
@@ -355,7 +496,21 @@ async function getMessages(
                                 media.fileName,
 
                             mimeType:
-                                media.mimeType
+                                media.mimeType,
+
+                            width:
+                                media.width,
+
+                            height:
+                                media.height,
+
+                            duration:
+                                media.duration,
+
+                            mediaUrl,
+
+                            thumbnails:
+                                thumbnailUrls
                         };
                     }
                 )
@@ -391,6 +546,487 @@ async function getMessages(
     }
 }
 
+async function handleMediaRequest(
+    request,
+    env,
+    chatId,
+    messageId
+) {
+
+    const numericChatId =
+        Number(
+            chatId
+        );
+
+    const numericMessageId =
+        Number(
+            messageId
+        );
+
+    if (
+        !Number.isSafeInteger(
+            numericChatId
+        )
+    ) {
+
+        return new Response(
+            "Invalid chat ID.",
+            {
+                status: 400
+            }
+        );
+    }
+
+    if (
+        !Number.isSafeInteger(
+            numericMessageId
+        )
+    ) {
+
+        return new Response(
+            "Invalid message ID.",
+            {
+                status: 400
+            }
+        );
+    }
+
+    const client =
+        await getTelegramClient(
+            env
+        );
+
+    const chats =
+        await client.getChats({
+            from:
+                "main",
+
+            limit:
+                100
+        });
+
+    const chatItem =
+        chats.find(
+            item =>
+                Number(
+                    item.chat.id
+                ) ===
+                numericChatId
+        );
+
+    if (!chatItem) {
+
+        return new Response(
+            "Chat cannot be accessed.",
+            {
+                status: 404
+            }
+        );
+    }
+
+    const chat =
+        chatItem.chat;
+
+    await client.getInputPeer(
+        chat.id
+    );
+
+    const message =
+        await client.getMessage(
+            chat.id,
+            numericMessageId
+        );
+
+    if (!message) {
+
+        return new Response(
+            "Message not found.",
+            {
+                status: 404
+            }
+        );
+    }
+
+    const media =
+        message.media;
+
+    if (!media) {
+
+        return new Response(
+            "Message has no media.",
+            {
+                status: 404
+            }
+        );
+    }
+
+    const url =
+        new URL(
+            request.url
+        );
+
+    const thumbParam =
+        url.searchParams.get(
+            "thumb"
+        );
+
+    let fileId =
+        media.fileId;
+
+    let contentType =
+        media.mimeType ||
+        "application/octet-stream";
+
+    let fileSize =
+        Number(
+            media.fileSize ||
+            0
+        );
+
+    if (
+        thumbParam !== null
+    ) {
+
+        const thumbIndex =
+            Number(
+                thumbParam
+            );
+
+        const thumbnails =
+            Array.isArray(
+                media.thumbnails
+            )
+                ? media.thumbnails
+                : [];
+
+        if (
+            !Number.isInteger(
+                thumbIndex
+            ) ||
+            thumbIndex < 0 ||
+            thumbIndex >=
+                thumbnails.length
+        ) {
+
+            return new Response(
+                "Thumbnail not found.",
+                {
+                    status: 404
+                }
+            );
+        }
+
+        const thumbnail =
+            thumbnails[
+                thumbIndex
+            ];
+
+        if (
+            !thumbnail.fileId
+        ) {
+
+            return new Response(
+                "Thumbnail has no file ID.",
+                {
+                    status: 404
+                }
+            );
+        }
+
+        fileId =
+            thumbnail.fileId;
+
+        fileSize =
+            Number(
+                thumbnail.fileSize ||
+                0
+            );
+
+        contentType =
+            "image/jpeg";
+    }
+
+    if (!fileId) {
+
+        return new Response(
+            "Media has no downloadable file ID.",
+            {
+                status: 404
+            }
+        );
+    }
+
+    if (
+        !Number.isFinite(
+            fileSize
+        ) ||
+        fileSize < 0
+    ) {
+
+        return new Response(
+            "Media has an invalid file size.",
+            {
+                status: 500
+            }
+        );
+    }
+
+    const rangeHeader =
+        request.headers.get(
+            "Range"
+        );
+
+    let start =
+        0;
+
+    let end =
+        fileSize - 1;
+
+    let status =
+        200;
+
+    if (
+        rangeHeader
+    ) {
+
+        const match =
+            rangeHeader.match(
+                /^bytes=(\d*)-(\d*)$/
+            );
+
+        if (!match) {
+
+            return new Response(
+                "Invalid Range.",
+                {
+                    status: 416,
+
+                    headers: {
+                        "Content-Range":
+                            `bytes */${fileSize}`
+                    }
+                }
+            );
+        }
+
+        if (
+            match[1]
+        ) {
+
+            start =
+                Number(
+                    match[1]
+                );
+        }
+
+        if (
+            match[2]
+        ) {
+
+            end =
+                Number(
+                    match[2]
+                );
+
+        } else {
+
+            end =
+                fileSize - 1;
+        }
+
+        if (
+            !match[1] &&
+            match[2]
+        ) {
+
+            const length =
+                Number(
+                    match[2]
+                );
+
+            start =
+                Math.max(
+                    0,
+                    fileSize -
+                    length
+                );
+
+            end =
+                fileSize - 1;
+        }
+
+        if (
+            start > end ||
+            start >= fileSize
+        ) {
+
+            return new Response(
+                "Requested range not satisfiable.",
+                {
+                    status: 416,
+
+                    headers: {
+                        "Content-Range":
+                            `bytes */${fileSize}`
+                    }
+                }
+            );
+        }
+
+        end =
+            Math.min(
+                end,
+                fileSize - 1
+            );
+
+        status =
+            206;
+    }
+
+    const contentLength =
+        fileSize === 0
+            ? 0
+            : end -
+              start +
+              1;
+
+    const headers =
+        new Headers();
+
+    headers.set(
+        "Content-Type",
+        contentType
+    );
+
+    headers.set(
+        "Accept-Ranges",
+        "bytes"
+    );
+
+    headers.set(
+        "Content-Length",
+        String(
+            contentLength
+        )
+    );
+
+    headers.set(
+        "Cache-Control",
+        "public, max-age=31536000, immutable"
+    );
+
+    if (
+        status === 206
+    ) {
+
+        headers.set(
+            "Content-Range",
+            `bytes ${start}-${end}/${fileSize}`
+        );
+    }
+
+    if (
+        request.method ===
+        "HEAD"
+    ) {
+
+        return new Response(
+            null,
+            {
+                status,
+                headers
+            }
+        );
+    }
+
+    const iterator =
+        client.download(
+            fileId,
+            {
+                chunkSize:
+                    2 * 1024 * 1024,
+
+                offset:
+                    start,
+
+                signal:
+                    request.signal
+            }
+        );
+
+    const stream =
+        new ReadableStream({
+
+            async pull(
+                controller
+            ) {
+
+                try {
+
+                    const result =
+                        await iterator.next();
+
+                    if (
+                        result.done
+                    ) {
+
+                        controller.close();
+
+                        return;
+                    }
+
+                    const chunk =
+                        result.value;
+
+                    const remaining =
+                        end -
+                        start +
+                        1;
+
+                    if (
+                        chunk.byteLength >
+                        remaining
+                    ) {
+
+                        controller.enqueue(
+                            chunk.slice(
+                                0,
+                                remaining
+                            )
+                        );
+
+                        controller.close();
+
+                        return;
+                    }
+
+                    controller.enqueue(
+                        chunk
+                    );
+
+                    start +=
+                        chunk.byteLength;
+
+                } catch (
+                    error
+                ) {
+
+                    controller.error(
+                        error
+                    );
+                }
+            }
+        });
+
+    return new Response(
+        stream,
+        {
+            status,
+            headers
+        }
+    );
+}
+
 async function testDownload(
     request,
     env,
@@ -406,12 +1042,52 @@ async function testDownload(
             env
         );
 
+    const numericChatId =
+        Number(
+            chatId
+        );
+
+    const numericMessageId =
+        Number(
+            messageId
+        );
+
+    const chats =
+        await client.getChats({
+            from:
+                "main",
+
+            limit:
+                100
+        });
+
+    const chatItem =
+        chats.find(
+            item =>
+                Number(
+                    item.chat.id
+                ) ===
+                numericChatId
+        );
+
+    if (!chatItem) {
+
+        throw new Error(
+            `Chat ${numericChatId} was not found.`
+        );
+    }
+
+    const chat =
+        chatItem.chat;
+
+    await client.getInputPeer(
+        chat.id
+    );
+
     const message =
         await client.getMessage(
-            chatId,
-            Number(
-                messageId
-            )
+            chat.id,
+            numericMessageId
         );
 
     if (!message) {
@@ -495,11 +1171,6 @@ async function testDownload(
             chunk.byteLength;
 
         chunks++;
-
-        /*
-         * Deliberately discard
-         * every downloaded chunk.
-         */
     }
 
     return json({
@@ -734,15 +1405,15 @@ async function loadChats() {
         const chat
         of chats
     ) {
-    
+
         const option =
             document.createElement(
                 "option"
             );
-    
+
         option.value =
             chat.id;
-    
+
         option.textContent =
             chat.title +
             " [" +
@@ -752,7 +1423,7 @@ async function loadChats() {
             ) +
             "] — ID: " +
             chat.id;
-    
+
         chatSelect.appendChild(
             option
         );
@@ -1009,6 +1680,72 @@ function updateMessage() {
         "";
 
     if (
+        message.mediaUrl
+    ) {
+
+        const media =
+            document.createElement(
+                "a"
+            );
+
+        media.href =
+            message.mediaUrl;
+
+        media.target =
+            "_blank";
+
+        media.textContent =
+            "Open media";
+
+        buttons.appendChild(
+            media
+        );
+    }
+
+    if (
+        message.thumbnails &&
+        message.thumbnails.length
+    ) {
+
+        for (
+            const thumbnail
+            of message.thumbnails
+        ) {
+
+            if (
+                !thumbnail.url
+            ) {
+
+                continue;
+            }
+
+            const link =
+                document.createElement(
+                    "a"
+                );
+
+            link.href =
+                thumbnail.url;
+
+            link.target =
+                "_blank";
+
+            link.textContent =
+                "Thumbnail " +
+                thumbnail.index +
+                " (" +
+                thumbnail.width +
+                "×" +
+                thumbnail.height +
+                ")";
+
+            buttons.appendChild(
+                link
+            );
+        }
+    }
+
+    if (
         message.fileId
     ) {
 
@@ -1107,70 +1844,99 @@ loadChats()
     if (
         path === "/api/chat"
     ) {
-    
+
         const chatId =
             url.searchParams.get(
                 "chatId"
             );
-    
+
         if (!chatId) {
-    
+
             return json(
                 {
                     success:
                         false,
-    
+
                     error:
                         "Missing chatId."
                 },
                 400
             );
         }
-    
+
         try {
-    
+
             const client =
                 await getTelegramClient(
                     env
                 );
-    
-            const chat =
-                await client.getChat(
-                    Number(chatId)
+
+            const chats =
+                await client.getChats({
+                    from:
+                        "main",
+
+                    limit:
+                        100
+                });
+
+            const chatItem =
+                chats.find(
+                    item =>
+                        Number(
+                            item.chat.id
+                        ) ===
+                        Number(
+                            chatId
+                        )
                 );
-    
+
+            if (!chatItem) {
+
+                throw new Error(
+                    `Chat ${chatId} was not found.`
+                );
+            }
+
+            const chat =
+                chatItem.chat;
+
+            await client.getInputPeer(
+                chat.id
+            );
+
             return json({
                 success:
                     true,
-    
+
                 requestedChatId:
                     chatId,
-    
+
                 chat
             });
-    
+
         } catch (
             error
         ) {
-    
+
             return json(
                 {
                     success:
                         false,
-    
+
                     requestedChatId:
                         chatId,
-    
+
                     error:
                         error?.message ||
                         String(
                             error
                         ),
-    
+
                     name:
                         error?.name ||
                         null,
-    
+
                     stack:
                         error?.stack ||
                         null
@@ -1183,42 +1949,62 @@ loadChats()
     if (
         path === "/api/messages"
     ) {
-    
+
         const chatId =
             url.searchParams.get(
                 "chatId"
             );
-    
+
         if (!chatId) {
-    
+
             return json(
                 {
                     success:
                         false,
-    
+
                     error:
                         "Missing chatId."
                 },
                 400
             );
         }
-    
+
         const client =
             await getTelegramClient(
                 env
             );
-    
+
         const result =
             await getMessages(
                 client,
-                chatId
+                chatId,
+                request.url
             );
-    
+
         return json(
             result,
             result.success
                 ? 200
                 : 500
+        );
+    }
+
+    const mediaMatch =
+        path.match(
+            /^\/media\/([^/]+)\/([^/]+)$/
+        );
+
+    if (mediaMatch) {
+
+        return handleMediaRequest(
+            request,
+            env,
+            decodeURIComponent(
+                mediaMatch[1]
+            ),
+            decodeURIComponent(
+                mediaMatch[2]
+            )
         );
     }
 

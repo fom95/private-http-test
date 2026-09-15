@@ -2907,7 +2907,7 @@ async function fetchMediaPieces(
                 Math.min(
                     PIECE_SIZE,
                     fileSize -
-                        offset
+                    offset
                 );
 
             const buffer =
@@ -3094,9 +3094,7 @@ async function loadMedia(
             );
         }
 
-        if (
-            !mime
-        ) {
+        if (!mime) {
             throw new Error(
                 "Media MIME type is missing."
             );

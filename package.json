@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "private": true,
   "dependencies": {
-    "@mtkruto/mtkruto": "0.217.0"
+    "@mtkruto/mtkruto": "npm:@jsr/mtkruto__mtkruto@^0.217.0"
   }
 }

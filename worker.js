@@ -347,9 +347,9 @@ async function getChatForId(client, chatId) {
 async function getMessages(client, chatId) {
     const chat = await getChatForId(client, chatId);
 
-    const peer = await client.getInputPeer(chat.id);
+    await client.getInputPeer(chat.id);
 
-    return await client.getHistory(peer, {
+    return await client.getHistory(chat.id, {
         limit: 100
     });
 }

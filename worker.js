@@ -194,8 +194,12 @@ async function findTelegramMessage(
     const dialog =
         dialogs.find(
             item =>
-                String(item.id) ===
-                String(chatId)
+                String(
+                    item.id
+                ) ===
+                String(
+                    chatId
+                )
         );
 
     if (!dialog) {
@@ -211,15 +215,208 @@ async function findTelegramMessage(
         await client.getMessages(
             inputEntity,
             {
-                ids: Number(messageId)
+                ids:
+                    Number(
+                        messageId
+                    )
             }
         );
 
     return {
         dialog,
+
         message:
             messages?.[0] ??
             null
+    };
+}
+
+function getPhotoSizes(photo) {
+
+    return Array.isArray(
+        photo?.sizes
+    )
+        ? photo.sizes.filter(
+            item =>
+                item &&
+                item.type
+        )
+        : [];
+}
+
+function getLargestPhotoSize(photo) {
+
+    const sizes =
+        getPhotoSizes(
+            photo
+        );
+
+    if (!sizes.length) {
+        return null;
+    }
+
+    return sizes.reduce(
+        (largest, current) => {
+
+            const largestArea =
+                Number(
+                    largest?.w ?? 0
+                ) *
+                Number(
+                    largest?.h ?? 0
+                );
+
+            const currentArea =
+                Number(
+                    current?.w ?? 0
+                ) *
+                Number(
+                    current?.h ?? 0
+                );
+
+            return currentArea >
+                largestArea
+                ? current
+                : largest;
+        }
+    );
+}
+
+function getThumbnailPhotoSize(photo) {
+
+    const sizes =
+        getPhotoSizes(
+            photo
+        );
+
+    if (!sizes.length) {
+        return null;
+    }
+
+    return (
+        sizes.find(
+            item =>
+                item.type === "m"
+        ) ||
+
+        sizes.find(
+            item =>
+                item.type === "x"
+        ) ||
+
+        sizes.find(
+            item =>
+                item.type === "s"
+        ) ||
+
+        sizes[0]
+    );
+}
+
+function getPhotoSizeBytes(photoSize) {
+
+    if (!photoSize) {
+        return null;
+    }
+
+    if (
+        photoSize.size != null
+    ) {
+
+        return Number(
+            photoSize.size
+        );
+    }
+
+    if (
+        Array.isArray(
+            photoSize.sizes
+        )
+    ) {
+
+        const sizes =
+            photoSize.sizes;
+
+        if (!sizes.length) {
+            return null;
+        }
+
+        return Number(
+            sizes[
+                sizes.length - 1
+            ]
+        );
+    }
+
+    return null;
+}
+
+function getMediaInfo(message) {
+
+    const media =
+        message?.media;
+
+    if (!media) {
+
+        return {
+            type: null,
+
+            supported: false,
+
+            hasThumbnail: false
+        };
+    }
+
+    if (media.document) {
+
+        const document =
+            media.document;
+
+        return {
+            type:
+                "document",
+
+            supported:
+                true,
+
+            hasThumbnail:
+                Array.isArray(
+                    document.thumbs
+                ) &&
+                document.thumbs.length >
+                    0
+        };
+    }
+
+    if (media.photo) {
+
+        const photo =
+            media.photo;
+
+        return {
+            type:
+                "photo",
+
+            supported:
+                true,
+
+            hasThumbnail:
+                getThumbnailPhotoSize(
+                    photo
+                ) !== null
+        };
+    }
+
+    return {
+        type:
+            media.className ??
+            null,
+
+        supported:
+            false,
+
+        hasThumbnail:
+            false
     };
 }
 
@@ -539,7 +736,10 @@ async function loadMessages(chatId) {
 
                 label +=
                     " [" +
-                    message.mediaType +
+                    (
+                        message.mediaType ||
+                        "Media"
+                    ) +
                     "]";
             }
 
@@ -683,24 +883,43 @@ messageSelect.addEventListener(
             return;
         }
 
-        let mediaLink =
+        let mediaLinks =
             "";
 
-        if (message.hasMedia) {
+        if (
+            message.hasFullMedia
+        ) {
 
-            mediaLink =
-                "<br><br>" +
-                '<a href="/media/' +
+            const baseURL =
+                "/media/" +
                 encodeURIComponent(
                     chatSelect.value
                 ) +
                 "/" +
                 encodeURIComponent(
                     message.id
-                ) +
+                );
+
+            mediaLinks =
+                "<br><br>" +
+                '<a href="' +
+                baseURL +
                 '" target="_blank">' +
                 "Open media" +
                 "</a>";
+
+            if (
+                message.hasThumbnail
+            ) {
+
+                mediaLinks +=
+                    "<br>" +
+                    '<a href="' +
+                    baseURL +
+                    '?thumb=1" target="_blank">' +
+                    "Open thumbnail" +
+                    "</a>";
+            }
         }
 
         messageInfo.style.display =
@@ -720,7 +939,7 @@ messageSelect.addEventListener(
                     ? message.mediaType
                     : "None"
             ) +
-            mediaLink +
+            mediaLinks +
             "<br><br><strong>Text:</strong>" +
             "<pre>" +
             escapeHtml(
@@ -780,7 +999,9 @@ export default {
                 url.pathname === "/index.html"
             ) {
 
-                return html(PAGE);
+                return html(
+                    PAGE
+                );
             }
 
             if (
@@ -962,37 +1183,53 @@ export default {
                     await client.getMessages(
                         inputEntity,
                         {
-                            limit: 10
+                            limit:
+                                undefined
                         }
                     );
 
                 const output =
                     messages.map(
-                        message => ({
-                            id:
-                                String(
-                                    message.id
-                                ),
+                        message => {
 
-                            date:
-                                message.date
-                                    ? new Date(
-                                        message.date
-                                    ).toISOString()
-                                    : null,
+                            const mediaInfo =
+                                getMediaInfo(
+                                    message
+                                );
 
-                            text:
-                                message.message ??
-                                "",
+                            return {
 
-                            hasMedia:
-                                !!message.media,
+                                id:
+                                    String(
+                                        message.id
+                                    ),
 
-                            mediaType:
-                                message.media
-                                    ?.className ??
-                                null
-                        })
+                                date:
+                                    message.date
+                                        ? new Date(
+                                            message.date
+                                        ).toISOString()
+                                        : null,
+
+                                text:
+                                    message.message ??
+                                    "",
+
+                                hasMedia:
+                                    !!message.media,
+
+                                mediaType:
+                                    message.media
+                                        ?.className ??
+                                    null,
+
+                                hasFullMedia:
+                                    mediaInfo.supported,
+
+                                hasThumbnail:
+                                    mediaInfo.hasThumbnail
+                            };
+                        }
                     );
 
                 return json(
@@ -1005,16 +1242,16 @@ export default {
                     "/media/"
                 )
             ) {
-            
+
                 const parts =
                     url.pathname
                         .split("/")
                         .filter(Boolean);
-            
+
                 if (
                     parts.length !== 3
                 ) {
-            
+
                     return new Response(
                         "Invalid media URL",
                         {
@@ -1022,22 +1259,27 @@ export default {
                         }
                     );
                 }
-            
+
                 const chatId =
                     decodeURIComponent(
                         parts[1]
                     );
-            
+
                 const messageId =
                     decodeURIComponent(
                         parts[2]
                     );
-            
+
+                const requestedThumb =
+                    url.searchParams.get(
+                        "thumb"
+                    ) === "1";
+
                 if (
                     !chatId ||
                     !messageId
                 ) {
-            
+
                     return new Response(
                         "Missing chat or message ID",
                         {
@@ -1045,21 +1287,21 @@ export default {
                         }
                     );
                 }
-            
+
                 const client =
                     await getTelegramClient(
                         env
                     );
-            
+
                 const found =
                     await findTelegramMessage(
                         client,
                         chatId,
                         messageId
                     );
-            
+
                 if (!found) {
-            
+
                     return new Response(
                         "Chat not found",
                         {
@@ -1067,12 +1309,12 @@ export default {
                         }
                     );
                 }
-            
+
                 const message =
                     found.message;
-            
+
                 if (!message) {
-            
+
                     return new Response(
                         "Message not found",
                         {
@@ -1080,12 +1322,12 @@ export default {
                         }
                     );
                 }
-            
+
                 const media =
                     message.media;
-            
+
                 if (!media) {
-            
+
                     return new Response(
                         "Message does not contain media",
                         {
@@ -1093,178 +1335,187 @@ export default {
                         }
                     );
                 }
-            
-                const isDocument =
-                    !!media.document;
-            
-                const isPhoto =
-                    !!media.photo;
-            
-                if (
-                    !isDocument &&
-                    !isPhoto
-                ) {
-            
-                    return new Response(
-                        "Unsupported Telegram media type",
-                        {
-                            status: 415
-                        }
-                    );
-                }
-            
+
                 let location;
                 let size;
                 let mimeType;
-            
-                if (isDocument) {
-            
+
+                if (
+                    media.document
+                ) {
+
                     const document =
                         media.document;
-            
-                    size =
-                        Number(
-                            document.size.toString()
-                        );
-            
+
                     if (
-                        !Number.isSafeInteger(
-                            size
-                        ) ||
-                        size < 0
+                        requestedThumb
                     ) {
-            
-                        return new Response(
-                            "Unsupported file size",
-                            {
-                                status: 500
-                            }
-                        );
+
+                        const thumbs =
+                            Array.isArray(
+                                document.thumbs
+                            )
+                                ? document.thumbs
+                                : [];
+
+                        if (
+                            !thumbs.length
+                        ) {
+
+                            return new Response(
+                                "Document has no thumbnail",
+                                {
+                                    status: 404
+                                }
+                            );
+                        }
+
+                        const thumbnail =
+                            thumbs.find(
+                                item =>
+                                    item.type ===
+                                    "m"
+                            ) ||
+                            thumbs.find(
+                                item =>
+                                    item.type ===
+                                    "x"
+                            ) ||
+                            thumbs[
+                                thumbs.length - 1
+                            ];
+
+                        if (
+                            thumbnail.type ===
+                            "i"
+                        ) {
+
+                            return new Response(
+                                "Stripped thumbnails are not directly supported by this endpoint",
+                                {
+                                    status: 415
+                                }
+                            );
+                        }
+
+                        size =
+                            Number(
+                                thumbnail.size
+                            );
+
+                        if (
+                            !Number.isSafeInteger(
+                                size
+                            ) ||
+                            size < 0
+                        ) {
+
+                            return new Response(
+                                "Unsupported thumbnail size",
+                                {
+                                    status: 500
+                                }
+                            );
+                        }
+
+                        location =
+                            new Api.InputDocumentFileLocation({
+                                id:
+                                    document.id,
+
+                                accessHash:
+                                    document.accessHash,
+
+                                fileReference:
+                                    document.fileReference,
+
+                                thumbSize:
+                                    thumbnail.type
+                            });
+
+                        mimeType =
+                            "image/jpeg";
+
+                    } else {
+
+                        size =
+                            Number(
+                                document.size.toString()
+                            );
+
+                        if (
+                            !Number.isSafeInteger(
+                                size
+                            ) ||
+                            size < 0
+                        ) {
+
+                            return new Response(
+                                "Unsupported file size",
+                                {
+                                    status: 500
+                                }
+                            );
+                        }
+
+                        location =
+                            new Api.InputDocumentFileLocation({
+                                id:
+                                    document.id,
+
+                                accessHash:
+                                    document.accessHash,
+
+                                fileReference:
+                                    document.fileReference,
+
+                                thumbSize:
+                                    ""
+                            });
+
+                        mimeType =
+                            document.mimeType ||
+                            "application/octet-stream";
                     }
-            
-                    location =
-                        new Api.InputDocumentFileLocation({
-                            id:
-                                document.id,
-            
-                            accessHash:
-                                document.accessHash,
-            
-                            fileReference:
-                                document.fileReference,
-            
-                            thumbSize:
-                                ""
-                        });
-            
-                    mimeType =
-                        document.mimeType ||
-                        "application/octet-stream";
-            
-                } else {
-            
+
+                } else if (
+                    media.photo
+                ) {
+
                     const photo =
                         media.photo;
-            
-                    const sizes =
-                        Array.isArray(
-                            photo.sizes
-                        )
-                            ? photo.sizes
-                            : [];
-            
-                    if (!sizes.length) {
-            
-                        return new Response(
-                            "Telegram photo has no downloadable sizes",
-                            {
-                                status: 500
-                            }
-                        );
-                    }
-            
-                    const downloadableSizes =
-                        sizes.filter(
-                            item =>
-                                item &&
-                                (
-                                    item.size != null ||
-                                    Array.isArray(
-                                        item.sizes
-                                    )
-                                )
-                        );
-            
-                    if (
-                        !downloadableSizes.length
-                    ) {
-            
+
+                    const selectedSize =
+                        requestedThumb
+                            ? getThumbnailPhotoSize(
+                                photo
+                            )
+                            : getLargestPhotoSize(
+                                photo
+                            );
+
+                    if (!selectedSize) {
+
                         return new Response(
                             "Telegram photo has no downloadable size",
                             {
-                                status: 500
+                                status: 404
                             }
                         );
                     }
-            
-                    const requestedThumb =
-                        url.searchParams.get(
-                            "thumb"
-                        );
-            
-                    let selectedSize;
-            
-                    if (requestedThumb === "1") {
-            
-                        selectedSize =
-                            downloadableSizes.find(
-                                item =>
-                                    item.type === "m"
-                            ) ||
-                            downloadableSizes.find(
-                                item =>
-                                    item.type === "x"
-                            ) ||
-                            downloadableSizes[
-                                0
-                            ];
-            
-                    } else {
-            
-                        selectedSize =
-                            downloadableSizes[
-                                downloadableSizes.length - 1
-                            ];
-                    }
-            
-                    let photoSize =
-                        selectedSize.size;
-            
-                    if (
-                        photoSize == null &&
-                        Array.isArray(
-                            selectedSize.sizes
-                        )
-                    ) {
-            
-                        photoSize =
-                            selectedSize.sizes[
-                                selectedSize.sizes.length - 1
-                            ];
-                    }
-            
+
                     size =
-                        Number(
-                            photoSize
+                        getPhotoSizeBytes(
+                            selectedSize
                         );
-            
+
                     if (
                         !Number.isSafeInteger(
                             size
                         ) ||
                         size < 0
                     ) {
-            
+
                         return new Response(
                             "Unsupported Telegram photo size",
                             {
@@ -1272,26 +1523,35 @@ export default {
                             }
                         );
                     }
-            
+
                     location =
                         new Api.InputPhotoFileLocation({
                             id:
                                 photo.id,
-            
+
                             accessHash:
                                 photo.accessHash,
-            
+
                             fileReference:
                                 photo.fileReference,
-            
+
                             thumbSize:
                                 selectedSize.type
                         });
-            
+
                     mimeType =
                         "image/jpeg";
+
+                } else {
+
+                    return new Response(
+                        "Unsupported Telegram media type",
+                        {
+                            status: 415
+                        }
+                    );
                 }
-            
+
                 const range =
                     parseRange(
                         request.headers.get(
@@ -1299,19 +1559,19 @@ export default {
                         ),
                         size
                     );
-            
+
                 if (
                     request.headers.has(
                         "Range"
                     ) &&
                     !range
                 ) {
-            
+
                     return new Response(
                         null,
                         {
                             status: 416,
-            
+
                             headers: {
                                 "Content-Range":
                                     "bytes */" +
@@ -1320,101 +1580,101 @@ export default {
                         }
                     );
                 }
-            
+
                 const start =
                     range
                         ? range.start
                         : 0;
-            
+
                 const end =
                     range
                         ? range.end
                         : size - 1;
-            
+
                 const contentLength =
                     end -
                     start +
                     1;
-            
+
                 const iter =
                     client.iterDownload({
                         file:
                             location,
-            
+
                         offset:
                             bigInt(
                                 start
                             ),
-            
+
                         limit:
                             bigInt(
                                 contentLength
                             ),
-            
+
                         requestSize:
                             512 * 1024
                     });
-            
+
                 const stream =
                     new ReadableStream({
-            
+
                         async start(
                             controller
                         ) {
-            
+
                             try {
-            
+
                                 for await (
                                     const chunk
                                     of iter
                                 ) {
-            
+
                                     controller.enqueue(
                                         new Uint8Array(
                                             chunk
                                         )
                                     );
                                 }
-            
+
                                 controller.close();
-            
+
                             } catch (error) {
-            
+
                                 controller.error(
                                     error
                                 );
                             }
                         }
-            
+
                     });
-            
+
                 const headers =
                     new Headers();
-            
+
                 headers.set(
                     "Content-Type",
                     mimeType
                 );
-            
+
                 headers.set(
                     "Accept-Ranges",
                     "bytes"
                 );
-            
+
                 headers.set(
                     "Content-Length",
                     String(
                         contentLength
                     )
                 );
-            
+
                 headers.set(
                     "Cache-Control",
                     "public, max-age=31536000, immutable"
                 );
-            
+
                 if (range) {
-            
+
                     headers.set(
                         "Content-Range",
                         "bytes " +
@@ -1425,7 +1685,7 @@ export default {
                         size
                     );
                 }
-            
+
                 return new Response(
                     stream,
                     {
@@ -1433,7 +1693,7 @@ export default {
                             range
                                 ? 206
                                 : 200,
-            
+
                         headers
                     }
                 );

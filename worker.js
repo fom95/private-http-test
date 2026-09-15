@@ -167,27 +167,56 @@ async function getChatList(
         });
 
     return chats.map(
-        chat => ({
-            id:
-                String(
-                    chat.id
-                ),
+        item => {
 
-            title:
-                chat.title ||
-                chat.name ||
-                String(
-                    chat.id
-                ),
+            const chat =
+                item.chat;
 
-            type:
-                chat.type ||
-                null,
+            let title;
 
-            username:
-                chat.username ||
-                null
-        })
+            if (
+                chat.title
+            ) {
+
+                title =
+                    chat.title;
+
+            } else {
+
+                title =
+                    [
+                        chat.firstName,
+                        chat.lastName
+                    ]
+                        .filter(
+                            Boolean
+                        )
+                        .join(
+                            " "
+                        );
+            }
+
+            return {
+                id:
+                    String(
+                        chat.id
+                    ),
+
+                title:
+                    title ||
+                    String(
+                        chat.id
+                    ),
+
+                type:
+                    chat.type ||
+                    null,
+
+                username:
+                    chat.username ||
+                    null
+            };
+        }
     );
 }
 

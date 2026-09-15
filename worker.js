@@ -16,6 +16,207 @@ function json(data, status = 200, extraHeaders = {}) {
     });
 }
 
+class CloudflareKVStorage {
+    constructor(kv, prefix = "mtkruto") {
+        this.kv = kv;
+        this.prefix = prefix;
+    }
+
+    key(parts) {
+        return this.prefix + ":" + parts.map(part => {
+            if (typeof part === "bigint") {
+                return "b:" + part.toString();
+            }
+
+            if (typeof part === "number") {
+                return "n:" + part;
+            }
+
+            return "s:" + encodeURIComponent(String(part));
+        }).join(":");
+    }
+
+    decodeKey(key) {
+        const prefix = this.prefix + ":";
+
+        if (!key.startsWith(prefix)) {
+            return null;
+        }
+
+        return key.slice(prefix.length).split(":").map(part => {
+            const type = part.slice(0, 2);
+            const value = part.slice(2);
+
+            if (type === "b:") {
+                return BigInt(value);
+            }
+
+            if (type === "n:") {
+                return Number(value);
+            }
+
+            if (type === "s:") {
+                return decodeURIComponent(value);
+            }
+
+            return value;
+        });
+    }
+
+    branch(id) {
+        return new CloudflareKVStorage(
+            this.kv,
+            this.prefix + ":branch:" + encodeURIComponent(id)
+        );
+    }
+
+    async initialize() {}
+
+    async close() {}
+
+    get isMemory() {
+        return false;
+    }
+
+    get mustSerialize() {
+        return true;
+    }
+
+    get supportsFiles() {
+        return false;
+    }
+
+    async get(key) {
+        return await this.kv.get(
+            this.key(key)
+        );
+    }
+
+    async set(key, value) {
+        const stored =
+            typeof value === "string"
+                ? value
+                : JSON.stringify(value);
+
+        await this.kv.put(
+            this.key(key),
+            stored
+        );
+    }
+
+    async incr(key, by) {
+        const kvKey =
+            this.key(key);
+
+        const current =
+            await this.kv.get(kvKey);
+
+        let value =
+            current === null
+                ? 0
+                : Number(
+                    JSON.parse(current)
+                );
+
+        if (!Number.isFinite(value)) {
+            value = 0;
+        }
+
+        value += by;
+
+        await this.kv.put(
+            kvKey,
+            JSON.stringify(value)
+        );
+    }
+
+    async *getMany(filter, params = {}) {
+        let prefix;
+
+        if ("prefix" in filter) {
+            prefix =
+                this.key(filter.prefix);
+        } else {
+            prefix =
+                this.prefix + ":";
+        }
+
+        let cursor = undefined;
+
+        do {
+            const result =
+                await this.kv.list({
+                    prefix,
+                    limit:
+                        params.limit || 1000,
+                    ...(cursor
+                        ? { cursor }
+                        : {})
+                });
+
+            const keys =
+                result.keys || [];
+
+            const names =
+                keys.map(
+                    item => item.name
+                );
+
+            const values =
+                names.length
+                    ? await this.kv.get(
+                        names
+                    )
+                    : new Map();
+
+            for (const name of names) {
+                const decoded =
+                    this.decodeKey(name);
+
+                if (!decoded) {
+                    continue;
+                }
+
+                if (
+                    "prefix" in filter &&
+                    decoded.length <
+                        filter.prefix.length
+                ) {
+                    continue;
+                }
+
+                if (
+                    "prefix" in filter &&
+                    !filter.prefix.every(
+                        (part, index) =>
+                            decoded[index] ===
+                            part
+                    )
+                ) {
+                    continue;
+                }
+
+                const value =
+                    values.get(name);
+
+                if (value !== null) {
+                    yield [
+                        decoded,
+                        value
+                    ];
+                }
+            }
+
+            if (result.list_complete) {
+                break;
+            }
+
+            cursor =
+                result.cursor;
+        } while (cursor);
+    }
+}
+
 async function createClient(env) {
     const apiId = Number(await env.API_ID.get());
     const apiHash = await env.API_HASH.get();
@@ -25,10 +226,21 @@ async function createClient(env) {
         throw new Error("Telegram credentials are not configured.");
     }
 
+    if (!env.MTKRUTO_CACHE) {
+        throw new Error("MTKRUTO_CACHE KV binding is not configured.");
+    }
+
+    const storage =
+        new CloudflareKVStorage(
+            env.MTKRUTO_CACHE
+        );
+
     const client = new Client({
         apiId,
         apiHash,
-        authString: session
+        authString: session,
+        storage,
+        persistCache: true
     });
 
     await client.start();
@@ -74,15 +286,6 @@ async function getMessage(client, chatId, messageId) {
         !Number.isSafeInteger(numericMessageId)
     ) {
         throw new Error("Invalid chat or message ID.");
-    }
-
-    const chat =
-        await client.getChat(numericChatId);
-
-    if (!chat) {
-        throw new Error(
-            `Chat ${numericChatId} was not found.`
-        );
     }
 
     const message =
@@ -2353,7 +2556,7 @@ async function loadMedia(
     }
 
     if (
-        !info.media ||
+        !info.success ||
         !info.fileId
     ) {
         mediaInfo.textContent =

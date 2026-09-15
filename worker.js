@@ -317,11 +317,16 @@ async function createClient(env) {
 
 async function getChatForId(client, chatId) {
     const numericId = Number(chatId);
+    const start = Date.now();
+
+    const chatsStart = Date.now();
 
     const chats = await client.getChats({
         from: "main",
         limit: 100
     });
+
+    const chatsTime = Date.now() - chatsStart;
 
     const item = chats.find(
         item => item?.chat && Number(item.chat.id) === numericId
@@ -330,6 +335,11 @@ async function getChatForId(client, chatId) {
     if (!item?.chat) {
         throw new Error(`Chat ${chatId} was not found.`);
     }
+
+    item.chat._debugTimings = {
+        getChats: `${chatsTime} ms`,
+        total: `${Date.now() - start} ms`
+    };
 
     return item.chat;
 }

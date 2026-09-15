@@ -76,10 +76,20 @@ async function getMessage(client, chatId, messageId) {
         throw new Error("Invalid chat or message ID.");
     }
 
-    const message = await client.getMessage(
-        numericChatId,
-        numericMessageId
-    );
+    const chat =
+        await client.getChat(numericChatId);
+
+    if (!chat) {
+        throw new Error(
+            `Chat ${numericChatId} was not found.`
+        );
+    }
+
+    const message =
+        await client.getMessage(
+            numericChatId,
+            numericMessageId
+        );
 
     if (!message) {
         throw new Error(

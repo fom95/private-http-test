@@ -2825,7 +2825,7 @@ a {
 
 <script>
 const PIECE_SIZE = ${TELEGRAM_CHUNK_SIZE};
-const PIECE_CONCURRENCY = 5;
+const PIECE_CONCURRENCY = 8;
 
 const chatSelect =
     document.getElementById(
@@ -3313,38 +3313,22 @@ async function fetchImageParts(
     mimeType,
     token
 ) {
-    const alignment =
-        ${TELEGRAM_OFFSET_ALIGNMENT};
-
+    // Each "part" is now a single PIECE_SIZE-aligned chunk (same size the
+    // Worker's /piece handler fetches from Telegram in one downloadChunk
+    // call). Previously this split the file into only 5 large parts, which
+    // forced handlePieceRequest to loop over many downloadChunk/decrypt
+    // calls inside a single Worker invocation -- accumulating CPU time
+    // against one request's cap instead of spreading it across many cheap
+    // requests. Concurrency (not part size) is what should scale with
+    // image size.
     const partCount =
-        fileSize >= alignment * 5
-            ? 5
-            : 1;
-
-    const boundaries =
-        [0];
-
-    for (
-        let i = 1;
-        i < partCount;
-        i++
-    ) {
-        boundaries.push(
-            Math.floor(
-                (
-                    fileSize *
-                    i /
-                    partCount
-                ) /
-                alignment
-            ) *
-            alignment
+        Math.max(
+            1,
+            Math.ceil(
+                fileSize /
+                PIECE_SIZE
+            )
         );
-    }
-
-    boundaries.push(
-        fileSize
-    );
 
     const parts =
         new Array(partCount);
@@ -3374,10 +3358,15 @@ async function fetchImageParts(
             }
 
             const start =
-                boundaries[index];
+                index *
+                PIECE_SIZE;
 
-            const end =
-                boundaries[index + 1];
+            const length =
+                Math.min(
+                    PIECE_SIZE,
+                    fileSize -
+                    start
+                );
 
             const buffer =
                 await fetchPiece(
@@ -3385,7 +3374,7 @@ async function fetchImageParts(
                     fileSize,
                     mimeType,
                     start,
-                    end - start
+                    length
                 );
 
             if (

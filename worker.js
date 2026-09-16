@@ -313,6 +313,30 @@ function resetClient() {
     sharedClientPromise = null;
 }
 
+// cache.put() can throw synchronously for a handful of reasons (a 206
+// response, a Vary: * header, a body over the size limit, etc). Caching
+// is always a best-effort side channel -- it must never be able to turn
+// a successful response into a 500. This wraps both the synchronous
+// call and the returned promise so nothing from cache.put() can escape.
+function safeCachePut(ctx, cache, request, response) {
+    if (!ctx || !cache) {
+        return;
+    }
+
+    try {
+        const toCache =
+            response.clone();
+
+        ctx.waitUntil(
+            Promise.resolve(
+                cache.put(request, toCache)
+            ).catch(() => {})
+        );
+    } catch {
+        // Ignore -- caching is never allowed to affect the real response.
+    }
+}
+
 function isConnectionError(error) {
     const message =
         String(
@@ -1615,11 +1639,15 @@ async function handleDirectMediaRequest(
             : null;
 
     if (cache) {
-        const cached =
-            await cache.match(request);
+        try {
+            const cached =
+                await cache.match(request);
 
-        if (cached) {
-            return cached;
+            if (cached) {
+                return cached;
+            }
+        } catch {
+            // Fall through to a normal fetch if the cache read fails.
         }
     }
 
@@ -1959,11 +1987,11 @@ async function handleDirectMediaRequest(
             );
 
         if (cache) {
-            ctx.waitUntil(
-                cache.put(
-                    request,
-                    response.clone()
-                ).catch(() => {})
+            safeCachePut(
+                ctx,
+                cache,
+                request,
+                response
             );
         }
 
@@ -2003,11 +2031,15 @@ async function handlePieceRequest(
     // viewers, retried requests) nearly free.
     const cache = caches.default;
 
-    const cached =
-        await cache.match(request);
+    try {
+        const cached =
+            await cache.match(request);
 
-    if (cached) {
-        return cached;
+        if (cached) {
+            return cached;
+        }
+    } catch {
+        // Fall through to a normal fetch if the cache read fails.
     }
 
     const requestStart =
@@ -2113,16 +2145,14 @@ async function handlePieceRequest(
         "Cache-Control":
             CACHE_CONTROL,
         "Accept-Ranges":
-            "bytes",
-        "Content-Range":
-            `bytes ${offset}-${end}/${fileSize}`
+            "bytes"
     };
 
     if (
         request.method === "HEAD"
     ) {
         return new Response(null, {
-            status: 206,
+            status: 200,
             headers
         });
     }
@@ -2244,7 +2274,7 @@ async function handlePieceRequest(
             String(output.length);
 
         headers[
-            "Content-Range"
+            "X-Piece-Range"
         ] =
             `bytes ${offset}-${offset + output.length - 1}/${fileSize}`;
 
@@ -2277,20 +2307,19 @@ async function handlePieceRequest(
             new Response(
                 output,
                 {
-                    status: 206,
+                    status: 200,
                     headers
                 }
             );
 
         if (
-            ctx &&
             request.method === "GET"
         ) {
-            ctx.waitUntil(
-                cache.put(
-                    request,
-                    response.clone()
-                ).catch(() => {})
+            safeCachePut(
+                ctx,
+                cache,
+                request,
+                response
             );
         }
 

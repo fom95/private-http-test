@@ -367,10 +367,29 @@ async function createClient(env) {
     return client;
 }
 
+// In-memory peer memo, shared across requests on a warm isolate.
+//
+// Unlike a Client (which owns a socket and must never be shared), this
+// holds only plain data -- a chat object and a BigInt access hash -- so
+// Cloudflare's cross-request I/O restriction does not apply. It saves a
+// KV read on repeat hits for the same chat; it is not a substitute for
+// the KV cache, which is what survives isolate restarts.
+const peerMemo = new Map();
+
 async function getCachedChatPeer(
     env,
     chatId
 ) {
+    const memoKey =
+        Number(chatId);
+
+    const memoized =
+        peerMemo.get(memoKey);
+
+    if (memoized) {
+        return memoized;
+    }
+
     if (!env.MTKRUTO_CACHE) {
         return null;
     }
@@ -396,7 +415,7 @@ async function getCachedChatPeer(
         return null;
     }
 
-    return {
+    const resolved = {
         chat:
             cached[0],
         accessHash:
@@ -404,6 +423,13 @@ async function getCachedChatPeer(
                 ? cached[1]
                 : BigInt(cached[1])
     };
+
+    peerMemo.set(
+        memoKey,
+        resolved
+    );
+
+    return resolved;
 }
 
 async function cacheChatPeer(
@@ -503,6 +529,33 @@ async function prepareChatPeer(
     /*
      * No persistent entry exists.
      *
+     * This client is brand new (one per request, and
+     * persistCache=false), so MTKruto currently knows
+     * no peers at all. For a channel/supergroup it
+     * cannot build an inputPeerChannel without the
+     * access hash, so calling getChat() directly here
+     * fails with PEER_ID_INVALID on a cold cache.
+     *
+     * Loading the dialog list is how that access hash
+     * is legitimately learned -- it populates MTKruto's
+     * in-memory peer map as a side effect. This is only
+     * reached on a cache MISS, so it costs one extra
+     * Telegram call per uncached chat, not per request.
+     */
+    try {
+        await client.getChats({
+            from: "main",
+            limit: 100
+        });
+    } catch (error) {
+        console.log(
+            "Dialog bootstrap failed:",
+            error?.message ||
+                String(error)
+        );
+    }
+
+    /*
      * Ask Telegram for the chat. This causes
      * MTKruto to obtain the peer/access hash.
      */
@@ -587,6 +640,24 @@ async function prepareChatPeer(
         env,
         numericId,
         peer
+    );
+
+    /*
+     * Memoize in-process too. Later requests on this
+     * isolate then short-circuit in getCachedChatPeer,
+     * so they issue neither a KV read nor a redundant
+     * write-check.
+     */
+    peerMemo.set(
+        numericId,
+        {
+            chat:
+                peer[0],
+            accessHash:
+                typeof peer[1] === "bigint"
+                    ? peer[1]
+                    : BigInt(peer[1])
+        }
     );
 
     return {

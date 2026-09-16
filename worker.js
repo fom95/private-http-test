@@ -1713,6 +1713,22 @@ async function handleDirectMediaRequest(
 
     const timings = {};
 
+    function addTimingHeader(
+        headers
+    ) {
+        headers[
+            "X-Media-Timing"
+        ] =
+            Object.entries(timings)
+                .map(
+                    ([key, value]) =>
+                        `${key}=${value}ms`
+                )
+                .join(", ");
+
+        return headers;
+    }
+
     const pathParts =
         url.pathname
             .split("/")
@@ -1919,16 +1935,8 @@ async function handleDirectMediaRequest(
                     Date.now() -
                     totalStart;
 
-                headers.set(
-                    "X-Media-Timing",
-                    Object.entries(
-                        timings
-                    )
-                        .map(
-                            ([key, value]) =>
-                                `${key}=${value}ms`
-                        )
-                        .join(", ")
+                addTimingHeader(
+                    headers
                 );
 
                 return new Response(null, {
@@ -1958,16 +1966,8 @@ async function handleDirectMediaRequest(
                 Date.now() -
                 totalStart;
 
-            headers.set(
-                "X-Media-Timing",
-                Object.entries(
-                    timings
-                )
-                    .map(
-                        ([key, value]) =>
-                            `${key}=${value}ms`
-                    )
-                    .join(", ")
+            addTimingHeader(
+                headers
             );
 
             return new Response(
@@ -1994,16 +1994,8 @@ async function handleDirectMediaRequest(
                     filename
                 });
 
-            headers.set(
-                "X-Media-Timing",
-                Object.entries(
-                    timings
-                )
-                    .map(
-                        ([key, value]) =>
-                            `${key}=${value}ms`
-                    )
-                    .join(", ")
+            addTimingHeader(
+                headers
             );
 
             return new Response(null, {
@@ -2038,16 +2030,8 @@ async function handleDirectMediaRequest(
                 filename
             });
 
-        headers.set(
-            "X-Media-Timing",
-            Object.entries(
-                timings
-            )
-                .map(
-                    ([key, value]) =>
-                        `${key}=${value}ms`
-                )
-                .join(", ")
+        addTimingHeader(
+            headers
         );
 
         return new Response(

@@ -282,6 +282,55 @@ class CloudflareKVStorage {
     }
 }
 
+// A warm Cloudflare isolate can serve many requests. Re-running
+// client.start() (session setup / MTProto handshake) on every single
+// request -- as the old createClient(env) call sites did -- is pure
+// waste of both CPU time and latency, and it's the main reason small
+// files (thumbnails etc.) still felt slow even after piece sizing was
+// fixed: a 20KB thumbnail doesn't need its own fresh session.
+//
+// getClient(env) lazily creates ONE client and reuses it for the
+// lifetime of the isolate. resetClient() is called only when a request
+// hits a real connection-level failure, so the next call rebuilds a
+// fresh session instead of a permanently broken one.
+let sharedClientPromise = null;
+
+async function getClient(env) {
+    if (!sharedClientPromise) {
+        sharedClientPromise =
+            createClient(env).catch(
+                error => {
+                    sharedClientPromise = null;
+                    throw error;
+                }
+            );
+    }
+
+    return sharedClientPromise;
+}
+
+function resetClient() {
+    sharedClientPromise = null;
+}
+
+function isConnectionError(error) {
+    const message =
+        String(
+            error?.message ||
+            error ||
+            ""
+        ).toLowerCase();
+
+    return (
+        message.includes("disconnect") ||
+        message.includes("connection") ||
+        message.includes("closed") ||
+        message.includes("socket") ||
+        message.includes("timeout") ||
+        message.includes("network")
+    );
+}
+
 async function createClient(env) {
     const apiId =
         Number(
@@ -953,17 +1002,21 @@ async function streamFullDownload(
     let bytes = 0;
     let telegramWait = 0;
     let processingTime = 0;
-    let disconnected = false;
+    let released = false;
 
+    // The client is now shared across requests (see getClient), so a
+    // finished/cancelled/errored stream must NOT disconnect it -- that
+    // would kill every other in-flight request on the isolate. Only
+    // release this stream's own download iterator.
     async function disconnect() {
-        if (disconnected) {
+        if (released) {
             return;
         }
 
-        disconnected = true;
+        released = true;
 
         try {
-            await client.disconnect();
+            await iterator.return?.();
         } catch {}
     }
 
@@ -1319,9 +1372,7 @@ async function streamRangeDownload(
                 }
             );
 
-            try {
-                await client.disconnect();
-            } catch {}
+            // Client is shared across requests -- do not disconnect it here.
         }
     });
 }
@@ -1532,7 +1583,8 @@ img {
 async function handleDirectMediaRequest(
     request,
     env,
-    url
+    url,
+    ctx
 ) {
     if (
         request.method !== "GET" &&
@@ -1544,6 +1596,31 @@ async function handleDirectMediaRequest(
                 Allow: "GET, HEAD"
             }
         });
+    }
+
+    // Thumbnails (?thumb=1) and small direct media requests hit this
+    // path, and they're deterministic by URL. Skip caching for Range
+    // requests (video seeking) to keep partial-content semantics simple
+    // and unambiguous -- but a plain GET, which is exactly how a
+    // thumbnail <img> tag requests it, can be served straight from
+    // Cloudflare's edge on repeat views without ever touching Telegram
+    // or spinning up a client.
+    const cacheable =
+        request.method === "GET" &&
+        !request.headers.get("Range");
+
+    const cache =
+        cacheable
+            ? caches.default
+            : null;
+
+    if (cache) {
+        const cached =
+            await cache.match(request);
+
+        if (cached) {
+            return cached;
+        }
     }
 
     const totalStart =
@@ -1609,7 +1686,7 @@ async function handleDirectMediaRequest(
         Date.now();
 
     const client =
-        await createClient(env);
+        await getClient(env);
 
     timings.createClient =
         Date.now() -
@@ -1872,17 +1949,29 @@ async function handleDirectMediaRequest(
             headers
         );
 
-        return new Response(
-            stream,
-            {
-                status: 200,
-                headers
-            }
-        );
+        const response =
+            new Response(
+                stream,
+                {
+                    status: 200,
+                    headers
+                }
+            );
+
+        if (cache) {
+            ctx.waitUntil(
+                cache.put(
+                    request,
+                    response.clone()
+                ).catch(() => {})
+            );
+        }
+
+        return response;
     } catch (error) {
-        try {
-            await client.disconnect();
-        } catch {}
+        if (isConnectionError(error)) {
+            resetClient();
+        }
 
         throw error;
     }
@@ -1891,7 +1980,8 @@ async function handleDirectMediaRequest(
 async function handlePieceRequest(
     request,
     env,
-    url
+    url,
+    ctx
 ) {
     if (
         request.method !== "GET" &&
@@ -1903,6 +1993,21 @@ async function handlePieceRequest(
                 Allow: "GET, HEAD"
             }
         });
+    }
+
+    // Piece URLs are content-addressed (fileId + fileSize + offset +
+    // length + mime, always serialized in the same order by fetchPiece),
+    // so they're safe to cache at Cloudflare's edge with the Cache API.
+    // A cache hit costs essentially no CPU and never touches Telegram --
+    // this is what makes repeat views of the same media (reloads, other
+    // viewers, retried requests) nearly free.
+    const cache = caches.default;
+
+    const cached =
+        await cache.match(request);
+
+    if (cached) {
+        return cached;
     }
 
     const requestStart =
@@ -2026,7 +2131,7 @@ async function handlePieceRequest(
         Date.now();
 
     const client =
-        await createClient(env);
+        await getClient(env);
 
     const clientTime =
         Date.now() -
@@ -2168,17 +2273,34 @@ async function handlePieceRequest(
         ] =
             String(output.length);
 
-        return new Response(
-            output,
-            {
-                status: 206,
-                headers
-            }
-        );
-    } finally {
-        try {
-            await client.disconnect();
-        } catch {}
+        const response =
+            new Response(
+                output,
+                {
+                    status: 206,
+                    headers
+                }
+            );
+
+        if (
+            ctx &&
+            request.method === "GET"
+        ) {
+            ctx.waitUntil(
+                cache.put(
+                    request,
+                    response.clone()
+                ).catch(() => {})
+            );
+        }
+
+        return response;
+    } catch (error) {
+        if (isConnectionError(error)) {
+            resetClient();
+        }
+
+        throw error;
     }
 }
 
@@ -2239,7 +2361,7 @@ async function handleApi(
             Date.now();
 
         const client =
-            await createClient(env);
+            await getClient(env);
 
         const clientTime =
             Date.now() -
@@ -2296,10 +2418,12 @@ async function handleApi(
                         };
                     })
             });
-        } finally {
-            try {
-                await client.disconnect();
-            } catch {}
+        } catch (error) {
+            if (isConnectionError(error)) {
+                resetClient();
+            }
+
+            throw error;
         }
     }
 
@@ -2323,7 +2447,7 @@ async function handleApi(
             Date.now();
     
         const client =
-            await createClient(env);
+            await getClient(env);
     
         const clientTime =
             Date.now() -
@@ -2376,10 +2500,12 @@ async function handleApi(
                         null
                 }
             });
-        } finally {
-            try {
-                await client.disconnect();
-            } catch {}
+        } catch (error) {
+            if (isConnectionError(error)) {
+                resetClient();
+            }
+
+            throw error;
         }
     }
 
@@ -2403,7 +2529,7 @@ async function handleApi(
             Date.now();
     
         const client =
-            await createClient(env);
+            await getClient(env);
     
         const clientTime =
             Date.now() -
@@ -2468,10 +2594,12 @@ async function handleApi(
                         })
                     )
             });
-        } finally {
-            try {
-                await client.disconnect();
-            } catch {}
+        } catch (error) {
+            if (isConnectionError(error)) {
+                resetClient();
+            }
+
+            throw error;
         }
     }
 
@@ -2495,7 +2623,7 @@ async function handleApi(
         }
 
         const client =
-            await createClient(env);
+            await getClient(env);
 
         try {
             return json({
@@ -2509,10 +2637,12 @@ async function handleApi(
                     )
                 )
             });
-        } finally {
-            try {
-                await client.disconnect(); 
-            } catch {}
+        } catch (error) {
+            if (isConnectionError(error)) {
+                resetClient();
+            }
+
+            throw error;
         }
     }
 
@@ -2536,7 +2666,7 @@ async function handleApi(
         }
 
         const client =
-            await createClient(env);
+            await getClient(env);
 
         try {
             const message =
@@ -2575,10 +2705,12 @@ async function handleApi(
                         )
                 }
             });
-        } finally {
-            try {
-                await client.disconnect();
-            } catch {}
+        } catch (error) {
+            if (isConnectionError(error)) {
+                resetClient();
+            }
+
+            throw error;
         }
     }
 
@@ -2602,7 +2734,7 @@ async function handleApi(
         }
 
         const client =
-            await createClient(env);
+            await getClient(env);
 
         try {
             const message =
@@ -2642,10 +2774,12 @@ async function handleApi(
                     null,
                 ...result
             });
-        } finally {
-            try {
-                await client.disconnect(); 
-            } catch {}
+        } catch (error) {
+            if (isConnectionError(error)) {
+                resetClient();
+            }
+
+            throw error;
         }
     }
 
@@ -4071,7 +4205,7 @@ loadChats().catch(
 }
 
 export default {
-    async fetch(request, env) {
+    async fetch(request, env, ctx) {
         const url =
             new URL(
                 request.url
@@ -4093,7 +4227,8 @@ export default {
                 return await handlePieceRequest(
                     request,
                     env,
-                    url
+                    url,
+                    ctx
                 );
             }
 
@@ -4117,7 +4252,8 @@ export default {
                 return await handleDirectMediaRequest(
                     request,
                     env,
-                    url
+                    url,
+                    ctx
                 );
             }
 
@@ -4140,7 +4276,8 @@ export default {
                 return await handleDirectMediaRequest(
                     request,
                     env,
-                    url
+                    url,
+                    ctx
                 );
             }
 

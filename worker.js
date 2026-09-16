@@ -5,6 +5,11 @@ const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 
 const CACHE_CONTROL = "public, max-age=31536000, immutable";
 
+// Files at or under this size are downloaded into memory and served as a
+// single buffer, which makes them safely cacheable (see
+// bufferFullDownload). Anything larger is streamed and not cached.
+const MAX_BUFFERED_SIZE = 2 * 1024 * 1024;
+
 function json(data, status = 200, extraHeaders = {}) {
     return new Response(JSON.stringify(data, null, 2), {
         status,
@@ -1007,6 +1012,72 @@ function createMediaHeaders({
     return headers;
 }
 
+// Download a whole (small) file into a single buffer.
+//
+// This exists specifically so thumbnails can be cached safely. Caching a
+// streaming response requires response.clone(), which tees the underlying
+// ReadableStream -- and a tee only advances as fast as its SLOWEST reader.
+// The cache-write side runs in waitUntil (background, deprioritized), so
+// the tee would stall, hold the shared Telegram client's download iterator
+// open, and eventually get force-cancelled at the waitUntil deadline. That
+// starves every other request queued behind the shared client.
+//
+// A fully-buffered body has no such coupling: cloning it is an instant
+// refcount, both readers are already-resolved data, and nothing holds the
+// Telegram connection open. Only use this for genuinely small files.
+async function bufferFullDownload(
+    client,
+    fileId,
+    signal
+) {
+    const chunks = [];
+    let total = 0;
+
+    const iterator =
+        client.download(fileId, {
+            chunkSize:
+                TELEGRAM_CHUNK_SIZE,
+            signal
+        });
+
+    try {
+        while (true) {
+            const result =
+                await iterator.next();
+
+            if (result.done) {
+                break;
+            }
+
+            const chunk =
+                result.value;
+
+            chunks.push(chunk);
+            total += chunk.length;
+        }
+    } finally {
+        try {
+            await iterator.return?.();
+        } catch {}
+    }
+
+    if (chunks.length === 1) {
+        return chunks[0];
+    }
+
+    const output =
+        new Uint8Array(total);
+
+    let position = 0;
+
+    for (const chunk of chunks) {
+        output.set(chunk, position);
+        position += chunk.length;
+    }
+
+    return output;
+}
+
 async function streamFullDownload(
     client,
     fileId,
@@ -1950,6 +2021,67 @@ async function handleDirectMediaRequest(
         const downloadStart =
             Date.now();
 
+        // Only fully buffer things that are actually small. Thumbnails
+        // always qualify; a 20MB photo must keep streaming so it never
+        // sits in the isolate's memory, and so the client starts
+        // receiving bytes immediately.
+        const bufferable =
+            cache &&
+            (
+                thumbnail ||
+                fileSize <=
+                    MAX_BUFFERED_SIZE
+            );
+
+        if (bufferable) {
+            const body =
+                await bufferFullDownload(
+                    client,
+                    fileId,
+                    request.signal
+                );
+
+            timings.download =
+                Date.now() -
+                downloadStart;
+
+            timings.total =
+                Date.now() -
+                totalStart;
+
+            const headers =
+                createMediaHeaders({
+                    mimeType,
+                    size:
+                        body.length,
+                    filename
+                });
+
+            addTimingHeader(
+                headers
+            );
+
+            const response =
+                new Response(
+                    body,
+                    {
+                        status: 200,
+                        headers
+                    }
+                );
+
+            // Safe: the body is an in-memory buffer, so clone() is
+            // instant and the cache write can't stall on the network.
+            safeCachePut(
+                ctx,
+                cache,
+                request,
+                response
+            );
+
+            return response;
+        }
+
         const stream =
             await streamFullDownload(
                 client,
@@ -1977,25 +2109,16 @@ async function handleDirectMediaRequest(
             headers
         );
 
-        const response =
-            new Response(
-                stream,
-                {
-                    status: 200,
-                    headers
-                }
-            );
-
-        if (cache) {
-            safeCachePut(
-                ctx,
-                cache,
-                request,
-                response
-            );
-        }
-
-        return response;
+        // Deliberately NOT cached: caching a stream requires clone(),
+        // which tees it, and the background cache reader would throttle
+        // the response the user is waiting on.
+        return new Response(
+            stream,
+            {
+                status: 200,
+                headers
+            }
+        );
     } catch (error) {
         if (isConnectionError(error)) {
             resetClient();

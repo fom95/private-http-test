@@ -1446,6 +1446,12 @@ async function handleImageViewer(
         );
     }
 
+    const mediaUrl =
+        "/media?chat=" +
+        encodeURIComponent(chat) +
+        "&message=" +
+        encodeURIComponent(message);
+
     const html = `<!DOCTYPE html>
 <html>
 <head>
@@ -1458,221 +1464,53 @@ html, body {
     height: 100%;
     background: #111;
 }
+
 body {
     display: flex;
     align-items: center;
     justify-content: center;
     overflow: auto;
 }
+
 img {
     max-width: 100%;
     max-height: 100%;
     object-fit: contain;
 }
+
 #status {
     color: #ccc;
     font-family: sans-serif;
-}
-.piece-timing {
-    padding: 4px 0;
-    font-size: 13px;
-    color: #aaa;
 }
 </style>
 </head>
 <body>
 <div id="status">Loading image...</div>
+
 <script>
 (async () => {
-    const chat =
-        ${JSON.stringify(chat)};
-
-    const message =
-        ${JSON.stringify(message)};
-
     const status =
         document.getElementById("status");
 
-    try {
-        const infoResponse =
-            await fetch(
-                "/api/media-info?chat=" +
-                encodeURIComponent(chat) +
-                "&message=" +
-                encodeURIComponent(message),
-                {
-                    cache: "force-cache"
-                }
-            );
+    const image =
+        document.createElement("img");
 
-        if (!infoResponse.ok) {
-            throw new Error(
-                "Media information request failed: HTTP " +
-                infoResponse.status
-            );
-        }
+    image.alt = "";
 
-        const info =
-            await infoResponse.json();
-
-        if (
-            !info.success ||
-            !info.fileId
-        ) {
-            throw new Error(
-                info.error ||
-                "This message has no supported media."
-            );
-        }
-
-        const fileSize =
-            Number(info.fileSize);
-
-        const mimeType =
-            info.mimeType ||
-            "application/octet-stream";
-
-        if (
-            !Number.isSafeInteger(fileSize) ||
-            fileSize <= 0
-        ) {
-            throw new Error(
-                "Invalid media size."
-            );
-        }
-
-        if (
-            !mimeType.startsWith("image/")
-        ) {
-            throw new Error(
-                "This viewer only supports images."
-            );
-        }
-
-        const alignment =
-            ${TELEGRAM_OFFSET_ALIGNMENT};
-
-        const partCount =
-            fileSize >= alignment * 4
-                ? 4
-                : 1;
-
-        const boundaries =
-            [0];
-
-        for (
-            let i = 1;
-            i < partCount;
-            i++
-        ) {
-            boundaries.push(
-                Math.floor(
-                    (
-                        fileSize *
-                        i /
-                        partCount
-                    ) /
-                    alignment
-                ) *
-                alignment
-            );
-        }
-
-        boundaries.push(
-            fileSize
-        );
-
-        async function fetchPart(index) {
-            const start =
-                boundaries[index];
-
-            const end =
-                boundaries[index + 1];
-
-            const params =
-                new URLSearchParams({
-                    fileId:
-                        info.fileId,
-                    fileSize:
-                        String(fileSize),
-                    mime:
-                        mimeType,
-                    offset:
-                        String(start),
-                    length:
-                        String(end - start)
-                });
-
-            const response =
-                await fetch(
-                    "/piece?" +
-                    params.toString(),
-                    {
-                        cache:
-                            "force-cache"
-                    }
-                );
-
-            if (!response.ok) {
-                throw new Error(
-                    "Image part " +
-                    (index + 1) +
-                    " failed: HTTP " +
-                    response.status
-                );
-            }
-
-            return await response.arrayBuffer();
-        }
-
-        status.textContent =
-            partCount === 4
-                ? "Downloading image in 4 parts..."
-                : "Downloading image...";
-
-        const parts =
-            await Promise.all(
-                Array.from(
-                    {
-                        length:
-                            partCount
-                    },
-                    (_, index) =>
-                        fetchPart(index)
-                )
-            );
-
-        const blob =
-            new Blob(
-                parts,
-                {
-                    type:
-                        mimeType
-                }
-            );
-
-        const image =
-            document.createElement(
-                "img"
-            );
-
-        image.src =
-            URL.createObjectURL(
-                blob
-            );
-
-        image.onload = () => {
-            status.remove();
-        };
-
+    image.onload = () => {
+        status.remove();
         document.body.appendChild(
             image
         );
-    } catch (error) {
+    };
+
+    image.onerror = () => {
         status.textContent =
-            error.message ||
-            String(error);
-    }
+            "Failed to load image.";
+    };
+
+    image.src =
+        ${JSON.stringify(mediaUrl)};
 })();
 </script>
 </body>
@@ -2987,7 +2825,7 @@ a {
 
 <script>
 const PIECE_SIZE = ${TELEGRAM_CHUNK_SIZE};
-const PIECE_CONCURRENCY = 4;
+const PIECE_CONCURRENCY = 5;
 
 const chatSelect =
     document.getElementById(
@@ -3479,8 +3317,8 @@ async function fetchImageParts(
         ${TELEGRAM_OFFSET_ALIGNMENT};
 
     const partCount =
-        fileSize >= alignment * 4
-            ? 4
+        fileSize >= alignment * 5
+            ? 5
             : 1;
 
     const boundaries =

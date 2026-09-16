@@ -287,35 +287,27 @@ class CloudflareKVStorage {
     }
 }
 
-// A warm Cloudflare isolate can serve many requests. Re-running
-// client.start() (session setup / MTProto handshake) on every single
-// request -- as the old createClient(env) call sites did -- is pure
-// waste of both CPU time and latency, and it's the main reason small
-// files (thumbnails etc.) still felt slow even after piece sizing was
-// fixed: a 20KB thumbnail doesn't need its own fresh session.
+// IMPORTANT: do NOT cache a Client at module scope.
 //
-// getClient(env) lazily creates ONE client and reuses it for the
-// lifetime of the isolate. resetClient() is called only when a request
-// hits a real connection-level failure, so the next call rebuilds a
-// fresh session instead of a permanently broken one.
-let sharedClientPromise = null;
-
+// Cloudflare Workers forbids using an I/O object (socket, stream, etc)
+// created during one request from a different request's handler:
+//
+//   "Cannot perform I/O on behalf of a different request. I/O objects
+//    ... created in the context of one request handler cannot be
+//    accessed from a different request's handler."
+//
+// An MTProto Client owns a live socket, so a module-scope shared client
+// works for exactly the first request that creates it and then throws on
+// every subsequent request that lands on the same warm isolate. The
+// throw happens immediately on first I/O, which is why those failures
+// show up as fast, detail-free 500s (tiny wallTime, tiny cpuTime).
+//
+// So: one client per request. The session-start cost is real, but it is
+// not optional here. The way to avoid paying it is to not reach this
+// code at all -- i.e. cache hits (see safeCachePut / cache.match), which
+// serve without ever constructing a client.
 async function getClient(env) {
-    if (!sharedClientPromise) {
-        sharedClientPromise =
-            createClient(env).catch(
-                error => {
-                    sharedClientPromise = null;
-                    throw error;
-                }
-            );
-    }
-
-    return sharedClientPromise;
-}
-
-function resetClient() {
-    sharedClientPromise = null;
+    return createClient(env);
 }
 
 // cache.put() can throw synchronously for a handful of reasons (a 206
@@ -340,24 +332,6 @@ function safeCachePut(ctx, cache, request, response) {
     } catch {
         // Ignore -- caching is never allowed to affect the real response.
     }
-}
-
-function isConnectionError(error) {
-    const message =
-        String(
-            error?.message ||
-            error ||
-            ""
-        ).toLowerCase();
-
-    return (
-        message.includes("disconnect") ||
-        message.includes("connection") ||
-        message.includes("closed") ||
-        message.includes("socket") ||
-        message.includes("timeout") ||
-        message.includes("network")
-    );
 }
 
 async function createClient(env) {
@@ -1099,10 +1073,9 @@ async function streamFullDownload(
     let processingTime = 0;
     let released = false;
 
-    // The client is now shared across requests (see getClient), so a
-    // finished/cancelled/errored stream must NOT disconnect it -- that
-    // would kill every other in-flight request on the isolate. Only
-    // release this stream's own download iterator.
+    // The client is created per-request (Cloudflare forbids sharing I/O
+    // objects across requests), so this stream owns it: when the stream
+    // finishes, is cancelled, or errors, tear the connection down.
     async function disconnect() {
         if (released) {
             return;
@@ -1112,6 +1085,10 @@ async function streamFullDownload(
 
         try {
             await iterator.return?.();
+        } catch {}
+
+        try {
+            await client.disconnect();
         } catch {}
     }
 
@@ -1467,7 +1444,10 @@ async function streamRangeDownload(
                 }
             );
 
-            // Client is shared across requests -- do not disconnect it here.
+            // Per-request client -- this stream owns it, so close it.
+            try {
+                await client.disconnect();
+            } catch {}
         }
     });
 }
@@ -2041,6 +2021,11 @@ async function handleDirectMediaRequest(
                     request.signal
                 );
 
+            // Fully buffered -- the connection is no longer needed.
+            try {
+                await client.disconnect();
+            } catch {}
+
             timings.download =
                 Date.now() -
                 downloadStart;
@@ -2120,9 +2105,12 @@ async function handleDirectMediaRequest(
             }
         );
     } catch (error) {
-        if (isConnectionError(error)) {
-            resetClient();
-        }
+        // We never got as far as handing a stream to the runtime, so
+        // nothing else will close this per-request client. (On the
+        // success paths the stream's own cancel/close handler does it.)
+        try {
+            await client.disconnect();
+        } catch {}
 
         throw error;
     }
@@ -2447,12 +2435,13 @@ async function handlePieceRequest(
         }
 
         return response;
-    } catch (error) {
-        if (isConnectionError(error)) {
-            resetClient();
-        }
-
-        throw error;
+    } finally {
+        // Per-request client: safe to tear down in finally here because
+        // `output` is already a fully-materialized buffer, so nothing is
+        // still reading from the connection.
+        try {
+            await client.disconnect();
+        } catch {}
     }
 }
 
@@ -2570,12 +2559,10 @@ async function handleApi(
                         };
                     })
             });
-        } catch (error) {
-            if (isConnectionError(error)) {
-                resetClient();
-            }
-
-            throw error;
+        } finally {
+            try {
+                await client.disconnect();
+            } catch {}
         }
     }
 
@@ -2652,12 +2639,10 @@ async function handleApi(
                         null
                 }
             });
-        } catch (error) {
-            if (isConnectionError(error)) {
-                resetClient();
-            }
-
-            throw error;
+        } finally {
+            try {
+                await client.disconnect();
+            } catch {}
         }
     }
 
@@ -2746,12 +2731,10 @@ async function handleApi(
                         })
                     )
             });
-        } catch (error) {
-            if (isConnectionError(error)) {
-                resetClient();
-            }
-
-            throw error;
+        } finally {
+            try {
+                await client.disconnect();
+            } catch {}
         }
     }
 
@@ -2789,12 +2772,10 @@ async function handleApi(
                     )
                 )
             });
-        } catch (error) {
-            if (isConnectionError(error)) {
-                resetClient();
-            }
-
-            throw error;
+        } finally {
+            try {
+                await client.disconnect();
+            } catch {}
         }
     }
 
@@ -2857,12 +2838,10 @@ async function handleApi(
                         )
                 }
             });
-        } catch (error) {
-            if (isConnectionError(error)) {
-                resetClient();
-            }
-
-            throw error;
+        } finally {
+            try {
+                await client.disconnect();
+            } catch {}
         }
     }
 
@@ -2926,12 +2905,10 @@ async function handleApi(
                     null,
                 ...result
             });
-        } catch (error) {
-            if (isConnectionError(error)) {
-                resetClient();
-            }
-
-            throw error;
+        } finally {
+            try {
+                await client.disconnect();
+            } catch {}
         }
     }
 
@@ -4440,6 +4417,28 @@ export default {
                 }
             );
         } catch (error) {
+            // Log the full error so it shows up in observability. Without
+            // this, a throw surfaces only as a bare 500 with no clue what
+            // failed -- which is exactly what made the shared-client bug
+            // so hard to pin down.
+            console.error(
+                "request failed:",
+                JSON.stringify({
+                    url: request.url,
+                    method: request.method,
+                    name:
+                        error?.name ||
+                        error?.constructor?.name ||
+                        "Error",
+                    message:
+                        error?.message ||
+                        String(error),
+                    stack:
+                        error?.stack ||
+                        null
+                })
+            );
+
             return json({
                 success: false,
                 error:

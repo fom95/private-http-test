@@ -644,17 +644,48 @@ async function getMessage(
         );
     }
 
+    const prepareStarted =
+        Date.now();
+
     await prepareChatPeer(
         client,
         env,
         numericChatId
     );
 
+    const prepareTime =
+        Date.now() -
+        prepareStarted;
+
+    const messageStarted =
+        Date.now();
+
     const message =
         await client.getMessage(
             numericChatId,
             numericMessageId
         );
+
+    const messageTime =
+        Date.now() -
+        messageStarted;
+
+    console.log(
+        "getMessage timing:",
+        JSON.stringify({
+            chatId:
+                numericChatId,
+            messageId:
+                numericMessageId,
+            prepareChatPeer:
+                prepareTime,
+            getMessage:
+                messageTime,
+            total:
+                prepareTime +
+                messageTime
+        })
+    );
 
     if (!message) {
         throw new Error(
@@ -915,6 +946,13 @@ async function streamFullDownload(
             signal
         });
 
+    const startedAt =
+        Date.now();
+
+    let chunks = 0;
+    let bytes = 0;
+    let telegramWait = 0;
+    let processingTime = 0;
     let disconnected = false;
 
     async function disconnect() {
@@ -929,28 +967,118 @@ async function streamFullDownload(
         } catch {}
     }
 
+    function report(
+        event,
+        extra = {}
+    ) {
+        console.log(
+            "media full download:",
+            JSON.stringify({
+                event,
+                fileId:
+                    String(fileId),
+                chunks,
+                bytes,
+                telegramWait,
+                processingTime,
+                elapsed:
+                    Date.now() -
+                    startedAt,
+                ...extra
+            })
+        );
+    }
+
     return new ReadableStream({
         async pull(controller) {
+            const pullStarted =
+                Date.now();
+
             try {
+                const telegramStarted =
+                    Date.now();
+
                 const result =
                     await iterator.next();
 
+                telegramWait +=
+                    Date.now() -
+                    telegramStarted;
+
                 if (result.done) {
                     controller.close();
+
+                    report("complete");
+
                     await disconnect();
                     return;
                 }
 
+                const processStarted =
+                    Date.now();
+
+                const value =
+                    result.value;
+
+                const valueBytes =
+                    value?.byteLength ??
+                    value?.length ??
+                    0;
+
+                chunks++;
+                bytes += valueBytes;
+
                 controller.enqueue(
-                    result.value
+                    value
                 );
+
+                processingTime +=
+                    Date.now() -
+                    processStarted;
+
+                if (
+                    chunks <= 3 ||
+                    chunks % 10 === 0
+                ) {
+                    report(
+                        "chunk",
+                        {
+                            chunk:
+                                chunks,
+                            chunkBytes:
+                                valueBytes,
+                            pullTime:
+                                Date.now() -
+                                pullStarted
+                        }
+                    );
+                }
             } catch (error) {
+                report(
+                    "error",
+                    {
+                        error:
+                            error?.message ||
+                            String(error)
+                    }
+                );
+
                 controller.error(error);
+
                 await disconnect();
             }
         },
 
-        async cancel() {
+        async cancel(reason) {
+            report(
+                "cancel",
+                {
+                    reason:
+                        reason?.message ||
+                        String(reason || "")
+                }
+            );
+
             try {
                 await iterator.return?.();
             } catch {}
@@ -978,12 +1106,53 @@ async function streamRangeDownload(
     let currentOffset =
         alignedStart;
 
+    const startedAt =
+        Date.now();
+
+    let chunks = 0;
+    let bytesReceived = 0;
+    let bytesSent = 0;
+    let telegramWait = 0;
+    let processingTime = 0;
+
+    function report(
+        event,
+        extra = {}
+    ) {
+        console.log(
+            "media range download:",
+            JSON.stringify({
+                event,
+                fileId:
+                    String(fileId),
+                requestedStart:
+                    start,
+                requestedEnd:
+                    end,
+                alignedStart,
+                currentOffset,
+                chunks,
+                bytesReceived,
+                bytesSent,
+                telegramWait,
+                processingTime,
+                elapsed:
+                    Date.now() -
+                    startedAt,
+                ...extra
+            })
+        );
+    }
+
     return new ReadableStream({
         async pull(controller) {
             if (
                 currentOffset > end
             ) {
                 controller.close();
+
+                report("complete");
+
                 return;
             }
 
@@ -999,6 +1168,9 @@ async function streamRangeDownload(
                         remaining
                     );
 
+                const telegramStarted =
+                    Date.now();
+
                 const bytes =
                     await client.downloadChunk(
                         fileId,
@@ -1011,6 +1183,10 @@ async function streamRangeDownload(
                         }
                     );
 
+                telegramWait +=
+                    Date.now() -
+                    telegramStarted;
+
                 if (
                     !bytes ||
                     bytes.length === 0
@@ -1021,6 +1197,9 @@ async function streamRangeDownload(
                         "."
                     );
                 }
+
+                const processStarted =
+                    Date.now();
 
                 const chunkStart =
                     currentOffset;
@@ -1055,16 +1234,54 @@ async function streamRangeDownload(
                         chunkStart +
                         1;
 
-                    controller.enqueue(
+                    const output =
                         bytes.slice(
                             sliceStart,
                             sliceEnd
-                        )
+                        );
+
+                    bytesSent +=
+                        output.length;
+
+                    controller.enqueue(
+                        output
                     );
                 }
 
+                bytesReceived +=
+                    bytes.length;
+
+                chunks++;
+
                 currentOffset =
                     chunkEnd + 1;
+
+                processingTime +=
+                    Date.now() -
+                    processStarted;
+
+                if (
+                    chunks <= 3 ||
+                    chunks % 10 === 0
+                ) {
+                    report(
+                        "chunk",
+                        {
+                            chunk:
+                                chunks,
+                            requestedBytes:
+                                requestSize,
+                            receivedBytes:
+                                bytes.length,
+                            offset:
+                                chunkStart,
+                            chunkEnd,
+                            chunkTime:
+                                Date.now() -
+                                processStarted
+                        }
+                    );
+                }
 
                 if (
                     currentOffset >
@@ -1073,15 +1290,35 @@ async function streamRangeDownload(
                     fileSize
                 ) {
                     controller.close();
+
+                    report("complete");
                 }
             } catch (error) {
+                report(
+                    "error",
+                    {
+                        error:
+                            error?.message ||
+                            String(error)
+                    }
+                );
+
                 controller.error(
                     error
                 );
             }
         },
 
-        async cancel() {
+        async cancel(reason) {
+            report(
+                "cancel",
+                {
+                    reason:
+                        reason?.message ||
+                        String(reason || "")
+                }
+            );
+
             try {
                 await client.disconnect();
             } catch {}
@@ -1471,6 +1708,11 @@ async function handleDirectMediaRequest(
         });
     }
 
+    const totalStart =
+        Date.now();
+
+    const timings = {};
+
     const pathParts =
         url.pathname
             .split("/")
@@ -1509,10 +1751,20 @@ async function handleDirectMediaRequest(
         }, 400);
     }
 
+    const clientStart =
+        Date.now();
+
     const client =
         await createClient(env);
 
+    timings.createClient =
+        Date.now() -
+        clientStart;
+
     try {
+        const messageStart =
+            Date.now();
+
         const message =
             await getMessage(
                 client,
@@ -1521,8 +1773,19 @@ async function handleDirectMediaRequest(
                 messageId
             );
 
+        timings.getMessage =
+            Date.now() -
+            messageStart;
+
+        const mediaStart =
+            Date.now();
+
         const media =
             getMessageMedia(message);
+
+        timings.getMedia =
+            Date.now() -
+            mediaStart;
 
         if (!media) {
             return json({
@@ -1549,10 +1812,17 @@ async function handleDirectMediaRequest(
             `telegram-${chatId}-${messageId}`;
 
         if (thumbnail) {
+            const thumbnailStart =
+                Date.now();
+
             const thumbnails =
                 getMediaThumbnails(
                     media
                 );
+
+            timings.getThumbnails =
+                Date.now() -
+                thumbnailStart;
 
             if (!thumbnails.length) {
                 return json({
@@ -1602,11 +1872,18 @@ async function handleDirectMediaRequest(
             );
 
         if (rangeHeader) {
+            const rangeStart =
+                Date.now();
+
             const range =
                 parseRange(
                     rangeHeader,
                     fileSize
                 );
+
+            timings.parseRange =
+                Date.now() -
+                rangeStart;
 
             if (!range) {
                 return new Response(null, {
@@ -1638,11 +1915,30 @@ async function handleDirectMediaRequest(
                 request.method ===
                 "HEAD"
             ) {
+                timings.total =
+                    Date.now() -
+                    totalStart;
+
+                headers.set(
+                    "X-Media-Timing",
+                    Object.entries(
+                        timings
+                    )
+                        .map(
+                            ([key, value]) =>
+                                `${key}=${value}ms`
+                        )
+                        .join(", ")
+                );
+
                 return new Response(null, {
                     status: 206,
                     headers
                 });
             }
+
+            const downloadStart =
+                Date.now();
 
             const stream =
                 await streamRangeDownload(
@@ -1653,6 +1949,26 @@ async function handleDirectMediaRequest(
                     range.end,
                     request.signal
                 );
+
+            timings.streamSetup =
+                Date.now() -
+                downloadStart;
+
+            timings.total =
+                Date.now() -
+                totalStart;
+
+            headers.set(
+                "X-Media-Timing",
+                Object.entries(
+                    timings
+                )
+                    .map(
+                        ([key, value]) =>
+                            `${key}=${value}ms`
+                    )
+                    .join(", ")
+            );
 
             return new Response(
                 stream,
@@ -1666,17 +1982,38 @@ async function handleDirectMediaRequest(
         if (
             request.method === "HEAD"
         ) {
+            timings.total =
+                Date.now() -
+                totalStart;
+
+            const headers =
+                createMediaHeaders({
+                    mimeType,
+                    size:
+                        fileSize,
+                    filename
+                });
+
+            headers.set(
+                "X-Media-Timing",
+                Object.entries(
+                    timings
+                )
+                    .map(
+                        ([key, value]) =>
+                            `${key}=${value}ms`
+                    )
+                    .join(", ")
+            );
+
             return new Response(null, {
                 status: 200,
-                headers:
-                    createMediaHeaders({
-                        mimeType,
-                        size:
-                            fileSize,
-                        filename
-                    })
+                headers
             });
         }
+
+        const downloadStart =
+            Date.now();
 
         const stream =
             await streamFullDownload(
@@ -1685,17 +2022,39 @@ async function handleDirectMediaRequest(
                 request.signal
             );
 
+        timings.streamSetup =
+            Date.now() -
+            downloadStart;
+
+        timings.total =
+            Date.now() -
+            totalStart;
+
+        const headers =
+            createMediaHeaders({
+                mimeType,
+                size:
+                    fileSize,
+                filename
+            });
+
+        headers.set(
+            "X-Media-Timing",
+            Object.entries(
+                timings
+            )
+                .map(
+                    ([key, value]) =>
+                        `${key}=${value}ms`
+                )
+                .join(", ")
+        );
+
         return new Response(
             stream,
             {
                 status: 200,
-                headers:
-                    createMediaHeaders({
-                        mimeType,
-                        size:
-                            fileSize,
-                        filename
-                    })
+                headers
             }
         );
     } catch (error) {

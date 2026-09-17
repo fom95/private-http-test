@@ -1,4 +1,5 @@
 import { Client } from "@mtkruto/mtkruto";
+import { DurableObject } from "cloudflare:workers";
 
 const TELEGRAM_CHUNK_SIZE = 256 * 1024;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
@@ -19,6 +20,29 @@ function json(data, status = 200, extraHeaders = {}) {
             ...extraHeaders
         }
     });
+}
+
+// String.fromCharCode(...bytes) can overflow the call stack on large
+// arrays, so build the string in chunks. Only used for thumbnail-sized
+// buffers (see MAX_BUFFERED_SIZE), so this is always small in practice.
+function bufferToBase64(bytes) {
+    const CHUNK = 8192;
+    let binary = "";
+
+    for (
+        let i = 0;
+        i < bytes.length;
+        i += CHUNK
+    ) {
+        binary += String.fromCharCode(
+            ...bytes.subarray(
+                i,
+                i + CHUNK
+            )
+        );
+    }
+
+    return btoa(binary);
 }
 
 class CloudflareKVStorage {
@@ -287,27 +311,26 @@ class CloudflareKVStorage {
     }
 }
 
-// IMPORTANT: do NOT cache a Client at module scope.
+// A single Durable Object instance holds the one persistent Telegram
+// client. This is the sanctioned way to keep an I/O object (a live
+// MTProto socket) alive across many requests on Cloudflare Workers: a
+// DO processes its own invocations sequentially, so it is exempt from
+// the "I/O objects can't cross requests" restriction that broke an
+// earlier attempt to do this with a module-scope client in the plain
+// Worker (see the DO class near the bottom of this file for the
+// explanation of that restriction and why a DO is different).
 //
-// Cloudflare Workers forbids using an I/O object (socket, stream, etc)
-// created during one request from a different request's handler:
-//
-//   "Cannot perform I/O on behalf of a different request. I/O objects
-//    ... created in the context of one request handler cannot be
-//    accessed from a different request's handler."
-//
-// An MTProto Client owns a live socket, so a module-scope shared client
-// works for exactly the first request that creates it and then throws on
-// every subsequent request that lands on the same warm isolate. The
-// throw happens immediately on first I/O, which is why those failures
-// show up as fast, detail-free 500s (tiny wallTime, tiny cpuTime).
-//
-// So: one client per request. The session-start cost is real, but it is
-// not optional here. The way to avoid paying it is to not reach this
-// code at all -- i.e. cache hits (see safeCachePut / cache.match), which
-// serve without ever constructing a client.
-async function getClient(env) {
-    return createClient(env);
+// One Telegram session (one authString) backs one Telegram account, and
+// MTProto multiplexes many calls over a single connection just fine, so
+// there's no benefit to sharding this by chat -- every shard would be
+// the same account anyway. Hence a single fixed instance name.
+function getConnectionStub(env) {
+    const id =
+        env.TELEGRAM_DO.idFromName(
+            "telegram-client"
+        );
+
+    return env.TELEGRAM_DO.get(id);
 }
 
 // cache.put() can throw synchronously for a handful of reasons (a 206
@@ -335,16 +358,21 @@ function safeCachePut(ctx, cache, request, response) {
 }
 
 async function createClient(env) {
+    // These were three sequential awaits; each is its own round trip to
+    // the Secrets Store, and this runs on every single request now, so
+    // running them concurrently is a small, free win on every request.
+    const [
+        apiIdRaw,
+        apiHash,
+        session
+    ] = await Promise.all([
+        env.API_ID.get(),
+        env.API_HASH.get(),
+        env.MTKRUTO_SESSION.get()
+    ]);
+
     const apiId =
-        Number(
-            await env.API_ID.get()
-        );
-
-    const apiHash =
-        await env.API_HASH.get();
-
-    const session =
-        await env.MTKRUTO_SESSION.get();
+        Number(apiIdRaw);
 
     if (!apiId || !apiHash || !session) {
         throw new Error(
@@ -529,18 +557,20 @@ async function prepareChatPeer(
     /*
      * No persistent entry exists.
      *
-     * This client is brand new (one per request, and
-     * persistCache=false), so MTKruto currently knows
-     * no peers at all. For a channel/supergroup it
-     * cannot build an inputPeerChannel without the
-     * access hash, so calling getChat() directly here
-     * fails with PEER_ID_INVALID on a cold cache.
+     * The client (owned by the Durable Object, persisting across many
+     * calls) knows no peers yet -- either this is its first-ever call,
+     * or it was just rebuilt after a reconnect (persistCache=false, so
+     * a rebuilt client starts cold too). For a channel/supergroup it
+     * cannot build an inputPeerChannel without the access hash, so
+     * calling getChat() directly here fails with PEER_ID_INVALID on a
+     * cold cache.
      *
-     * Loading the dialog list is how that access hash
-     * is legitimately learned -- it populates MTKruto's
-     * in-memory peer map as a side effect. This is only
-     * reached on a cache MISS, so it costs one extra
-     * Telegram call per uncached chat, not per request.
+     * Loading the dialog list is how that access hash is legitimately
+     * learned -- it populates MTKruto's in-memory peer map as a side
+     * effect. This is only reached on a cache MISS, so once this DO's
+     * client has resolved a chat, later calls for the SAME chat won't
+     * pay this cost again for the client's whole lifetime -- only a
+     * genuinely new chat, or a rebuilt client, does.
      */
     try {
         await client.getChats({
@@ -1072,8 +1102,7 @@ function createMediaHeaders({
 // Telegram connection open. Only use this for genuinely small files.
 async function bufferFullDownload(
     client,
-    fileId,
-    signal
+    fileId
 ) {
     const chunks = [];
     let total = 0;
@@ -1081,8 +1110,7 @@ async function bufferFullDownload(
     const iterator =
         client.download(fileId, {
             chunkSize:
-                TELEGRAM_CHUNK_SIZE,
-            signal
+                TELEGRAM_CHUNK_SIZE
         });
 
     try {
@@ -1126,13 +1154,12 @@ async function bufferFullDownload(
 async function streamFullDownload(
     client,
     fileId,
-    signal
+    onFatalError
 ) {
     const iterator =
         client.download(fileId, {
             chunkSize:
-                TELEGRAM_CHUNK_SIZE,
-            signal
+                TELEGRAM_CHUNK_SIZE
         });
 
     const startedAt =
@@ -1144,9 +1171,12 @@ async function streamFullDownload(
     let processingTime = 0;
     let released = false;
 
-    // The client is created per-request (Cloudflare forbids sharing I/O
-    // objects across requests), so this stream owns it: when the stream
-    // finishes, is cancelled, or errors, tear the connection down.
+    // The client now lives in the Durable Object and is reused across
+    // many streams over its lifetime, so a finished/cancelled/errored
+    // stream must NOT disconnect it -- only release this stream's own
+    // download iterator. RPC propagates cancellation of the returned
+    // ReadableStream back to this cancel() automatically, so there's no
+    // AbortSignal to thread through here.
     async function disconnect() {
         if (released) {
             return;
@@ -1156,10 +1186,6 @@ async function streamFullDownload(
 
         try {
             await iterator.return?.();
-        } catch {}
-
-        try {
-            await client.disconnect();
         } catch {}
     }
 
@@ -1262,6 +1288,8 @@ async function streamFullDownload(
                 controller.error(error);
 
                 await disconnect();
+
+                onFatalError?.(error);
             }
         },
 
@@ -1290,7 +1318,7 @@ async function streamRangeDownload(
     fileSize,
     start,
     end,
-    signal
+    onFatalError
 ) {
     const alignedStart =
         Math.floor(
@@ -1374,8 +1402,7 @@ async function streamRangeDownload(
                             offset:
                                 currentOffset,
                             chunkSize:
-                                requestSize,
-                            signal
+                                requestSize
                         }
                     );
 
@@ -1502,6 +1529,8 @@ async function streamRangeDownload(
                 controller.error(
                     error
                 );
+
+                onFatalError?.(error);
             }
         },
 
@@ -1515,10 +1544,8 @@ async function streamRangeDownload(
                 }
             );
 
-            // Per-request client -- this stream owns it, so close it.
-            try {
-                await client.disconnect();
-            } catch {}
+            // Client lives in the Durable Object and is reused across
+            // many streams -- nothing to close here.
         }
     });
 }
@@ -1832,239 +1859,149 @@ async function handleDirectMediaRequest(
         }, 400);
     }
 
-    const clientStart =
+    const stub =
+        getConnectionStub(env);
+
+    const infoStart =
         Date.now();
 
-    const client =
-        await getClient(env);
+    // One RPC call replaces getMessage + getMessageMedia + mime/name
+    // resolution -- getMediaInfo already returns exactly this shape
+    // (it's the same helper /api/media-info uses), so there's no
+    // separate "create a client, then ask it things" step here anymore.
+    const info =
+        await stub.getMediaInfo(
+            chatId,
+            messageId
+        );
 
-    timings.createClient =
+    timings.getMediaInfo =
         Date.now() -
-        clientStart;
+        infoStart;
 
-    try {
-        const messageStart =
-            Date.now();
+    if (!info.fileId) {
+        return json({
+            success: false,
+            error:
+                "Message does not contain supported media."
+        }, 404);
+    }
 
-        const message =
-            await getMessage(
-                client,
-                env,
-                chatId,
-                messageId
-            );
+    let fileId =
+        info.fileId;
 
-        timings.getMessage =
-            Date.now() -
-            messageStart;
+    let fileSize =
+        Number(info.fileSize);
 
-        const mediaStart =
-            Date.now();
+    let mimeType =
+        info.mimeType;
 
-        const media =
-            getMessageMedia(message);
+    let filename =
+        info.fileName ||
+        `telegram-${chatId}-${messageId}`;
 
-        timings.getMedia =
-            Date.now() -
-            mediaStart;
-
-        if (!media) {
+    if (thumbnail) {
+        if (!info.thumbnails.length) {
             return json({
                 success: false,
                 error:
-                    "Message does not contain supported media."
+                    "Media has no thumbnail."
             }, 404);
         }
 
-        let fileId =
-            media.fileId;
+        const selected =
+            info.thumbnails[
+                info.thumbnails.length - 1
+            ];
 
-        let fileSize =
-            Number(media.fileSize);
+        fileId =
+            selected.fileId;
 
-        let mimeType =
-            getMediaMimeType(
-                media,
-                message
+        fileSize =
+            Number(
+                selected.fileSize
             );
 
-        let filename =
-            media.fileName ||
-            `telegram-${chatId}-${messageId}`;
+        mimeType =
+            "image/jpeg";
 
-        if (thumbnail) {
-            const thumbnailStart =
-                Date.now();
+        filename +=
+            "-thumbnail.jpg";
+    }
 
-            const thumbnails =
-                getMediaThumbnails(
-                    media
-                );
+    if (
+        !fileId ||
+        !Number.isSafeInteger(
+            fileSize
+        ) ||
+        fileSize <= 0
+    ) {
+        return json({
+            success: false,
+            error:
+                "Media does not contain a downloadable file."
+        }, 500);
+    }
 
-            timings.getThumbnails =
-                Date.now() -
-                thumbnailStart;
+    const rangeHeader =
+        request.headers.get(
+            "Range"
+        );
 
-            if (!thumbnails.length) {
-                return json({
-                    success: false,
-                    error:
-                        "Media has no thumbnail."
-                }, 404);
-            }
+    if (rangeHeader) {
+        const rangeStart =
+            Date.now();
 
-            const selected =
-                thumbnails[
-                    thumbnails.length - 1
-                ];
-
-            fileId =
-                selected.fileId;
-
-            fileSize =
-                Number(
-                    selected.fileSize
-                );
-
-            mimeType =
-                "image/jpeg";
-
-            filename +=
-                "-thumbnail.jpg";
-        }
-
-        if (
-            !fileId ||
-            !Number.isSafeInteger(
+        const range =
+            parseRange(
+                rangeHeader,
                 fileSize
-            ) ||
-            fileSize <= 0
-        ) {
-            return json({
-                success: false,
-                error:
-                    "Media does not contain a downloadable file."
-            }, 500);
-        }
-
-        const rangeHeader =
-            request.headers.get(
-                "Range"
             );
 
-        if (rangeHeader) {
-            const rangeStart =
-                Date.now();
+        timings.parseRange =
+            Date.now() -
+            rangeStart;
 
-            const range =
-                parseRange(
-                    rangeHeader,
-                    fileSize
-                );
-
-            timings.parseRange =
-                Date.now() -
-                rangeStart;
-
-            if (!range) {
-                return new Response(null, {
-                    status: 416,
-                    headers: {
-                        "Content-Range":
-                            `bytes */${fileSize}`,
-                        "Accept-Ranges":
-                            "bytes",
-                        "Cache-Control":
-                            CACHE_CONTROL
-                    }
-                });
-            }
-
-            const headers =
-                createMediaHeaders({
-                    mimeType,
-                    size:
-                        fileSize,
-                    filename,
-                    start:
-                        range.start,
-                    end:
-                        range.end
-                });
-
-            if (
-                request.method ===
-                "HEAD"
-            ) {
-                timings.total =
-                    Date.now() -
-                    totalStart;
-
-                addTimingHeader(
-                    headers
-                );
-
-                return new Response(null, {
-                    status: 206,
-                    headers
-                });
-            }
-
-            const downloadStart =
-                Date.now();
-
-            const stream =
-                await streamRangeDownload(
-                    client,
-                    fileId,
-                    fileSize,
-                    range.start,
-                    range.end,
-                    request.signal
-                );
-
-            timings.streamSetup =
-                Date.now() -
-                downloadStart;
-
-            timings.total =
-                Date.now() -
-                totalStart;
-
-            addTimingHeader(
-                headers
-            );
-
-            return new Response(
-                stream,
-                {
-                    status: 206,
-                    headers
+        if (!range) {
+            return new Response(null, {
+                status: 416,
+                headers: {
+                    "Content-Range":
+                        `bytes */${fileSize}`,
+                    "Accept-Ranges":
+                        "bytes",
+                    "Cache-Control":
+                        CACHE_CONTROL
                 }
-            );
+            });
         }
+
+        const headers =
+            createMediaHeaders({
+                mimeType,
+                size:
+                    fileSize,
+                filename,
+                start:
+                    range.start,
+                end:
+                    range.end
+            });
 
         if (
-            request.method === "HEAD"
+            request.method ===
+            "HEAD"
         ) {
             timings.total =
                 Date.now() -
                 totalStart;
-
-            const headers =
-                createMediaHeaders({
-                    mimeType,
-                    size:
-                        fileSize,
-                    filename
-                });
 
             addTimingHeader(
                 headers
             );
 
             return new Response(null, {
-                status: 200,
+                status: 206,
                 headers
             });
         }
@@ -2072,83 +2009,38 @@ async function handleDirectMediaRequest(
         const downloadStart =
             Date.now();
 
-        // Only fully buffer things that are actually small. Thumbnails
-        // always qualify; a 20MB photo must keep streaming so it never
-        // sits in the isolate's memory, and so the client starts
-        // receiving bytes immediately.
-        const bufferable =
-            cache &&
-            (
-                thumbnail ||
-                fileSize <=
-                    MAX_BUFFERED_SIZE
-            );
-
-        if (bufferable) {
-            const body =
-                await bufferFullDownload(
-                    client,
-                    fileId,
-                    request.signal
-                );
-
-            // Fully buffered -- the connection is no longer needed.
-            try {
-                await client.disconnect();
-            } catch {}
-
-            timings.download =
-                Date.now() -
-                downloadStart;
-
-            timings.total =
-                Date.now() -
-                totalStart;
-
-            const headers =
-                createMediaHeaders({
-                    mimeType,
-                    size:
-                        body.length,
-                    filename
-                });
-
-            addTimingHeader(
-                headers
-            );
-
-            const response =
-                new Response(
-                    body,
-                    {
-                        status: 200,
-                        headers
-                    }
-                );
-
-            // Safe: the body is an in-memory buffer, so clone() is
-            // instant and the cache write can't stall on the network.
-            safeCachePut(
-                ctx,
-                cache,
-                request,
-                response
-            );
-
-            return response;
-        }
-
         const stream =
-            await streamFullDownload(
-                client,
+            await stub.downloadRangeStream(
                 fileId,
-                request.signal
+                fileSize,
+                range.start,
+                range.end
             );
 
         timings.streamSetup =
             Date.now() -
             downloadStart;
 
+        timings.total =
+            Date.now() -
+            totalStart;
+
+        addTimingHeader(
+            headers
+        );
+
+        return new Response(
+            stream,
+            {
+                status: 206,
+                headers
+            }
+        );
+    }
+
+    if (
+        request.method === "HEAD"
+    ) {
         timings.total =
             Date.now() -
             totalStart;
@@ -2165,26 +2057,109 @@ async function handleDirectMediaRequest(
             headers
         );
 
-        // Deliberately NOT cached: caching a stream requires clone(),
-        // which tees it, and the background cache reader would throttle
-        // the response the user is waiting on.
-        return new Response(
-            stream,
-            {
-                status: 200,
-                headers
-            }
-        );
-    } catch (error) {
-        // We never got as far as handing a stream to the runtime, so
-        // nothing else will close this per-request client. (On the
-        // success paths the stream's own cancel/close handler does it.)
-        try {
-            await client.disconnect();
-        } catch {}
-
-        throw error;
+        return new Response(null, {
+            status: 200,
+            headers
+        });
     }
+
+    const downloadStart =
+        Date.now();
+
+    // Only fully buffer things that are actually small. Thumbnails
+    // always qualify; a 20MB photo must keep streaming so it never
+    // sits in the isolate's memory, and so the client starts
+    // receiving bytes immediately.
+    const bufferable =
+        cache &&
+        (
+            thumbnail ||
+            fileSize <=
+                MAX_BUFFERED_SIZE
+        );
+
+    if (bufferable) {
+        const body =
+            await stub.downloadBuffer(
+                fileId
+            );
+
+        timings.download =
+            Date.now() -
+            downloadStart;
+
+        timings.total =
+            Date.now() -
+            totalStart;
+
+        const headers =
+            createMediaHeaders({
+                mimeType,
+                size:
+                    body.byteLength,
+                filename
+            });
+
+        addTimingHeader(
+            headers
+        );
+
+        const response =
+            new Response(
+                body,
+                {
+                    status: 200,
+                    headers
+                }
+            );
+
+        // Safe: the body is an in-memory buffer, so clone() is
+        // instant and the cache write can't stall on the network.
+        safeCachePut(
+            ctx,
+            cache,
+            request,
+            response
+        );
+
+        return response;
+    }
+
+    const stream =
+        await stub.downloadStream(
+            fileId
+        );
+
+    timings.streamSetup =
+        Date.now() -
+        downloadStart;
+
+    timings.total =
+        Date.now() -
+        totalStart;
+
+    const headers =
+        createMediaHeaders({
+            mimeType,
+            size:
+                fileSize,
+            filename
+        });
+
+    addTimingHeader(
+        headers
+    );
+
+    // Deliberately NOT cached: caching a stream requires clone(),
+    // which tees it, and the background cache reader would throttle
+    // the response the user is waiting on.
+    return new Response(
+        stream,
+        {
+            status: 200,
+            headers
+        }
+    );
 }
 
 async function handlePieceRequest(
@@ -2339,47 +2314,33 @@ async function handlePieceRequest(
         });
     }
 
-    const clientStart =
+    const stub =
+        getConnectionStub(env);
+
+    const downloadStart =
         Date.now();
 
-    const client =
-        await getClient(env);
+    const chunks = [];
+    let downloaded = 0;
+    let currentOffset = offset;
 
-    const clientTime =
-        Date.now() -
-        clientStart;
+    while (
+        downloaded <
+        actualLength
+    ) {
+        const requestLength =
+            Math.min(
+                TELEGRAM_CHUNK_SIZE,
+                actualLength -
+                    downloaded
+            );
 
-    try {
-        const downloadStart =
-            Date.now();
-
-        const chunks = [];
-        let downloaded = 0;
-        let currentOffset = offset;
-
-        while (
-            downloaded <
-            actualLength
-        ) {
-            const requestLength =
-                Math.min(
-                    TELEGRAM_CHUNK_SIZE,
-                    actualLength -
-                        downloaded
-                );
-
-            const bytes =
-                await client.downloadChunk(
-                    fileId,
-                    {
-                        offset:
-                            currentOffset,
-                        chunkSize:
-                            requestLength,
-                        signal:
-                            request.signal
-                    }
-                );
+        const bytes =
+            await stub.downloadChunk(
+                fileId,
+                currentOffset,
+                requestLength
+            );
 
             if (
                 !bytes ||
@@ -2461,11 +2422,6 @@ async function handlePieceRequest(
             `bytes ${offset}-${offset + output.length - 1}/${fileSize}`;
 
         headers[
-            "X-Timing-Create-Client"
-        ] =
-            `${clientTime} ms`;
-
-        headers[
             "X-Timing-Download"
         ] =
             `${downloadTime} ms`;
@@ -2485,49 +2441,39 @@ async function handlePieceRequest(
         ] =
             String(output.length);
 
-        const response =
-            new Response(
-                output,
-                {
-                    status: 200,
-                    headers
-                }
-            );
+    const response =
+        new Response(
+            output,
+            {
+                status: 200,
+                headers
+            }
+        );
 
-        if (
-            request.method === "GET"
-        ) {
-            safeCachePut(
-                ctx,
-                cache,
-                request,
-                response
-            );
-        }
-
-        return response;
-    } finally {
-        // Per-request client: safe to tear down in finally here because
-        // `output` is already a fully-materialized buffer, so nothing is
-        // still reading from the connection.
-        try {
-            await client.disconnect();
-        } catch {}
+    if (
+        request.method === "GET"
+    ) {
+        safeCachePut(
+            ctx,
+            cache,
+            request,
+            response
+        );
     }
+
+    return response;
 }
 
 async function testDownload(
     client,
-    fileId,
-    signal
+    fileId
 ) {
     const iterator =
         client.download(
             fileId,
             {
                 chunkSize:
-                    TELEGRAM_CHUNK_SIZE,
-                signal
+                    TELEGRAM_CHUNK_SIZE
             }
         );
 
@@ -2569,72 +2515,20 @@ async function handleApi(
         const start =
             Date.now();
 
-        const clientStart =
-            Date.now();
+        const stub =
+            getConnectionStub(env);
 
-        const client =
-            await getClient(env);
+        const chats =
+            await stub.getChats();
 
-        const clientTime =
-            Date.now() -
-            clientStart;
-
-        try {
-            const chatsStart =
-                Date.now();
-
-            const chats =
-                await client.getChats({
-                    from: "main",
-                    limit: 100
-                });
-
-            const chatsTime =
-                Date.now() -
-                chatsStart;
-
-            return json({
-                success: true,
-                timings: {
-                    createClient:
-                        `${clientTime} ms`,
-                    getChats:
-                        `${chatsTime} ms`,
-                    total:
-                        `${Date.now() - start} ms`
-                },
-                chats:
-                    chats.map(item => {
-                        const chat =
-                            item.chat;
-
-                        return {
-                            id:
-                                chat?.id ??
-                                null,
-                            title:
-                                chat?.title ??
-                                null,
-                            firstName:
-                                chat?.firstName ??
-                                null,
-                            lastName:
-                                chat?.lastName ??
-                                null,
-                            type:
-                                chat?.type ??
-                                null,
-                            username:
-                                chat?.username ??
-                                null
-                        };
-                    })
-            });
-        } finally {
-            try {
-                await client.disconnect();
-            } catch {}
-        }
+        return json({
+            success: true,
+            timings: {
+                total:
+                    `${Date.now() - start} ms`
+            },
+            chats
+        });
     }
 
     if (path === "/api/chat") {
@@ -2642,79 +2536,35 @@ async function handleApi(
             url.searchParams.get(
                 "chat"
             );
-    
+
         if (!chatId) {
             return json({
                 success: false,
                 error: "Missing chat."
             }, 400);
         }
-    
+
         const start =
             Date.now();
-    
-        const clientStart =
-            Date.now();
-    
-        const client =
-            await getClient(env);
-    
-        const clientTime =
-            Date.now() -
-            clientStart;
-    
-        try {
-            const chatStart =
-                Date.now();
-    
-            const chat =
-                await getChatForId(
-                    client,
-                    env,
-                    chatId
-                );
-    
-            const chatTime =
-                Date.now() -
-                chatStart;
-    
-            return json({
-                success: true,
-    
-                timings: {
-                    createClient:
-                        `${clientTime} ms`,
-                    getChat:
-                        `${chatTime} ms`,
-                    total:
-                        `${Date.now() - start} ms`
-                },
-    
-                chat: {
-                    id:
-                        chat.id,
-                    title:
-                        chat.title ??
-                        null,
-                    firstName:
-                        chat.firstName ??
-                        null,
-                    lastName:
-                        chat.lastName ??
-                        null,
-                    type:
-                        chat.type ??
-                        null,
-                    username:
-                        chat.username ??
-                        null
-                }
-            });
-        } finally {
-            try {
-                await client.disconnect();
-            } catch {}
-        }
+
+        const stub =
+            getConnectionStub(env);
+
+        const chat =
+            await stub.getChat(
+                chatId
+            );
+
+        return json({
+            success: true,
+
+            timings: {
+                total:
+                    `${Date.now() - start} ms`
+            },
+
+            chat
+        });
     }
 
     if (path === "/api/messages") {
@@ -2732,81 +2582,159 @@ async function handleApi(
     
         const start =
             Date.now();
-    
-        const clientStart =
-            Date.now();
-    
-        const client =
-            await getClient(env);
-    
-        const clientTime =
-            Date.now() -
-            clientStart;
-    
-        try {
-            const historyStart =
-                Date.now();
-    
-            const messages =
-                await getMessages(
-                    client,
-                    env,
-                    chatId
-                );
-    
-            const historyTime =
-                Date.now() -
-                historyStart;
-    
+
+        const stub =
+            getConnectionStub(env);
+
+        const messages =
+            await stub.getMessages(
+                chatId
+            );
+
+        return json({
+            success: true,
+
+            timings: {
+                total:
+                    `${Date.now() - start} ms`
+            },
+
+            chatId:
+                Number(chatId),
+
+            messages
+        });
+    }
+
+    // Batch thumbnails into one request.
+    //
+    // Each thumbnail loaded individually via /media?thumb=1 pays a full
+    // client.start() (a real MTProto round trip, not CPU) on its own.
+    // That's the ~750-1200ms cold-load latency: it's dominated by
+    // network round trips to Telegram, one full set of which happens
+    // per request, not by bytes transferred (thumbnails are tiny).
+    //
+    // This is the practical equivalent of a sprite sheet: instead of N
+    // separate "sheets" (requests) each paying setup cost once, load one
+    // sheet's worth of thumbnails together. Rather than stitching pixels
+    // into one image (which would mean decoding and re-encoding JPEGs --
+    // real CPU work this endpoint doesn't need), it returns each
+    // thumbnail as its own small buffer in one JSON response. Same
+    // latency win, none of the image-processing complexity or CPU cost.
+    if (path === "/api/thumbnails") {
+        const chatId =
+            url.searchParams.get(
+                "chat"
+            );
+
+        const messagesParam =
+            url.searchParams.get(
+                "messages"
+            );
+
+        if (!chatId || !messagesParam) {
             return json({
-                success: true,
-    
-                timings: {
-                    createClient:
-                        `${clientTime} ms`,
-                    getHistory:
-                        `${historyTime} ms`,
-                    total:
-                        `${Date.now() - start} ms`
-                },
-    
-                chatId:
-                    Number(chatId),
-    
-                messages:
-                    messages.map(
-                        message => ({
-                            id:
-                                message.id,
-                            date:
-                                message.date ??
-                                null,
-                            type:
-                                message.type ??
-                                null,
-                            text:
-                                message.text ??
-                                "",
-                            caption:
-                                message.caption ??
-                                "",
-                            senderId:
-                                message.sender?.id ??
-                                null,
-                            hasMedia:
-                                Boolean(
-                                    getMessageMedia(
-                                        message
-                                    )
-                                )
-                        })
-                    )
-            });
-        } finally {
-            try {
-                await client.disconnect();
-            } catch {}
+                success: false,
+                error:
+                    "Missing chat or messages."
+            }, 400);
         }
+
+        const messageIds =
+            messagesParam
+                .split(",")
+                .map(part =>
+                    Number(part.trim())
+                )
+                .filter(id =>
+                    Number.isSafeInteger(id) &&
+                    id > 0
+                );
+
+        const MAX_BATCH = 60;
+
+        if (!messageIds.length) {
+            return json({
+                success: false,
+                error:
+                    "No valid message IDs."
+            }, 400);
+        }
+
+        if (
+            messageIds.length >
+            MAX_BATCH
+        ) {
+            return json({
+                success: false,
+                error:
+                    `Too many messages requested (max ${MAX_BATCH}).`
+            }, 400);
+        }
+
+        const start =
+            Date.now();
+
+        const stub =
+            getConnectionStub(env);
+
+        const thumbnails = {};
+
+        for (
+            const messageId of messageIds
+        ) {
+            try {
+                const buffer =
+                    await stub.getThumbnailBuffer(
+                        chatId,
+                        messageId
+                    );
+
+                if (!buffer) {
+                    thumbnails[
+                        messageId
+                    ] = null;
+
+                    continue;
+                }
+
+                thumbnails[
+                    messageId
+                ] = {
+                    mimeType:
+                        "image/jpeg",
+                    dataUrl:
+                        "data:image/jpeg;base64," +
+                        bufferToBase64(
+                            buffer
+                        )
+                };
+            } catch (error) {
+                // One bad message must not fail the whole batch.
+                console.log(
+                    "Batch thumbnail failed:",
+                    messageId,
+                    error?.message ||
+                        String(error)
+                );
+
+                thumbnails[
+                    messageId
+                ] = null;
+            }
+        }
+
+        return json({
+            success: true,
+            timings: {
+                total:
+                    `${Date.now() - start} ms`
+            },
+            thumbnails
+        }, 200, {
+            "Cache-Control":
+                CACHE_CONTROL
+        });
     }
 
     if (path === "/api/media-info") {
@@ -2828,26 +2756,18 @@ async function handleApi(
             }, 400);
         }
 
-        const client =
-            await getClient(env);
+        const stub =
+            getConnectionStub(env);
 
-        try {
-            return json({
-                success: true,
-                ...(
-                    await getMessageMediaInfo(
-                        client,
-                        env,
-                        chatId,
-                        messageId
-                    )
+        return json({
+            success: true,
+            ...(
+                await stub.getMediaInfo(
+                    chatId,
+                    messageId
                 )
-            });
-        } finally {
-            try {
-                await client.disconnect();
-            } catch {}
-        }
+            )
+        });
     }
 
     if (path === "/api/message") {
@@ -2869,51 +2789,19 @@ async function handleApi(
             }, 400);
         }
 
-        const client =
-            await getClient(env);
+        const stub =
+            getConnectionStub(env);
 
-        try {
-            const message =
-                await getMessage(
-                    client,
-                    chatId,
-                    messageId
-                );
+        const message =
+            await stub.getMessageDetail(
+                chatId,
+                messageId
+            );
 
-            return json({
-                success: true,
-                message: {
-                    id:
-                        message.id,
-                    date:
-                        message.date ??
-                        null,
-                    type:
-                        message.type ??
-                        null,
-                    text:
-                        message.text ??
-                        "",
-                    caption:
-                        message.caption ??
-                        "",
-                    senderId:
-                        message.sender?.id ??
-                        null,
-                    media:
-                        await getMessageMediaInfo(
-                            client,
-                            env,
-                            chatId,
-                            messageId
-                        )
-                }
-            });
-        } finally {
-            try {
-                await client.disconnect();
-            } catch {}
-        }
+        return json({
+            success: true,
+            message
+        });
     }
 
     if (path === "/api/test-download") {
@@ -2935,52 +2823,27 @@ async function handleApi(
             }, 400);
         }
 
-        const client =
-            await getClient(env);
+        const stub =
+            getConnectionStub(env);
 
-        try {
-            const message =
-                await getMessage(
-                    client,
-                    env,
-                    chatId,
-                    messageId
-                );
+        const result =
+            await stub.runTestDownload(
+                chatId,
+                messageId
+            );
 
-            const media =
-                getMessageMedia(
-                    message
-                );
-
-            if (!media?.fileId) {
-                return json({
-                    success: false,
-                    error:
-                        "Message has no downloadable media."
-                }, 404);
-            }
-
-            const result =
-                await testDownload(
-                    client,
-                    media.fileId,
-                    request.signal
-                );
-
+        if (!result) {
             return json({
-                success: true,
-                fileId:
-                    media.fileId,
-                fileSize:
-                    media.fileSize ??
-                    null,
-                ...result
-            });
-        } finally {
-            try {
-                await client.disconnect();
-            } catch {}
+                success: false,
+                error:
+                    "Message has no downloadable media."
+            }, 404);
         }
+
+        return json({
+            success: true,
+            ...result
+        });
     }
 
     return json({
@@ -4402,6 +4265,426 @@ loadChats().catch(
                 "no-store"
         }
     });
+}
+
+function looksLikeConnectionError(error) {
+    const message =
+        String(
+            error?.message ||
+            error ||
+            ""
+        ).toLowerCase();
+
+    return (
+        message.includes("disconnect") ||
+        message.includes("connection") ||
+        message.includes("closed") ||
+        message.includes("socket") ||
+        message.includes("timeout") ||
+        message.includes("network")
+    );
+}
+
+// The one persistent Telegram client.
+//
+// A Durable Object instance processes its own invocations sequentially,
+// which is why it's exempt from the restriction that broke an earlier
+// attempt to share a client via a module-scope variable in the plain
+// Worker: Cloudflare Workers forbids using an I/O object (a socket, a
+// stream, etc) created during one request from a different request's
+// handler ("Cannot perform I/O on behalf of a different request..."),
+// but that restriction is about isolate-shared globals across
+// concurrent, independent requests -- not about a DO's own sequential
+// access to its own state. Holding a live connection across calls here
+// is the same sanctioned pattern hibernatable WebSockets and persistent
+// DB connections use.
+//
+// Every public method here becomes an RPC method callable from the
+// Worker via a DurableObjectStub. RPC return values must be structured-
+// cloneable (plus bigint/Date/ArrayBuffer/typed-arrays/Error/Blob/
+// ReadableStream -- see Cloudflare's RPC docs), and MTKruto's `message`/
+// `chat`/`media` objects are class instances, not plain objects (note
+// `media.constructor?.name` elsewhere in this file), so none of those
+// raw objects are returned directly. Every method here maps its result
+// into a plain, JSON-shaped object first -- the same shapes this file
+// already built for its JSON API responses -- before returning it.
+// `downloadStream`/`downloadRangeStream` are the one exception: they
+// return a ReadableStream directly, which RPC explicitly supports with
+// automatic flow control (including cancellation propagating back to
+// this side when the Worker's response stream is cancelled).
+export class TelegramConnectionDO extends DurableObject {
+    #client = null;
+    #clientPromise = null;
+
+    async #ensureClient() {
+        if (!this.#clientPromise) {
+            this.#clientPromise =
+                createClient(this.env)
+                    .then(client => {
+                        this.#client = client;
+                        return client;
+                    })
+                    .catch(error => {
+                        this.#clientPromise = null;
+                        this.#client = null;
+                        throw error;
+                    });
+        }
+
+        return this.#clientPromise;
+    }
+
+    // Used both when an RPC method's own call throws, and as the
+    // onFatalError callback the streaming helpers invoke from inside a
+    // ReadableStream's pull() -- i.e. after the client was already
+    // handed out. Either way this only affects the NEXT caller; it
+    // can't undo the failure the current caller already sees.
+    #discardClientOnConnectionError(error) {
+        if (looksLikeConnectionError(error)) {
+            this.#client = null;
+            this.#clientPromise = null;
+        }
+    }
+
+    async #withClient(fn) {
+        const client =
+            await this.#ensureClient();
+
+        try {
+            return await fn(client);
+        } catch (error) {
+            this.#discardClientOnConnectionError(
+                error
+            );
+
+            throw error;
+        }
+    }
+
+    async getChats() {
+        return this.#withClient(
+            async client => {
+                const chats =
+                    await client.getChats({
+                        from: "main",
+                        limit: 100
+                    });
+
+                return chats.map(
+                    item => {
+                        const chat =
+                            item.chat;
+
+                        return {
+                            id:
+                                chat?.id ??
+                                null,
+                            title:
+                                chat?.title ??
+                                null,
+                            firstName:
+                                chat?.firstName ??
+                                null,
+                            lastName:
+                                chat?.lastName ??
+                                null,
+                            type:
+                                chat?.type ??
+                                null,
+                            username:
+                                chat?.username ??
+                                null
+                        };
+                    }
+                );
+            }
+        );
+    }
+
+    async getChat(chatId) {
+        return this.#withClient(
+            async client => {
+                const chat =
+                    await getChatForId(
+                        client,
+                        this.env,
+                        chatId
+                    );
+
+                return {
+                    id:
+                        chat.id,
+                    title:
+                        chat.title ??
+                        null,
+                    firstName:
+                        chat.firstName ??
+                        null,
+                    lastName:
+                        chat.lastName ??
+                        null,
+                    type:
+                        chat.type ??
+                        null,
+                    username:
+                        chat.username ??
+                        null
+                };
+            }
+        );
+    }
+
+    async getMessages(chatId) {
+        return this.#withClient(
+            async client => {
+                const messages =
+                    await getMessages(
+                        client,
+                        this.env,
+                        chatId
+                    );
+
+                return messages.map(
+                    message => ({
+                        id:
+                            message.id,
+                        date:
+                            message.date ??
+                            null,
+                        type:
+                            message.type ??
+                            null,
+                        text:
+                            message.text ??
+                            "",
+                        caption:
+                            message.caption ??
+                            "",
+                        senderId:
+                            message.sender?.id ??
+                            null,
+                        hasMedia:
+                            Boolean(
+                                getMessageMedia(
+                                    message
+                                )
+                            )
+                    })
+                );
+            }
+        );
+    }
+
+    async getMessageDetail(
+        chatId,
+        messageId
+    ) {
+        return this.#withClient(
+            async client => {
+                const message =
+                    await getMessage(
+                        client,
+                        this.env,
+                        chatId,
+                        messageId
+                    );
+
+                const media =
+                    await getMessageMediaInfo(
+                        client,
+                        this.env,
+                        chatId,
+                        messageId,
+                        message
+                    );
+
+                return {
+                    id:
+                        message.id,
+                    date:
+                        message.date ??
+                        null,
+                    type:
+                        message.type ??
+                        null,
+                    text:
+                        message.text ??
+                        "",
+                    caption:
+                        message.caption ??
+                        "",
+                    senderId:
+                        message.sender?.id ??
+                        null,
+                    media
+                };
+            }
+        );
+    }
+
+    async getMediaInfo(
+        chatId,
+        messageId
+    ) {
+        return this.#withClient(
+            client =>
+                getMessageMediaInfo(
+                    client,
+                    this.env,
+                    chatId,
+                    messageId
+                )
+        );
+    }
+
+    async runTestDownload(
+        chatId,
+        messageId
+    ) {
+        return this.#withClient(
+            async client => {
+                const message =
+                    await getMessage(
+                        client,
+                        this.env,
+                        chatId,
+                        messageId
+                    );
+
+                const media =
+                    getMessageMedia(
+                        message
+                    );
+
+                if (!media?.fileId) {
+                    return null;
+                }
+
+                const result =
+                    await testDownload(
+                        client,
+                        media.fileId
+                    );
+
+                return {
+                    fileId:
+                        media.fileId,
+                    fileSize:
+                        media.fileSize ??
+                        null,
+                    ...result
+                };
+            }
+        );
+    }
+
+    // Used by /api/thumbnails: getMessage + pick-a-thumbnail + download,
+    // all as one RPC call so a batch of N messages costs N stub calls
+    // (cheap, local) rather than N round trips each needing its own
+    // getMediaInfo-then-downloadBuffer pair.
+    async getThumbnailBuffer(
+        chatId,
+        messageId
+    ) {
+        return this.#withClient(
+            async client => {
+                const message =
+                    await getMessage(
+                        client,
+                        this.env,
+                        chatId,
+                        messageId
+                    );
+
+                const media =
+                    getMessageMedia(
+                        message
+                    );
+
+                const thumbs =
+                    getMediaThumbnails(
+                        media
+                    );
+
+                if (!thumbs.length) {
+                    return null;
+                }
+
+                const selected =
+                    thumbs[
+                        thumbs.length - 1
+                    ];
+
+                return bufferFullDownload(
+                    client,
+                    selected.fileId
+                );
+            }
+        );
+    }
+
+    async downloadBuffer(fileId) {
+        return this.#withClient(
+            client =>
+                bufferFullDownload(
+                    client,
+                    fileId
+                )
+        );
+    }
+
+    async downloadChunk(
+        fileId,
+        offset,
+        chunkSize
+    ) {
+        return this.#withClient(
+            client =>
+                client.downloadChunk(
+                    fileId,
+                    {
+                        offset,
+                        chunkSize
+                    }
+                )
+        );
+    }
+
+    async downloadStream(fileId) {
+        const client =
+            await this.#ensureClient();
+
+        return streamFullDownload(
+            client,
+            fileId,
+            error =>
+                this.#discardClientOnConnectionError(
+                    error
+                )
+        );
+    }
+
+    async downloadRangeStream(
+        fileId,
+        fileSize,
+        start,
+        end
+    ) {
+        const client =
+            await this.#ensureClient();
+
+        return streamRangeDownload(
+            client,
+            fileId,
+            fileSize,
+            start,
+            end,
+            error =>
+                this.#discardClientOnConnectionError(
+                    error
+                )
+        );
+    }
 }
 
 export default {

@@ -36,9 +36,22 @@
     "logs": {
       "enabled": true,
       "invocation_logs": true
-    },
-    "traces": {
-      "enabled": false
     }
-  }
+  },
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "TELEGRAM_DO",
+        "class_name": "TelegramConnectionDO"
+      }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["TelegramConnectionDO"]
+    }
+  ]
 }

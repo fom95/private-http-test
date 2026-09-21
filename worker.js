@@ -1063,7 +1063,7 @@ function parseRange(rangeHeader, size) {
     };
 }
 
-function createMediaHeaders({
+function createMedia({
     mimeType,
     size,
     filename,
@@ -1074,6 +1074,7 @@ function createMediaHeaders({
         "Content-Type": mimeType || "application/octet-stream",
         "Accept-Ranges": "bytes",
         "Cache-Control": CACHE_CONTROL,
+        "Access-Control-Allow-Origin": "*",
         "Content-Disposition": `inline; filename="${String(filename || "media").replace(/["\\]/g, "_")}"`
     };
 
@@ -2302,7 +2303,9 @@ async function handlePieceRequest(
         "Cache-Control":
             CACHE_CONTROL,
         "Accept-Ranges":
-            "bytes"
+            "bytes",
+        "Access-Control-Allow-Origin":
+            "*"
     };
 
     if (

@@ -1063,7 +1063,7 @@ function parseRange(rangeHeader, size) {
     };
 }
 
-function createMedia({
+function createMediaHeaders({
     mimeType,
     size,
     filename,

@@ -2527,6 +2527,42 @@ async function handleDirectMediaRequest(
                 chatId,
                 messageId
             );
+        console.log(
+    "multipart resolution:",
+    JSON.stringify({
+        chatId,
+        messageId,
+        fileName:
+            info.fileName,
+        multipart:
+            Boolean(multipartInfo),
+        originalName:
+            multipartInfo?.originalName ??
+            null,
+        totalParts:
+            multipartInfo?.totalParts ??
+            null,
+        fileSize:
+            multipartInfo?.fileSize ??
+            null,
+        parts:
+            multipartInfo?.parts?.map(
+                part => ({
+                    messageId:
+                        part.messageId,
+                    part:
+                        part.part,
+                    total:
+                        part.total,
+                    fileName:
+                        part.fileName,
+                    fileSize:
+                        part.fileSize
+                })
+            ) ??
+            null
+    })
+);
 
         timings.multipartResolve =
             Date.now() -

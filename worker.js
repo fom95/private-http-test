@@ -4860,12 +4860,12 @@ async function selectMessage(
             selectedMessageId
         )
     );
-    <!--
+    /*
     await loadMedia(
         selectedChatId,
         selectedMessageId
     );
-    -->
+    */
 }
 
 chatSelect.addEventListener(

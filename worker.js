@@ -1710,36 +1710,6 @@ async function streamRangeDownload(
                         }
                     );
 
-                if (
-    currentOffset ===
-    0
-) {
-    console.log(
-        "multipart first chunk:",
-        JSON.stringify({
-            part:
-                currentPart.part,
-            fileId:
-                currentPart.fileId,
-            requestedStart:
-                start,
-            requestedEnd:
-                end,
-            chunkLength:
-                bytes?.length,
-            firstBytes:
-                bytes ?
-                    Array.from(
-                        bytes.slice(
-                            0,
-                            16
-                        )
-                    ) :
-                    null
-        })
-    );
-}
-
                 telegramWait +=
                     Date.now() -
                     telegramStarted;
@@ -1971,52 +1941,57 @@ async function streamMultipartRangeDownload(
                     currentReader =
                         stream.getReader();
 
-                    const result =
-                        await currentReader.read();
+                    while (true) {
+                        if (cancelled) {
+                            return;
+                        }
 
-                    if (result.done) {
-                        try {
-                            await currentReader.cancel();
-                        } catch {}
+                        const result =
+                            await currentReader.read();
 
-                        currentReader =
-                            null;
+                        if (result.done) {
+                            break;
+                        }
 
-                        globalOffset +=
-                            localEnd -
-                            localStart +
-                            1;
-
-                        partIndex++;
-
-                        localStart = 0;
-
-                        continue;
+                        controller.enqueue(
+                            result.value
+                        );
                     }
 
-                    controller.enqueue(
-                        result.value
-                    );
+                    try {
+                        await currentReader.cancel();
+                    } catch {}
 
-                    return;
+                    currentReader = null;
+
+                    globalOffset +=
+                        localEnd -
+                        localStart +
+                        1;
+
+                    partIndex++;
+
+                    localStart = 0;
                 }
 
-                controller.close();
+                if (!cancelled) {
+                    controller.close();
 
-                console.log(
-                    "media multipart range:",
-                    JSON.stringify({
-                        event:
-                            "complete",
-                        requestedStart:
-                            start,
-                        requestedEnd:
-                            end,
-                        elapsed:
-                            Date.now() -
-                            startedAt
-                    })
-                );
+                    console.log(
+                        "media multipart range:",
+                        JSON.stringify({
+                            event:
+                                "complete",
+                            requestedStart:
+                                start,
+                            requestedEnd:
+                                end,
+                            elapsed:
+                                Date.now() -
+                                startedAt
+                        })
+                    );
+                }
             } catch (error) {
                 if (cancelled) {
                     return;
@@ -2075,7 +2050,8 @@ async function streamMultipartRangeDownload(
                     reason:
                         reason?.message ||
                         String(
-                            reason || ""
+                            reason ||
+                            ""
                         )
                 })
             );

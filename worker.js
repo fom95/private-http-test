@@ -1710,6 +1710,36 @@ async function streamRangeDownload(
                         }
                     );
 
+                if (
+    currentOffset ===
+    0
+) {
+    console.log(
+        "multipart first chunk:",
+        JSON.stringify({
+            part:
+                currentPart.part,
+            fileId:
+                currentPart.fileId,
+            requestedStart:
+                start,
+            requestedEnd:
+                end,
+            chunkLength:
+                bytes?.length,
+            firstBytes:
+                bytes ?
+                    Array.from(
+                        bytes.slice(
+                            0,
+                            16
+                        )
+                    ) :
+                    null
+        })
+    );
+}
+
                 telegramWait +=
                     Date.now() -
                     telegramStarted;
@@ -5538,11 +5568,12 @@ export class TelegramConnectionDO extends DurableObject {
             error =>
                 this.#discardClientOnConnectionError(
                     error
-                ),
+                )
+            /*,
             cancel =>
                 this.#registerMultipartDownload(
                     cancel
-                )
+                )*/
         );
     }
 }

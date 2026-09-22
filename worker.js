@@ -4,6 +4,8 @@ import { DurableObject } from "cloudflare:workers";
 const TELEGRAM_CHUNK_SIZE = 256 * 1024;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 
+const MAX_ACTIVE_MULTIPART_DOWNLOADS = 3;
+
 const CACHE_CONTROL = "public, max-age=31536000, immutable";
 
 // Files at or under this size are downloaded into memory and served as a
@@ -1857,13 +1859,19 @@ async function streamMultipartRangeDownload(
     parts,
     start,
     end,
-    onFatalError
+    onFatalError,
+    registerDownload = null
 ) {
     const startedAt =
         Date.now();
 
     let partIndex = 0;
     let globalOffset = 0;
+    let localStart = 0;
+
+    let cancelled = false;
+    let controllerRef = null;
+    let unregister = null;
 
     while (
         partIndex < parts.length &&
@@ -1888,137 +1896,278 @@ async function streamMultipartRangeDownload(
         );
     }
 
-    let localStart =
+    localStart =
         start -
         globalOffset;
 
-    return new ReadableStream({
-        async start(controller) {
+    function stop(
+        reason =
+            "Multipart download cancelled."
+    ) {
+        if (cancelled) {
+            return;
+        }
+
+        cancelled = true;
+
+        if (unregister) {
+            unregister();
+            unregister = null;
+        }
+
+        if (controllerRef) {
             try {
-                while (
-                    partIndex <
-                        parts.length &&
-                    globalOffset <=
-                        end
-                ) {
-                    const part =
-                        parts[partIndex];
+                controllerRef.error(
+                    new Error(reason)
+                );
+            } catch {}
+        }
+    }
 
-                    const partSize =
-                        Number(
-                            part.fileSize
+    function finish() {
+        if (unregister) {
+            unregister();
+            unregister = null;
+        }
+    }
+
+    function report(
+        event,
+        extra = {}
+    ) {
+        console.log(
+            "media multipart range:",
+            JSON.stringify({
+                event,
+                part:
+                    parts[partIndex]?.part ??
+                    null,
+                parts:
+                    parts.length,
+                requestedStart:
+                    start,
+                requestedEnd:
+                    end,
+                elapsed:
+                    Date.now() -
+                    startedAt,
+                ...extra
+            })
+        );
+    }
+
+    const stream =
+        new ReadableStream({
+            async start(controller) {
+                controllerRef =
+                    controller;
+
+                if (registerDownload) {
+                    unregister =
+                        registerDownload(
+                            stop
                         );
+                }
+            },
 
-                    const localEnd =
-                        Math.min(
-                            partSize - 1,
-                            end -
-                                globalOffset
-                        );
-
-                    const stream =
-                        await streamRangeDownload(
-                            client,
-                            part.fileId,
-                            partSize,
-                            localStart,
-                            localEnd,
-                            onFatalError
-                        );
-
-                    const reader =
-                        stream.getReader();
-
-                    try {
-                        while (true) {
-                            const result =
-                                await reader.read();
-
-                            if (
-                                result.done
-                            ) {
-                                break;
-                            }
-
-                            controller.enqueue(
-                                result.value
-                            );
-                        }
-                    } finally {
-                        try {
-                            await reader.cancel();
-                        } catch {}
-                    }
-
-                    globalOffset +=
-                        localEnd -
-                        localStart +
-                        1;
-
-                    partIndex++;
-
-                    localStart = 0;
+            async pull(controller) {
+                if (cancelled) {
+                    return;
                 }
 
-                controller.close();
+                try {
+                    while (true) {
+                        if (cancelled) {
+                            return;
+                        }
 
-                console.log(
-                    "media multipart range:",
-                    JSON.stringify({
-                        event: "complete",
-                        requestedStart:
-                            start,
-                        requestedEnd:
-                            end,
-                        elapsed:
-                            Date.now() -
-                            startedAt
-                    })
-                );
-            } catch (error) {
-                console.log(
-                    "media multipart range:",
-                    JSON.stringify({
-                        event: "error",
-                        requestedStart:
-                            start,
-                        requestedEnd:
-                            end,
-                        elapsed:
-                            Date.now() -
-                            startedAt,
-                        error:
-                            error?.message ||
-                            String(error)
-                    })
+                        if (
+                            partIndex >=
+                            parts.length
+                        ) {
+                            finish();
+
+                            controller.close();
+
+                            report(
+                                "complete"
+                            );
+
+                            return;
+                        }
+
+                        const currentPart =
+                            parts[partIndex];
+
+                        const partSize =
+                            Number(
+                                currentPart.fileSize
+                            );
+
+                        const localEnd =
+                            Math.min(
+                                partSize - 1,
+                                end -
+                                    globalOffset
+                            );
+
+                        const alignedStart =
+                            Math.floor(
+                                localStart /
+                                TELEGRAM_OFFSET_ALIGNMENT
+                            ) *
+                            TELEGRAM_OFFSET_ALIGNMENT;
+
+                        let currentOffset =
+                            alignedStart;
+
+                        while (
+                            currentOffset <=
+                            localEnd
+                        ) {
+                            if (cancelled) {
+                                return;
+                            }
+
+                            const remaining =
+                                localEnd -
+                                currentOffset +
+                                1;
+
+                            const requestSize =
+                                Math.min(
+                                    TELEGRAM_CHUNK_SIZE,
+                                    remaining
+                                );
+
+                            const bytes =
+                                await client.downloadChunk(
+                                    currentPart.fileId,
+                                    {
+                                        offset:
+                                            currentOffset,
+                                        chunkSize:
+                                            requestSize
+                                    }
+                                );
+
+                            if (cancelled) {
+                                return;
+                            }
+
+                            if (
+                                !bytes ||
+                                bytes.length === 0
+                            ) {
+                                throw new Error(
+                                    `Telegram returned no data for multipart part ${currentPart.part} at offset ${currentOffset}.`
+                                );
+                            }
+
+                            const chunkStart =
+                                currentOffset;
+
+                            const chunkEnd =
+                                currentOffset +
+                                bytes.length -
+                                1;
+
+                            const outputStart =
+                                Math.max(
+                                    localStart,
+                                    chunkStart
+                                );
+
+                            const outputEnd =
+                                Math.min(
+                                    localEnd,
+                                    chunkEnd
+                                );
+
+                            if (
+                                outputEnd >=
+                                outputStart
+                            ) {
+                                const sliceStart =
+                                    outputStart -
+                                    chunkStart;
+
+                                const sliceEnd =
+                                    outputEnd -
+                                    chunkStart +
+                                    1;
+
+                                controller.enqueue(
+                                    bytes.slice(
+                                        sliceStart,
+                                        sliceEnd
+                                    )
+                                );
+                            }
+
+                            currentOffset =
+                                chunkEnd + 1;
+
+                            return;
+                        }
+
+                        globalOffset +=
+                            partSize;
+
+                        partIndex++;
+
+                        localStart = 0;
+                    }
+                } catch (error) {
+                    if (cancelled) {
+                        return;
+                    }
+
+                    report(
+                        "error",
+                        {
+                            error:
+                                error?.message ||
+                                String(error)
+                        }
+                    );
+
+                    finish();
+
+                    controller.error(
+                        error
+                    );
+
+                    onFatalError?.(
+                        error
+                    );
+                }
+            },
+
+            async cancel(reason) {
+                stop(
+                    reason?.message ||
+                    String(
+                        reason ||
+                        "Multipart download cancelled."
+                    )
                 );
 
-                controller.error(
-                    error
-                );
-
-                onFatalError?.(
-                    error
+                report(
+                    "cancel",
+                    {
+                        reason:
+                            reason?.message ||
+                            String(
+                                reason ||
+                                ""
+                            )
+                    }
                 );
             }
-        },
+        });
 
-        async cancel(reason) {
-            console.log(
-                "media multipart range:",
-                JSON.stringify({
-                    event: "cancel",
-                    requestedStart:
-                        start,
-                    requestedEnd:
-                        end,
-                    reason:
-                        reason?.message ||
-                        String(reason || "")
-                })
-            );
-        }
-    });
+    return stream;
 }
 
 async function getMessageMediaInfo(
@@ -4874,6 +5023,83 @@ export class TelegramConnectionDO extends DurableObject {
     #client = null;
     #clientPromise = null;
 
+    #activeMultipartDownloads =
+        new Map();
+
+    #nextMultipartDownloadId = 1;
+
+    #registerMultipartDownload(
+    cancel
+) {
+    const id =
+        this.#nextMultipartDownloadId++;
+
+    while (
+        this.#activeMultipartDownloads.size >=
+        MAX_ACTIVE_MULTIPART_DOWNLOADS
+    ) {
+        const oldest =
+            this.#activeMultipartDownloads
+                .entries()
+                .next()
+                .value;
+
+        if (!oldest) {
+            break;
+        }
+
+        const [
+            oldestId,
+            oldestCancel
+        ] = oldest;
+
+        this.#activeMultipartDownloads
+            .delete(oldestId);
+
+        try {
+            oldestCancel(
+                "Replaced by a newer multipart download."
+            );
+        } catch {}
+    }
+
+    this.#activeMultipartDownloads.set(
+        id,
+        cancel
+    );
+
+    console.log(
+        "multipart download queue:",
+        JSON.stringify({
+            event:
+                "start",
+            id,
+            active:
+                this.#activeMultipartDownloads.size
+        })
+    );
+
+    return () => {
+        if (
+            !this.#activeMultipartDownloads
+                .delete(id)
+        ) {
+            return;
+        }
+
+        console.log(
+            "multipart download queue:",
+            JSON.stringify({
+                event:
+                    "remove",
+                id,
+                active:
+                    this.#activeMultipartDownloads.size
+            })
+        );
+    };
+}
+
     async #ensureClient() {
         if (!this.#clientPromise) {
             this.#clientPromise =
@@ -5260,25 +5486,29 @@ export class TelegramConnectionDO extends DurableObject {
     }
 
 
-async downloadMultipartRangeStream(
-    parts,
-    start,
-    end
-) {
-    const client =
-        await this.#ensureClient();
-
-    return streamMultipartRangeDownload(
-        client,
+    async downloadMultipartRangeStream(
         parts,
         start,
-        end,
-        error =>
-            this.#discardClientOnConnectionError(
-                error
-            )
-    );
-}
+        end
+    ) {
+        const client =
+            await this.#ensureClient();
+    
+        return streamMultipartRangeDownload(
+            client,
+            parts,
+            start,
+            end,
+            error =>
+                this.#discardClientOnConnectionError(
+                    error
+                ),
+            cancel =>
+                this.#registerMultipartDownload(
+                    cancel
+                )
+        );
+    }
 }
 
 export default {

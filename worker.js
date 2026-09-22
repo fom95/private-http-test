@@ -1889,8 +1889,7 @@ async function streamMultipartRangeDownload(
     parts,
     start,
     end,
-    onFatalError,
-    registerDownload = null
+    onFatalError
 ) {
     const startedAt =
         Date.now();
@@ -1898,10 +1897,6 @@ async function streamMultipartRangeDownload(
     let partIndex = 0;
     let globalOffset = 0;
     let localStart = 0;
-
-    let cancelled = false;
-    let controllerRef = null;
-    let unregister = null;
 
     while (
         partIndex < parts.length &&
@@ -1930,274 +1925,162 @@ async function streamMultipartRangeDownload(
         start -
         globalOffset;
 
-    function stop(
-        reason =
-            "Multipart download cancelled."
-    ) {
-        if (cancelled) {
-            return;
-        }
+    let currentReader = null;
+    let cancelled = false;
 
-        cancelled = true;
+    return new ReadableStream({
+        async pull(controller) {
+            if (cancelled) {
+                return;
+            }
 
-        if (unregister) {
-            unregister();
-            unregister = null;
-        }
-
-        if (controllerRef) {
             try {
-                controllerRef.error(
-                    new Error(reason)
-                );
-            } catch {}
-        }
-    }
-
-    function finish() {
-        if (unregister) {
-            unregister();
-            unregister = null;
-        }
-    }
-
-    function report(
-        event,
-        extra = {}
-    ) {
-        console.log(
-            "media multipart range:",
-            JSON.stringify({
-                event,
-                part:
-                    parts[partIndex]?.part ??
-                    null,
-                parts:
-                    parts.length,
-                requestedStart:
-                    start,
-                requestedEnd:
-                    end,
-                elapsed:
-                    Date.now() -
-                    startedAt,
-                ...extra
-            })
-        );
-    }
-
-    const stream =
-        new ReadableStream({
-            async start(controller) {
-                controllerRef =
-                    controller;
-
-                if (registerDownload) {
-                    unregister =
-                        registerDownload(
-                            stop
-                        );
-                }
-            },
-
-            async pull(controller) {
-                if (cancelled) {
-                    return;
-                }
-
-                try {
-                    while (true) {
-                        if (cancelled) {
-                            return;
-                        }
-
-                        if (
-                            partIndex >=
-                            parts.length
-                        ) {
-                            finish();
-
-                            controller.close();
-
-                            report(
-                                "complete"
-                            );
-
-                            return;
-                        }
-
-                        const currentPart =
-                            parts[partIndex];
-
-                        const partSize =
-                            Number(
-                                currentPart.fileSize
-                            );
-
-                        const localEnd =
-                            Math.min(
-                                partSize - 1,
-                                end -
-                                    globalOffset
-                            );
-
-                        const alignedStart =
-                            Math.floor(
-                                localStart /
-                                TELEGRAM_OFFSET_ALIGNMENT
-                            ) *
-                            TELEGRAM_OFFSET_ALIGNMENT;
-
-                        let currentOffset =
-                            alignedStart;
-
-                        while (
-                            currentOffset <=
-                            localEnd
-                        ) {
-                            if (cancelled) {
-                                return;
-                            }
-
-                            const remaining =
-                                localEnd -
-                                currentOffset +
-                                1;
-
-                            const requestSize =
-                                Math.min(
-                                    TELEGRAM_CHUNK_SIZE,
-                                    remaining
-                                );
-
-                            const bytes =
-                                await client.downloadChunk(
-                                    currentPart.fileId,
-                                    {
-                                        offset:
-                                            currentOffset,
-                                        chunkSize:
-                                            requestSize
-                                    }
-                                );
-
-                            if (cancelled) {
-                                return;
-                            }
-
-                            if (
-                                !bytes ||
-                                bytes.length === 0
-                            ) {
-                                throw new Error(
-                                    `Telegram returned no data for multipart part ${currentPart.part} at offset ${currentOffset}.`
-                                );
-                            }
-
-                            const chunkStart =
-                                currentOffset;
-
-                            const chunkEnd =
-                                currentOffset +
-                                bytes.length -
-                                1;
-
-                            const outputStart =
-                                Math.max(
-                                    localStart,
-                                    chunkStart
-                                );
-
-                            const outputEnd =
-                                Math.min(
-                                    localEnd,
-                                    chunkEnd
-                                );
-
-                            if (
-                                outputEnd >=
-                                outputStart
-                            ) {
-                                const sliceStart =
-                                    outputStart -
-                                    chunkStart;
-
-                                const sliceEnd =
-                                    outputEnd -
-                                    chunkStart +
-                                    1;
-
-                                controller.enqueue(
-                                    bytes.slice(
-                                        sliceStart,
-                                        sliceEnd
-                                    )
-                                );
-                            }
-
-                            currentOffset =
-                                chunkEnd + 1;
-
-                            return;
-                        }
-
-                        globalOffset +=
-                            partSize;
-
-                        partIndex++;
-
-                        localStart = 0;
-                    }
-                } catch (error) {
+                while (
+                    partIndex <
+                    parts.length
+                ) {
                     if (cancelled) {
                         return;
                     }
 
-                    report(
-                        "error",
-                        {
-                            error:
-                                error?.message ||
-                                String(error)
-                        }
+                    const part =
+                        parts[partIndex];
+
+                    const partSize =
+                        Number(
+                            part.fileSize
+                        );
+
+                    const localEnd =
+                        Math.min(
+                            partSize - 1,
+                            end -
+                                globalOffset
+                        );
+
+                    const stream =
+                        await streamRangeDownload(
+                            client,
+                            part.fileId,
+                            partSize,
+                            localStart,
+                            localEnd,
+                            onFatalError
+                        );
+
+                    currentReader =
+                        stream.getReader();
+
+                    const result =
+                        await currentReader.read();
+
+                    if (result.done) {
+                        try {
+                            await currentReader.cancel();
+                        } catch {}
+
+                        currentReader =
+                            null;
+
+                        globalOffset +=
+                            localEnd -
+                            localStart +
+                            1;
+
+                        partIndex++;
+
+                        localStart = 0;
+
+                        continue;
+                    }
+
+                    controller.enqueue(
+                        result.value
                     );
 
-                    finish();
-
-                    controller.error(
-                        error
-                    );
-
-                    onFatalError?.(
-                        error
-                    );
+                    return;
                 }
-            },
 
-            async cancel(reason) {
-                stop(
-                    reason?.message ||
-                    String(
-                        reason ||
-                        "Multipart download cancelled."
-                    )
+                controller.close();
+
+                console.log(
+                    "media multipart range:",
+                    JSON.stringify({
+                        event:
+                            "complete",
+                        requestedStart:
+                            start,
+                        requestedEnd:
+                            end,
+                        elapsed:
+                            Date.now() -
+                            startedAt
+                    })
+                );
+            } catch (error) {
+                if (cancelled) {
+                    return;
+                }
+
+                console.log(
+                    "media multipart range:",
+                    JSON.stringify({
+                        event:
+                            "error",
+                        requestedStart:
+                            start,
+                        requestedEnd:
+                            end,
+                        elapsed:
+                            Date.now() -
+                            startedAt,
+                        error:
+                            error?.message ||
+                            String(error)
+                    })
                 );
 
-                report(
-                    "cancel",
-                    {
-                        reason:
-                            reason?.message ||
-                            String(
-                                reason ||
-                                ""
-                            )
-                    }
+                controller.error(
+                    error
+                );
+
+                onFatalError?.(
+                    error
                 );
             }
-        });
+        },
 
-    return stream;
+        async cancel(reason) {
+            cancelled = true;
+
+            if (currentReader) {
+                try {
+                    await currentReader.cancel(
+                        reason
+                    );
+                } catch {}
+
+                currentReader = null;
+            }
+
+            console.log(
+                "media multipart range:",
+                JSON.stringify({
+                    event:
+                        "cancel",
+                    requestedStart:
+                        start,
+                    requestedEnd:
+                        end,
+                    reason:
+                        reason?.message ||
+                        String(
+                            reason || ""
+                        )
+                })
+            );
+        }
+    });
 }
 
 async function getMessageMediaInfo(

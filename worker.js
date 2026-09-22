@@ -1215,7 +1215,7 @@ async function getMultipartMediaInfo(
         ) {
             continue;
         }
-
+    
         try {
             const message =
                 await getMessage(
@@ -1224,7 +1224,7 @@ async function getMultipartMediaInfo(
                     numericChatId,
                     candidateId
                 );
-
+    
             const info =
                 await getMessageMediaInfo(
                     client,
@@ -1233,7 +1233,7 @@ async function getMultipartMediaInfo(
                     candidateId,
                     message
                 );
-
+    
             addMessageInfo(
                 message,
                 info
@@ -1868,39 +1868,27 @@ async function streamMultipartRangeDownload(
     end,
     onFatalError
 ) {
-    const startedAt =
-        Date.now();
+    const startedAt = Date.now();
 
     let partIndex = 0;
     let globalOffset = 0;
 
     while (
-        partIndex <
-        parts.length &&
-        globalOffset +
-            Number(parts[partIndex].fileSize) <=
-            start
+        partIndex < parts.length &&
+        globalOffset + Number(parts[partIndex].fileSize) <= start
     ) {
-        globalOffset +=
-            Number(
-                parts[partIndex].fileSize
-            );
-
+        globalOffset += Number(parts[partIndex].fileSize);
         partIndex++;
     }
 
-    if (
-        partIndex >=
-        parts.length
-    ) {
+    if (partIndex >= parts.length) {
         throw new Error(
             "Multipart range starts beyond the available file."
         );
     }
 
     let localStart =
-        start -
-        globalOffset;
+        start - globalOffset;
 
     let currentPart =
         parts[partIndex];
@@ -1918,13 +1906,13 @@ async function streamMultipartRangeDownload(
         ) *
         TELEGRAM_OFFSET_ALIGNMENT;
 
-    let bytesSent = 0;
     let chunks = 0;
+    let bytesSent = 0;
 
-    function report(
-        event,
-        extra = {}
-    ) {
+    let iterator = null;
+    let iteratorPart = -1;
+
+    function report(event, extra = {}) {
         console.log(
             "media multipart range:",
             JSON.stringify({
@@ -1938,14 +1926,49 @@ async function streamMultipartRangeDownload(
                     start,
                 requestedEnd:
                     end,
-                bytesSent,
+                currentOffset,
                 chunks,
+                bytesSent,
                 elapsed:
                     Date.now() -
                     startedAt,
                 ...extra
             })
         );
+    }
+
+    async function closeIterator() {
+        if (!iterator) {
+            return;
+        }
+
+        const current =
+            iterator;
+
+        iterator = null;
+        iteratorPart = -1;
+
+        try {
+            await current.return?.();
+        } catch {}
+    }
+
+    async function createIterator() {
+        await closeIterator();
+
+        iterator =
+            client.download(
+                currentPart.fileId,
+                {
+                    offset:
+                        currentOffset,
+                    chunkSize:
+                        TELEGRAM_CHUNK_SIZE
+                }
+            );
+
+        iteratorPart =
+            partIndex;
     }
 
     return new ReadableStream({
@@ -1956,6 +1979,7 @@ async function streamMultipartRangeDownload(
                         partIndex >=
                         parts.length
                     ) {
+                        await closeIterator();
                         controller.close();
                         report("complete");
                         return;
@@ -1973,6 +1997,8 @@ async function streamMultipartRangeDownload(
                         currentOffset >
                         localEnd
                     ) {
+                        await closeIterator();
+
                         globalOffset +=
                             partSize;
 
@@ -2006,34 +2032,45 @@ async function streamMultipartRangeDownload(
                         continue;
                     }
 
-                    const remaining =
-                        localEnd -
-                        currentOffset +
-                        1;
+                    if (
+                        iterator === null ||
+                        iteratorPart !==
+                            partIndex
+                    ) {
+                        await createIterator();
+                    }
 
-                    const requestSize =
-                        Math.min(
-                            TELEGRAM_CHUNK_SIZE,
-                            remaining
-                        );
+                    const result =
+                        await iterator.next();
+
+                    if (result.done) {
+                        await closeIterator();
+
+                        /*
+                         * If Telegram's iterator ended before the
+                         * logical part ended, treat that as an error.
+                         */
+                        if (
+                            currentOffset <=
+                            localEnd
+                        ) {
+                            throw new Error(
+                                `Telegram ended part ${currentPart.part} early at offset ${currentOffset}.`
+                            );
+                        }
+
+                        continue;
+                    }
 
                     const bytes =
-                        await client.downloadChunk(
-                            currentPart.fileId,
-                            {
-                                offset:
-                                    currentOffset,
-                                chunkSize:
-                                    requestSize
-                            }
-                        );
+                        result.value;
 
                     if (
                         !bytes ||
                         bytes.length === 0
                     ) {
                         throw new Error(
-                            `Telegram returned no data for multipart part ${currentPart.part} at offset ${currentOffset}.`
+                            `Telegram returned no data for multipart part ${currentPart.part}.`
                         );
                     }
 
@@ -2041,9 +2078,12 @@ async function streamMultipartRangeDownload(
                         currentOffset;
 
                     const chunkEnd =
-                        currentOffset +
-                        bytes.length -
-                        1;
+                        Math.min(
+                            chunkStart +
+                                bytes.length -
+                                1,
+                            partSize - 1
+                        );
 
                     const outputStart =
                         Math.max(
@@ -2096,8 +2136,6 @@ async function streamMultipartRangeDownload(
                         report(
                             "chunk",
                             {
-                                part:
-                                    currentPart.part,
                                 offset:
                                     chunkStart,
                                 received:
@@ -2109,6 +2147,8 @@ async function streamMultipartRangeDownload(
                     return;
                 }
             } catch (error) {
+                await closeIterator();
+
                 report(
                     "error",
                     {
@@ -2137,6 +2177,8 @@ async function streamMultipartRangeDownload(
                         String(reason || "")
                 }
             );
+
+            await closeIterator();
         }
     });
 }

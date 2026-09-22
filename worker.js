@@ -1192,29 +1192,20 @@ async function getMultipartMediaInfo(
         numericMessageId -
         (multipart.part - 1);
 
-    const candidateIds = [];
-
     for (
         let part = 1;
         part <= multipart.total;
         part++
     ) {
-        candidateIds.push(
-            firstMessageId +
-            (part - 1)
-        );
-    }
-
-    for (
-        const candidateId of candidateIds
-    ) {
         if (
-            found.has(
-                candidateId
-            )
+            found.has(part)
         ) {
             continue;
         }
+    
+        const candidateId =
+            firstMessageId +
+            (part - 1);
     
         try {
             const message =
@@ -1868,294 +1859,138 @@ async function streamMultipartRangeDownload(
     end,
     onFatalError
 ) {
-    const startedAt = Date.now();
+    const startedAt =
+        Date.now();
 
     let partIndex = 0;
     let globalOffset = 0;
 
     while (
         partIndex < parts.length &&
-        globalOffset + Number(parts[partIndex].fileSize) <= start
+        globalOffset +
+            Number(parts[partIndex].fileSize) <=
+            start
     ) {
-        globalOffset += Number(parts[partIndex].fileSize);
+        globalOffset +=
+            Number(
+                parts[partIndex].fileSize
+            );
+
         partIndex++;
     }
 
-    if (partIndex >= parts.length) {
+    if (
+        partIndex >=
+        parts.length
+    ) {
         throw new Error(
             "Multipart range starts beyond the available file."
         );
     }
 
     let localStart =
-        start - globalOffset;
-
-    let currentPart =
-        parts[partIndex];
-
-    let localEnd =
-        Math.min(
-            Number(currentPart.fileSize) - 1,
-            end - globalOffset
-        );
-
-    let currentOffset =
-        Math.floor(
-            localStart /
-            TELEGRAM_OFFSET_ALIGNMENT
-        ) *
-        TELEGRAM_OFFSET_ALIGNMENT;
-
-    let chunks = 0;
-    let bytesSent = 0;
-
-    let iterator = null;
-    let iteratorPart = -1;
-
-    function report(event, extra = {}) {
-        console.log(
-            "media multipart range:",
-            JSON.stringify({
-                event,
-                part:
-                    currentPart?.part ??
-                    null,
-                parts:
-                    parts.length,
-                requestedStart:
-                    start,
-                requestedEnd:
-                    end,
-                currentOffset,
-                chunks,
-                bytesSent,
-                elapsed:
-                    Date.now() -
-                    startedAt,
-                ...extra
-            })
-        );
-    }
-
-    async function closeIterator() {
-        if (!iterator) {
-            return;
-        }
-
-        const current =
-            iterator;
-
-        iterator = null;
-        iteratorPart = -1;
-
-        try {
-            await current.return?.();
-        } catch {}
-    }
-
-    async function createIterator() {
-        await closeIterator();
-
-        iterator =
-            client.download(
-                currentPart.fileId,
-                {
-                    offset:
-                        currentOffset,
-                    chunkSize:
-                        TELEGRAM_CHUNK_SIZE
-                }
-            );
-
-        iteratorPart =
-            partIndex;
-    }
+        start -
+        globalOffset;
 
     return new ReadableStream({
-        async pull(controller) {
+        async start(controller) {
             try {
-                while (true) {
-                    if (
-                        partIndex >=
-                        parts.length
-                    ) {
-                        await closeIterator();
-                        controller.close();
-                        report("complete");
-                        return;
-                    }
-
-                    currentPart =
+                while (
+                    partIndex <
+                        parts.length &&
+                    globalOffset <=
+                        end
+                ) {
+                    const part =
                         parts[partIndex];
 
                     const partSize =
                         Number(
-                            currentPart.fileSize
+                            part.fileSize
                         );
 
-                    if (
-                        currentOffset >
-                        localEnd
-                    ) {
-                        await closeIterator();
-
-                        globalOffset +=
-                            partSize;
-
-                        partIndex++;
-
-                        if (
-                            partIndex >=
-                            parts.length
-                        ) {
-                            controller.close();
-                            report("complete");
-                            return;
-                        }
-
-                        currentPart =
-                            parts[partIndex];
-
-                        localStart = 0;
-
-                        localEnd =
-                            Math.min(
-                                Number(
-                                    currentPart.fileSize
-                                ) - 1,
-                                end -
-                                    globalOffset
-                            );
-
-                        currentOffset = 0;
-
-                        continue;
-                    }
-
-                    if (
-                        iterator === null ||
-                        iteratorPart !==
-                            partIndex
-                    ) {
-                        await createIterator();
-                    }
-
-                    const result =
-                        await iterator.next();
-
-                    if (result.done) {
-                        await closeIterator();
-
-                        /*
-                         * If Telegram's iterator ended before the
-                         * logical part ended, treat that as an error.
-                         */
-                        if (
-                            currentOffset <=
-                            localEnd
-                        ) {
-                            throw new Error(
-                                `Telegram ended part ${currentPart.part} early at offset ${currentOffset}.`
-                            );
-                        }
-
-                        continue;
-                    }
-
-                    const bytes =
-                        result.value;
-
-                    if (
-                        !bytes ||
-                        bytes.length === 0
-                    ) {
-                        throw new Error(
-                            `Telegram returned no data for multipart part ${currentPart.part}.`
-                        );
-                    }
-
-                    const chunkStart =
-                        currentOffset;
-
-                    const chunkEnd =
+                    const localEnd =
                         Math.min(
-                            chunkStart +
-                                bytes.length -
-                                1,
-                            partSize - 1
+                            partSize - 1,
+                            end -
+                                globalOffset
                         );
 
-                    const outputStart =
-                        Math.max(
+                    const stream =
+                        await streamRangeDownload(
+                            client,
+                            part.fileId,
+                            partSize,
                             localStart,
-                            chunkStart
-                        );
-
-                    const outputEnd =
-                        Math.min(
                             localEnd,
-                            chunkEnd
+                            onFatalError
                         );
 
-                    if (
-                        outputEnd >=
-                        outputStart
-                    ) {
-                        const sliceStart =
-                            outputStart -
-                            chunkStart;
+                    const reader =
+                        stream.getReader();
 
-                        const sliceEnd =
-                            outputEnd -
-                            chunkStart +
-                            1;
+                    try {
+                        while (true) {
+                            const result =
+                                await reader.read();
 
-                        const output =
-                            bytes.slice(
-                                sliceStart,
-                                sliceEnd
-                            );
-
-                        bytesSent +=
-                            output.length;
-
-                        chunks++;
-
-                        controller.enqueue(
-                            output
-                        );
-                    }
-
-                    currentOffset =
-                        chunkEnd + 1;
-
-                    if (
-                        chunks <= 3 ||
-                        chunks % 10 === 0
-                    ) {
-                        report(
-                            "chunk",
-                            {
-                                offset:
-                                    chunkStart,
-                                received:
-                                    bytes.length
+                            if (
+                                result.done
+                            ) {
+                                break;
                             }
-                        );
+
+                            controller.enqueue(
+                                result.value
+                            );
+                        }
+                    } finally {
+                        try {
+                            await reader.cancel();
+                        } catch {}
                     }
 
-                    return;
-                }
-            } catch (error) {
-                await closeIterator();
+                    globalOffset +=
+                        localEnd -
+                        localStart +
+                        1;
 
-                report(
-                    "error",
-                    {
+                    partIndex++;
+
+                    localStart = 0;
+                }
+
+                controller.close();
+
+                console.log(
+                    "media multipart range:",
+                    JSON.stringify({
+                        event: "complete",
+                        requestedStart:
+                            start,
+                        requestedEnd:
+                            end,
+                        elapsed:
+                            Date.now() -
+                            startedAt
+                    })
+                );
+            } catch (error) {
+                console.log(
+                    "media multipart range:",
+                    JSON.stringify({
+                        event: "error",
+                        requestedStart:
+                            start,
+                        requestedEnd:
+                            end,
+                        elapsed:
+                            Date.now() -
+                            startedAt,
                         error:
                             error?.message ||
                             String(error)
-                    }
+                    })
                 );
 
                 controller.error(
@@ -2169,16 +2004,19 @@ async function streamMultipartRangeDownload(
         },
 
         async cancel(reason) {
-            report(
-                "cancel",
-                {
+            console.log(
+                "media multipart range:",
+                JSON.stringify({
+                    event: "cancel",
+                    requestedStart:
+                        start,
+                    requestedEnd:
+                        end,
                     reason:
                         reason?.message ||
                         String(reason || "")
-                }
+                })
             );
-
-            await closeIterator();
         }
     });
 }

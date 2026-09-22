@@ -5377,7 +5377,7 @@ export class TelegramConnectionDO extends DurableObject {
                 )
         );
     }
-}
+
 
 async downloadMultipartRangeStream(
     parts,

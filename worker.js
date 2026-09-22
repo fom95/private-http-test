@@ -5398,6 +5398,7 @@ async downloadMultipartRangeStream(
             )
     );
 }
+}
 
 export default {
     async fetch(request, env, ctx) {

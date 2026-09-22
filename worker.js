@@ -1063,6 +1063,316 @@ function parseRange(rangeHeader, size) {
     };
 }
 
+function parseMultipartFilename(filename) {
+    const match =
+        /^(.+)\.part(\d+)of(\d+)$/i.exec(
+            String(filename || "")
+        );
+
+    if (!match) {
+        return null;
+    }
+
+    const part =
+        Number(match[2]);
+
+    const total =
+        Number(match[3]);
+
+    if (
+        !Number.isSafeInteger(part) ||
+        !Number.isSafeInteger(total) ||
+        part < 1 ||
+        total < 1 ||
+        part > total
+    ) {
+        return null;
+    }
+
+    return {
+        originalName: match[1],
+        part,
+        total
+    };
+}
+
+async function getMultipartMediaInfo(
+    client,
+    env,
+    chatId,
+    messageId,
+    existingMessage = null
+) {
+    const numericChatId =
+        Number(chatId);
+
+    const numericMessageId =
+        Number(messageId);
+
+    const targetMessage =
+        existingMessage ||
+        await getMessage(
+            client,
+            env,
+            numericChatId,
+            numericMessageId
+        );
+
+    const targetInfo =
+        await getMessageMediaInfo(
+            client,
+            env,
+            numericChatId,
+            numericMessageId,
+            targetMessage
+        );
+
+    const multipart =
+        parseMultipartFilename(
+            targetInfo.fileName
+        );
+
+    if (!multipart) {
+        return null;
+    }
+
+    const found = new Map();
+
+    function addMessageInfo(
+        message,
+        info
+    ) {
+        if (!message || !info?.fileId) {
+            return;
+        }
+
+        const parsed =
+            parseMultipartFilename(
+                info.fileName
+            );
+
+        if (!parsed) {
+            return;
+        }
+
+        if (
+            parsed.originalName !==
+                multipart.originalName ||
+            parsed.total !==
+                multipart.total
+        ) {
+            return;
+        }
+
+        found.set(
+            parsed.part,
+            {
+                ...info,
+                part:
+                    parsed.part,
+                total:
+                    parsed.total
+            }
+        );
+    }
+
+    addMessageInfo(
+        targetMessage,
+        targetInfo
+    );
+
+    /*
+     * The uploader creates the placeholder messages consecutively,
+     * so the multipart messages normally have consecutive Telegram
+     * message IDs. Check those exact IDs first. This also means old
+     * multipart files continue to work even if they are no longer in
+     * the most recent 100 messages.
+     */
+    const firstMessageId =
+        numericMessageId -
+        (multipart.part - 1);
+
+    const candidateIds = [];
+
+    for (
+        let part = 1;
+        part <= multipart.total;
+        part++
+    ) {
+        candidateIds.push(
+            firstMessageId +
+            (part - 1)
+        );
+    }
+
+    for (
+        const candidateId of candidateIds
+    ) {
+        if (
+            found.has(
+                candidateId
+            )
+        ) {
+            continue;
+        }
+
+        try {
+            const message =
+                await getMessage(
+                    client,
+                    env,
+                    numericChatId,
+                    candidateId
+                );
+
+            const info =
+                await getMessageMediaInfo(
+                    client,
+                    env,
+                    numericChatId,
+                    candidateId,
+                    message
+                );
+
+            addMessageInfo(
+                message,
+                info
+            );
+        } catch {
+            // Missing/non-media candidate; history fallback below.
+        }
+    }
+
+    /*
+     * If the messages weren't consecutive, search the normal history
+     * window as a compatibility fallback.
+     */
+    if (
+        found.size <
+        multipart.total
+    ) {
+        try {
+            const history =
+                await client.getHistory(
+                    numericChatId,
+                    {
+                        limit: 100
+                    }
+                );
+
+            for (
+                const message of
+                history || []
+            ) {
+                if (
+                    found.size >=
+                    multipart.total
+                ) {
+                    break;
+                }
+
+                const info =
+                    await getMessageMediaInfo(
+                        client,
+                        env,
+                        numericChatId,
+                        message.id,
+                        message
+                    );
+
+                addMessageInfo(
+                    message,
+                    info
+                );
+            }
+        } catch (error) {
+            console.log(
+                "Multipart history fallback failed:",
+                error?.message ||
+                    String(error)
+            );
+        }
+    }
+
+    if (
+        found.size !==
+        multipart.total
+    ) {
+        throw new Error(
+            `Could not find all parts of multipart file "${multipart.originalName}". ` +
+            `Found ${found.size} of ${multipart.total}.`
+        );
+    }
+
+    const parts =
+        Array.from(
+            found.values()
+        ).sort(
+            (a, b) =>
+                a.part -
+                b.part
+        );
+
+    for (
+        let index = 0;
+        index < parts.length;
+        index++
+    ) {
+        if (
+            parts[index].part !==
+            index + 1
+        ) {
+            throw new Error(
+                `Multipart file "${multipart.originalName}" is missing part ${index + 1}.`
+            );
+        }
+
+        if (
+            !Number.isSafeInteger(
+                Number(parts[index].fileSize)
+            ) ||
+            Number(parts[index].fileSize) <= 0
+        ) {
+            throw new Error(
+                `Multipart file "${multipart.originalName}" has an invalid size for part ${index + 1}.`
+            );
+        }
+    }
+
+    let totalSize = 0;
+
+    for (
+        const part of parts
+    ) {
+        totalSize +=
+            Number(part.fileSize);
+
+        if (
+            !Number.isSafeInteger(
+                totalSize
+            )
+        ) {
+            throw new Error(
+                `Multipart file "${multipart.originalName}" is too large.`
+            );
+        }
+    }
+
+    return {
+        multipart: true,
+        originalName:
+            multipart.originalName,
+        totalParts:
+            multipart.total,
+        fileSize:
+            totalSize,
+        mimeType:
+            parts[0].mimeType ||
+            "application/octet-stream",
+        parts
+    };
+}
+
 function createMediaHeaders({
     mimeType,
     size,
@@ -1551,6 +1861,286 @@ async function streamRangeDownload(
     });
 }
 
+async function streamMultipartRangeDownload(
+    client,
+    parts,
+    start,
+    end,
+    onFatalError
+) {
+    const startedAt =
+        Date.now();
+
+    let partIndex = 0;
+    let globalOffset = 0;
+
+    while (
+        partIndex <
+        parts.length &&
+        globalOffset +
+            Number(parts[partIndex].fileSize) <=
+            start
+    ) {
+        globalOffset +=
+            Number(
+                parts[partIndex].fileSize
+            );
+
+        partIndex++;
+    }
+
+    if (
+        partIndex >=
+        parts.length
+    ) {
+        throw new Error(
+            "Multipart range starts beyond the available file."
+        );
+    }
+
+    let localStart =
+        start -
+        globalOffset;
+
+    let currentPart =
+        parts[partIndex];
+
+    let localEnd =
+        Math.min(
+            Number(currentPart.fileSize) - 1,
+            end - globalOffset
+        );
+
+    let currentOffset =
+        Math.floor(
+            localStart /
+            TELEGRAM_OFFSET_ALIGNMENT
+        ) *
+        TELEGRAM_OFFSET_ALIGNMENT;
+
+    let bytesSent = 0;
+    let chunks = 0;
+
+    function report(
+        event,
+        extra = {}
+    ) {
+        console.log(
+            "media multipart range:",
+            JSON.stringify({
+                event,
+                part:
+                    currentPart?.part ??
+                    null,
+                parts:
+                    parts.length,
+                requestedStart:
+                    start,
+                requestedEnd:
+                    end,
+                bytesSent,
+                chunks,
+                elapsed:
+                    Date.now() -
+                    startedAt,
+                ...extra
+            })
+        );
+    }
+
+    return new ReadableStream({
+        async pull(controller) {
+            try {
+                while (true) {
+                    if (
+                        partIndex >=
+                        parts.length
+                    ) {
+                        controller.close();
+                        report("complete");
+                        return;
+                    }
+
+                    currentPart =
+                        parts[partIndex];
+
+                    const partSize =
+                        Number(
+                            currentPart.fileSize
+                        );
+
+                    if (
+                        currentOffset >
+                        localEnd
+                    ) {
+                        globalOffset +=
+                            partSize;
+
+                        partIndex++;
+
+                        if (
+                            partIndex >=
+                            parts.length
+                        ) {
+                            controller.close();
+                            report("complete");
+                            return;
+                        }
+
+                        currentPart =
+                            parts[partIndex];
+
+                        localStart = 0;
+
+                        localEnd =
+                            Math.min(
+                                Number(
+                                    currentPart.fileSize
+                                ) - 1,
+                                end -
+                                    globalOffset
+                            );
+
+                        currentOffset = 0;
+
+                        continue;
+                    }
+
+                    const remaining =
+                        localEnd -
+                        currentOffset +
+                        1;
+
+                    const requestSize =
+                        Math.min(
+                            TELEGRAM_CHUNK_SIZE,
+                            remaining
+                        );
+
+                    const bytes =
+                        await client.downloadChunk(
+                            currentPart.fileId,
+                            {
+                                offset:
+                                    currentOffset,
+                                chunkSize:
+                                    requestSize
+                            }
+                        );
+
+                    if (
+                        !bytes ||
+                        bytes.length === 0
+                    ) {
+                        throw new Error(
+                            `Telegram returned no data for multipart part ${currentPart.part} at offset ${currentOffset}.`
+                        );
+                    }
+
+                    const chunkStart =
+                        currentOffset;
+
+                    const chunkEnd =
+                        currentOffset +
+                        bytes.length -
+                        1;
+
+                    const outputStart =
+                        Math.max(
+                            localStart,
+                            chunkStart
+                        );
+
+                    const outputEnd =
+                        Math.min(
+                            localEnd,
+                            chunkEnd
+                        );
+
+                    if (
+                        outputEnd >=
+                        outputStart
+                    ) {
+                        const sliceStart =
+                            outputStart -
+                            chunkStart;
+
+                        const sliceEnd =
+                            outputEnd -
+                            chunkStart +
+                            1;
+
+                        const output =
+                            bytes.slice(
+                                sliceStart,
+                                sliceEnd
+                            );
+
+                        bytesSent +=
+                            output.length;
+
+                        chunks++;
+
+                        controller.enqueue(
+                            output
+                        );
+                    }
+
+                    currentOffset =
+                        chunkEnd + 1;
+
+                    if (
+                        chunks <= 3 ||
+                        chunks % 10 === 0
+                    ) {
+                        report(
+                            "chunk",
+                            {
+                                part:
+                                    currentPart.part,
+                                offset:
+                                    chunkStart,
+                                received:
+                                    bytes.length
+                            }
+                        );
+                    }
+
+                    return;
+                }
+            } catch (error) {
+                report(
+                    "error",
+                    {
+                        error:
+                            error?.message ||
+                            String(error)
+                    }
+                );
+
+                controller.error(
+                    error
+                );
+
+                onFatalError?.(
+                    error
+                );
+            }
+        },
+
+        async cancel(reason) {
+            report(
+                "cancel",
+                {
+                    reason:
+                        reason?.message ||
+                        String(reason || "")
+                }
+            );
+        }
+    });
+}
+
 async function getMessageMediaInfo(
     client,
     env,
@@ -1772,13 +2362,6 @@ async function handleDirectMediaRequest(
         });
     }
 
-    // Thumbnails (?thumb=1) and small direct media requests hit this
-    // path, and they're deterministic by URL. Skip caching for Range
-    // requests (video seeking) to keep partial-content semantics simple
-    // and unambiguous -- but a plain GET, which is exactly how a
-    // thumbnail <img> tag requests it, can be served straight from
-    // Cloudflare's edge on repeat views without ever touching Telegram
-    // or spinning up a client.
     const cacheable =
         request.method === "GET" &&
         !request.headers.get("Range");
@@ -1791,14 +2374,14 @@ async function handleDirectMediaRequest(
     if (cache) {
         try {
             const cached =
-                await cache.match(request);
+                await cache.match(
+                    request
+                );
 
             if (cached) {
                 return cached;
             }
-        } catch {
-            // Fall through to a normal fetch if the cache read fails.
-        }
+        } catch {}
     }
 
     const totalStart =
@@ -1812,7 +2395,9 @@ async function handleDirectMediaRequest(
         headers[
             "X-Media-Timing"
         ] =
-            Object.entries(timings)
+            Object.entries(
+                timings
+            )
                 .map(
                     ([key, value]) =>
                         `${key}=${value}ms`
@@ -1828,10 +2413,14 @@ async function handleDirectMediaRequest(
             .filter(Boolean);
 
     let chatId =
-        url.searchParams.get("chat");
+        url.searchParams.get(
+            "chat"
+        );
 
     let messageId =
-        url.searchParams.get("message");
+        url.searchParams.get(
+            "message"
+        );
 
     if (
         pathParts[0] === "media" &&
@@ -1849,8 +2438,12 @@ async function handleDirectMediaRequest(
     }
 
     const thumbnail =
-        url.searchParams.has("thumb") ||
-        url.searchParams.has("thumbnail");
+        url.searchParams.has(
+            "thumb"
+        ) ||
+        url.searchParams.has(
+            "thumbnail"
+        );
 
     if (!chatId || !messageId) {
         return json({
@@ -1866,10 +2459,6 @@ async function handleDirectMediaRequest(
     const infoStart =
         Date.now();
 
-    // One RPC call replaces getMessage + getMessageMedia + mime/name
-    // resolution -- getMediaInfo already returns exactly this shape
-    // (it's the same helper /api/media-info uses), so there's no
-    // separate "create a client, then ask it things" step here anymore.
     const info =
         await stub.getMediaInfo(
             chatId,
@@ -1888,6 +2477,33 @@ async function handleDirectMediaRequest(
         }, 404);
     }
 
+    /*
+     * Multipart files are represented by several Telegram documents
+     * whose filenames end in .partNNNofNNN.
+     *
+     * A URL referring to ANY one of those messages resolves to the
+     * complete logical file.
+     *
+     * Thumbnails deliberately remain attached to the individual
+     * Telegram message and therefore bypass multipart resolution.
+     */
+    let multipartInfo = null;
+
+    if (!thumbnail) {
+        const multipartStart =
+            Date.now();
+
+        multipartInfo =
+            await stub.getMultipartMediaInfo(
+                chatId,
+                messageId
+            );
+
+        timings.multipartResolve =
+            Date.now() -
+            multipartStart;
+    }
+
     let fileId =
         info.fileId;
 
@@ -1900,6 +2516,19 @@ async function handleDirectMediaRequest(
     let filename =
         info.fileName ||
         `telegram-${chatId}-${messageId}`;
+
+    if (multipartInfo) {
+        fileSize =
+            multipartInfo.fileSize;
+
+        mimeType =
+            multipartInfo.mimeType ||
+            mimeType ||
+            "application/octet-stream";
+
+        filename =
+            multipartInfo.originalName;
+    }
 
     if (thumbnail) {
         if (!info.thumbnails.length) {
@@ -1931,7 +2560,6 @@ async function handleDirectMediaRequest(
     }
 
     if (
-        !fileId ||
         !Number.isSafeInteger(
             fileSize
         ) ||
@@ -1972,7 +2600,9 @@ async function handleDirectMediaRequest(
                     "Accept-Ranges":
                         "bytes",
                     "Cache-Control":
-                        CACHE_CONTROL
+                        CACHE_CONTROL,
+                    "Access-Control-Allow-Origin":
+                        "*"
                 }
             });
         }
@@ -2010,13 +2640,24 @@ async function handleDirectMediaRequest(
         const downloadStart =
             Date.now();
 
-        const stream =
-            await stub.downloadRangeStream(
-                fileId,
-                fileSize,
-                range.start,
-                range.end
-            );
+        let stream;
+
+        if (multipartInfo) {
+            stream =
+                await stub.downloadMultipartRangeStream(
+                    multipartInfo.parts,
+                    range.start,
+                    range.end
+                );
+        } else {
+            stream =
+                await stub.downloadRangeStream(
+                    fileId,
+                    fileSize,
+                    range.start,
+                    range.end
+                );
+        }
 
         timings.streamSetup =
             Date.now() -
@@ -2067,10 +2708,48 @@ async function handleDirectMediaRequest(
     const downloadStart =
         Date.now();
 
-    // Only fully buffer things that are actually small. Thumbnails
-    // always qualify; a 20MB photo must keep streaming so it never
-    // sits in the isolate's memory, and so the client starts
-    // receiving bytes immediately.
+    /*
+     * Multipart files are intentionally never buffered. Even a
+     * 3-part file whose individual pieces are small must be streamed
+     * as one logical file.
+     */
+    if (multipartInfo) {
+        const stream =
+            await stub.downloadMultipartRangeStream(
+                multipartInfo.parts,
+                0,
+                fileSize - 1
+            );
+
+        timings.streamSetup =
+            Date.now() -
+            downloadStart;
+
+        timings.total =
+            Date.now() -
+            totalStart;
+
+        const headers =
+            createMediaHeaders({
+                mimeType,
+                size:
+                    fileSize,
+                filename
+            });
+
+        addTimingHeader(
+            headers
+        );
+
+        return new Response(
+            stream,
+            {
+                status: 200,
+                headers
+            }
+        );
+    }
+
     const bufferable =
         cache &&
         (
@@ -2114,8 +2793,6 @@ async function handleDirectMediaRequest(
                 }
             );
 
-        // Safe: the body is an in-memory buffer, so clone() is
-        // instant and the cache write can't stall on the network.
         safeCachePut(
             ctx,
             cache,
@@ -2151,9 +2828,6 @@ async function handleDirectMediaRequest(
         headers
     );
 
-    // Deliberately NOT cached: caching a stream requires clone(),
-    // which tees it, and the background cache reader would throttle
-    // the response the user is waiting on.
     return new Response(
         stream,
         {
@@ -4540,6 +5214,21 @@ export class TelegramConnectionDO extends DurableObject {
         );
     }
 
+    async getMultipartMediaInfo(
+    chatId,
+    messageId
+) {
+    return this.#withClient(
+        client =>
+            getMultipartMediaInfo(
+                client,
+                this.env,
+                chatId,
+                messageId
+            )
+    );
+}
+
     async runTestDownload(
         chatId,
         messageId
@@ -4688,6 +5377,26 @@ export class TelegramConnectionDO extends DurableObject {
                 )
         );
     }
+}
+
+async downloadMultipartRangeStream(
+    parts,
+    start,
+    end
+) {
+    const client =
+        await this.#ensureClient();
+
+    return streamMultipartRangeDownload(
+        client,
+        parts,
+        start,
+        end,
+        error =>
+            this.#discardClientOnConnectionError(
+                error
+            )
+    );
 }
 
 export default {

@@ -1,7 +1,10 @@
 import { Client } from "@mtkruto/mtkruto";
 import { DurableObject } from "cloudflare:workers";
 
-const TELEGRAM_CHUNK_SIZE = 256 * 1024;
+// Keep each Telegram request at the maximum 1 MiB fragment size.
+// streamRangeDownload still splits at fragment boundaries, so this avoids
+// LIMIT_INVALID while reducing thousands of tiny Telegram round trips.
+const TELEGRAM_CHUNK_SIZE = 1024 * 1024;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 
 const MAX_ACTIVE_MULTIPART_DOWNLOADS = 1;

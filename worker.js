@@ -5,7 +5,9 @@ import { DurableObject } from "cloudflare:workers";
 // streamRangeDownload still splits at fragment boundaries, so this avoids
 // LIMIT_INVALID while reducing thousands of tiny Telegram round trips.
 const TELEGRAM_CHUNK_SIZE = 1024 * 1024;
+const TELEGRAM_PARALLEL_REQUESTS = 5;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
+const TELEGRAM_FRAGMENT_SIZE = 1024 * 1024;
 
 const MAX_ACTIVE_MULTIPART_DOWNLOADS = 1;
 
@@ -1641,243 +1643,267 @@ async function streamRangeDownload(
         ) *
         TELEGRAM_OFFSET_ALIGNMENT;
 
-    let currentOffset =
-        alignedStart;
+    let currentOffset = alignedStart;
+    let cancelled = false;
+    let activeRequests = new Set();
 
-    const startedAt =
-        Date.now();
-
+    const startedAt = Date.now();
+    let batches = 0;
     let chunks = 0;
     let bytesReceived = 0;
     let bytesSent = 0;
     let telegramWait = 0;
-    let processingTime = 0;
-    let cancelled = false;
 
-    function report(
-        event,
-        extra = {}
-    ) {
+    function report(event, extra = {}) {
         console.log(
             "media range download:",
             JSON.stringify({
                 event,
-                fileId:
-                    String(fileId),
-                requestedStart:
-                    start,
-                requestedEnd:
-                    end,
+                fileId: String(fileId),
+                requestedStart: start,
+                requestedEnd: end,
                 alignedStart,
                 currentOffset,
+                batches,
                 chunks,
                 bytesReceived,
                 bytesSent,
                 telegramWait,
-                processingTime,
-                elapsed:
-                    Date.now() -
-                    startedAt,
+                elapsed: Date.now() - startedAt,
                 ...extra
             })
         );
     }
 
+    /*
+     * Telegram's getFile/downloadChunk request must not cross a 1 MiB
+     * fragment boundary unless precise mode is used.  Every range chunk is
+     * therefore capped to one fragment and rounded to a 4 KiB multiple.
+     */
+    function requestSizeAt(offset, remaining) {
+        const fragmentRemaining =
+            TELEGRAM_FRAGMENT_SIZE -
+            (offset % TELEGRAM_FRAGMENT_SIZE);
+
+        const desired = Math.min(
+            TELEGRAM_CHUNK_SIZE,
+            remaining,
+            fragmentRemaining
+        );
+
+        return Math.max(
+            TELEGRAM_OFFSET_ALIGNMENT,
+            Math.floor(
+                desired /
+                TELEGRAM_OFFSET_ALIGNMENT
+            ) *
+            TELEGRAM_OFFSET_ALIGNMENT
+        );
+    }
+
+    async function fetchChunk(offset, requestedSize) {
+        if (cancelled) {
+            return null;
+        }
+
+        let requestPromise;
+        const telegramStarted = Date.now();
+
+        requestPromise = client.downloadChunk(
+            fileId,
+            {
+                offset,
+                chunkSize: requestedSize
+            }
+        );
+
+        activeRequests.add(requestPromise);
+
+        try {
+            const bytes = await requestPromise;
+            telegramWait += Date.now() - telegramStarted;
+
+            if (cancelled) {
+                return null;
+            }
+
+            if (!bytes || bytes.length === 0) {
+                throw new Error(
+                    "Telegram returned no data at offset " +
+                    offset + "."
+                );
+            }
+
+            if (
+                bytes.length < requestedSize &&
+                offset + bytes.length < fileSize
+            ) {
+                throw new Error(
+                    "Telegram returned a short range at offset " +
+                    offset +
+                    " (requested " +
+                    requestedSize +
+                    ", received " +
+                    bytes.length + ")."
+                );
+            }
+
+            return {
+                offset,
+                bytes
+            };
+        } finally {
+            activeRequests.delete(requestPromise);
+        }
+    }
+
     return new ReadableStream({
         async pull(controller) {
-            if (
-                currentOffset > end
-            ) {
+            if (cancelled) {
+                return;
+            }
+
+            if (currentOffset > end) {
                 controller.close();
-
                 report("complete");
-
                 return;
             }
 
             try {
-                const remaining =
-                    end -
-                    currentOffset +
-                    1;
+                const batch = [];
+                let batchOffset = currentOffset;
 
                 /*
-                 * Telegram upload.getFile has an easy-to-miss constraint:
-                 * without the `precise` flag, every request must stay inside
-                 * one 1 MiB file fragment. A 256 KiB request is valid only
-                 * when it does not cross a 1 MiB boundary.
-                 *
-                 * This is exactly what was breaking seeking. For example,
-                 * offset 479133696 is 960 KiB into its 1 MiB fragment; asking
-                 * Telegram for another 256 KiB crosses the boundary and
-                 * produces LIMIT_INVALID.
-                 *
-                 * Keep the normal 256 KiB size when possible, but reduce the
-                 * request at a boundary to a valid divisor of 1 MiB.
+                 * Keep at most five Telegram reads in flight.  This is the
+                 * read-ahead window: it turns the old one-request-at-a-time
+                 * stream into a bounded parallel downloader while preserving
+                 * byte order when the results are enqueued below.
                  */
-                const TELEGRAM_FRAGMENT_SIZE =
-                    1024 * 1024;
+                for (
+                    let i = 0;
+                    i < TELEGRAM_PARALLEL_REQUESTS &&
+                    batchOffset <= end;
+                    i++
+                ) {
+                    const remaining =
+                        end - batchOffset + 1;
 
-                const fragmentOffset =
-                    currentOffset %
-                    TELEGRAM_FRAGMENT_SIZE;
+                    const requestSize =
+                        requestSizeAt(
+                            batchOffset,
+                            remaining
+                        );
 
-                const fragmentRemaining =
-                    TELEGRAM_FRAGMENT_SIZE -
-                    fragmentOffset;
+                    batch.push({
+                        offset: batchOffset,
+                        requestSize
+                    });
 
-                const desiredSize =
-                    Math.min(
-                        TELEGRAM_CHUNK_SIZE,
-                        remaining,
-                        fragmentRemaining
+                    batchOffset += requestSize;
+                }
+
+                batches++;
+
+                const results =
+                    await Promise.all(
+                        batch.map(item =>
+                            fetchChunk(
+                                item.offset,
+                                item.requestSize
+                            )
+                        )
                     );
-
-                /*
-                 * upload.getFile requires `limit` to divide 1 MiB. Use the
-                 * largest allowed 4 KiB multiple no larger than desiredSize.
-                 */
-                const requestSize =
-                    Math.max(
-                        TELEGRAM_OFFSET_ALIGNMENT,
-                        Math.floor(
-                            desiredSize /
-                            TELEGRAM_OFFSET_ALIGNMENT
-                        ) *
-                        TELEGRAM_OFFSET_ALIGNMENT
-                    );
-
-                const telegramStarted =
-                    Date.now();
-
-                const bytes =
-                    await client.downloadChunk(
-                        fileId,
-                        {
-                            offset:
-                                currentOffset,
-                            chunkSize:
-                                requestSize
-                        }
-                    );
-
-                telegramWait +=
-                    Date.now() -
-                    telegramStarted;
 
                 if (cancelled) {
                     return;
                 }
 
-                if (
-                    !bytes ||
-                    bytes.length === 0
-                ) {
-                    throw new Error(
-                        "Telegram returned no data at offset " +
-                        currentOffset +
-                        "."
-                    );
-                }
+                for (let i = 0; i < results.length; i++) {
+                    const result = results[i];
 
-                const processStarted =
-                    Date.now();
+                    if (!result) {
+                        return;
+                    }
 
-                const chunkStart =
-                    currentOffset;
-
-                const chunkEnd =
-                    currentOffset +
-                    bytes.length -
-                    1;
-
-                const outputStart =
-                    Math.max(
-                        start,
-                        chunkStart
-                    );
-
-                const outputEnd =
-                    Math.min(
-                        end,
-                        chunkEnd
-                    );
-
-                if (
-                    outputEnd >=
-                    outputStart
-                ) {
-                    const sliceStart =
-                        outputStart -
-                        chunkStart;
-
-                    const sliceEnd =
-                        outputEnd -
+                    const chunkStart =
+                        result.offset;
+                    const bytes =
+                        result.bytes;
+                    const chunkEnd =
                         chunkStart +
+                        bytes.length -
                         1;
 
-                    const output =
-                        bytes.slice(
-                            sliceStart,
-                            sliceEnd
+                    const outputStart =
+                        Math.max(
+                            start,
+                            chunkStart
+                        );
+                    const outputEnd =
+                        Math.min(
+                            end,
+                            chunkEnd
                         );
 
-                    bytesSent +=
-                        output.length;
+                    if (outputEnd >= outputStart) {
+                        const sliceStart =
+                            outputStart -
+                            chunkStart;
+                        const sliceEnd =
+                            outputEnd -
+                            chunkStart +
+                            1;
 
-                    controller.enqueue(
-                        output
-                    );
+                        const output =
+                            bytes.slice(
+                                sliceStart,
+                                sliceEnd
+                            );
+
+                        bytesSent +=
+                            output.length;
+
+                        controller.enqueue(output);
+                    }
+
+                    bytesReceived +=
+                        bytes.length;
+                    chunks++;
+
+                    if (
+                        chunks <= 5 ||
+                        chunks % 20 === 0
+                    ) {
+                        report(
+                            "chunk",
+                            {
+                                chunk: chunks,
+                                requestedBytes:
+                                    batch[i].requestSize,
+                                receivedBytes:
+                                    bytes.length,
+                                offset: chunkStart,
+                                chunkEnd,
+                                batch: batches
+                            }
+                        );
+                    }
                 }
 
-                bytesReceived +=
-                    bytes.length;
-
-                chunks++;
-
-                currentOffset =
-                    chunkEnd + 1;
-
-                processingTime +=
-                    Date.now() -
-                    processStarted;
+                currentOffset = batchOffset;
 
                 if (
-                    chunks <= 3 ||
-                    chunks % 10 === 0
-                ) {
-                    report(
-                        "chunk",
-                        {
-                            chunk:
-                                chunks,
-                            requestedBytes:
-                                requestSize,
-                            receivedBytes:
-                                bytes.length,
-                            fragmentOffset,
-                            fragmentRemaining,
-                            offset:
-                                chunkStart,
-                            chunkEnd,
-                            chunkTime:
-                                Date.now() -
-                                processStarted
-                        }
-                    );
-                }
-
-                if (
-                    currentOffset >
-                    end ||
-                    currentOffset >=
-                    fileSize
+                    currentOffset > end ||
+                    currentOffset >= fileSize
                 ) {
                     controller.close();
-
                     report("complete");
                 }
             } catch (error) {
+                if (cancelled) {
+                    return;
+                }
+
                 report(
                     "error",
                     {
@@ -1887,10 +1913,7 @@ async function streamRangeDownload(
                     }
                 );
 
-                controller.error(
-                    error
-                );
-
+                controller.error(error);
                 onFatalError?.(error);
             }
         },
@@ -1903,13 +1926,19 @@ async function streamRangeDownload(
                 {
                     reason:
                         reason?.message ||
-                        String(reason || "")
+                        String(reason || ""),
+                    activeRequests:
+                        activeRequests.size
                 }
             );
 
-            // downloadChunk() cannot be force-aborted, but the flag above
-            // makes the stream stop immediately after the in-flight Telegram
-            // call returns, without enqueueing another stale chunk.
+            /*
+             * MTKruto's downloadChunk does not currently expose an AbortSignal
+             * here, so an already-running Telegram RPC may finish.  The
+             * cancellation flag prevents its result from being emitted and
+             * prevents another batch from starting.  This keeps stale seek
+             * requests bounded to at most the current five-request window.
+             */
         }
     });
 }
@@ -1922,43 +1951,74 @@ async function streamMultipartRangeDownload(
     onFatalError,
     registerDownload = null
 ) {
-    const startedAt =
-        Date.now();
+    const normalizedParts =
+        parts.map(part => ({
+            fileId: part.fileId,
+            fileSize: Number(part.fileSize)
+        }));
 
-    let partIndex = 0;
+    const segments = [];
     let globalOffset = 0;
-    let localStart = 0;
 
-    while (
-        partIndex < parts.length &&
-        globalOffset +
-            Number(parts[partIndex].fileSize) <=
-            start
-    ) {
-        globalOffset +=
-            Number(
-                parts[partIndex].fileSize
-            );
+    for (const part of normalizedParts) {
+        const partStart = globalOffset;
+        const partEnd =
+            globalOffset +
+            part.fileSize -
+            1;
 
-        partIndex++;
+        if (end >= partStart && start <= partEnd) {
+            const overlapStart =
+                Math.max(start, partStart);
+            const overlapEnd =
+                Math.min(end, partEnd);
+
+            segments.push({
+                fileId: part.fileId,
+                fileSize: part.fileSize,
+                globalStart: overlapStart,
+                globalEnd: overlapEnd,
+                localStart:
+                    overlapStart - partStart,
+                localEnd:
+                    overlapEnd - partStart
+            });
+        }
+
+        globalOffset += part.fileSize;
+
+        if (globalOffset > end) {
+            break;
+        }
     }
 
-    if (
-        partIndex >=
-        parts.length
-    ) {
+    if (!segments.length) {
         throw new Error(
             "Multipart range starts beyond the available file."
         );
     }
 
-    localStart =
-        start -
-        globalOffset;
-
+    let segmentIndex = 0;
+    let currentStream = null;
     let currentReader = null;
     let cancelled = false;
     let unregister = null;
+
+    function cancel(reason) {
+        if (cancelled) {
+            return;
+        }
+
+        cancelled = true;
+
+        try {
+            currentReader?.cancel(reason);
+        } catch {}
+
+        try {
+            currentStream?.cancel(reason);
+        } catch {}
+    }
 
     const stream = new ReadableStream({
         async pull(controller) {
@@ -1968,40 +2028,34 @@ async function streamMultipartRangeDownload(
 
             try {
                 while (
-                    partIndex <
-                    parts.length
+                    segmentIndex <
+                    segments.length
                 ) {
                     if (cancelled) {
                         return;
                     }
 
-                    const part =
-                        parts[partIndex];
+                    const segment =
+                        segments[segmentIndex++];
 
-                    const partSize =
-                        Number(
-                            part.fileSize
-                        );
-
-                    const localEnd =
-                        Math.min(
-                            partSize - 1,
-                            end -
-                                globalOffset
-                        );
-
-                    const stream =
+                    /*
+                     * Each Telegram part is an independent physical file.
+                     * A range that crosses a 2 GiB split is therefore streamed
+                     * as adjacent range streams, but each stream starts at the
+                     * exact local offset inside its own Telegram document.
+                     */
+                    currentStream =
                         await streamRangeDownload(
                             client,
-                            part.fileId,
-                            partSize,
-                            localStart,
-                            localEnd,
+                            segment.fileId,
+                            segment.fileSize,
+                            segment.localStart,
+                            segment.localEnd,
                             onFatalError
                         );
 
                     currentReader =
-                        stream.getReader();
+                        currentStream.getReader();
 
                     while (true) {
                         if (cancelled) {
@@ -2025,1599 +2079,53 @@ async function streamMultipartRangeDownload(
                     } catch {}
 
                     currentReader = null;
-
-                    globalOffset +=
-                        localEnd -
-                        localStart +
-                        1;
-
-                    partIndex++;
-
-                    localStart = 0;
+                    currentStream = null;
                 }
 
                 if (!cancelled) {
                     controller.close();
-
-                    if (unregister) {
-                        unregister();
-                        unregister = null;
-                    }
-
-                    console.log(
-                        "media multipart range:",
-                        JSON.stringify({
-                            event:
-                                "complete",
-                            requestedStart:
-                                start,
-                            requestedEnd:
-                                end,
-                            elapsed:
-                                Date.now() -
-                                startedAt
-                        })
-                    );
+                    unregister?.();
+                    unregister = null;
                 }
             } catch (error) {
                 if (cancelled) {
-                    if (unregister) {
-                        unregister();
-                        unregister = null;
-                    }
                     return;
                 }
 
-                console.log("media multipart range:",
+                unregister?.();
+                unregister = null;
+
+                console.log(
+                    "media multipart range:",
                     JSON.stringify({
-                        event:
-                            "error",
-                        requestedStart:
-                            start,
-                        requestedEnd:
-                            end,
-                        elapsed:
-                            Date.now() -
-                            startedAt,
+                        event: "error",
+                        requestedStart: start,
+                        requestedEnd: end,
+                        segments: segments.length,
                         error:
                             error?.message ||
                             String(error)
                     })
                 );
 
-                controller.error(
-                    error
-                );
-
-                onFatalError?.(
-                    error
-                );
+                onFatalError?.(error);
+                controller.error(error);
             }
         },
 
         async cancel(reason) {
-            cancelled = true;
-
-            if (currentReader) {
-                try {
-                    await currentReader.cancel(
-                        reason
-                    );
-                } catch {}
-
-                currentReader = null;
-            }
-
-            if (unregister) {
-                unregister();
-                unregister = null;
-            }
-
-            console.log(
-                "media multipart range:",
-                JSON.stringify({
-                    event:
-                        "cancel",
-                    requestedStart:
-                        start,
-                    requestedEnd:
-                        end,
-                    reason:
-                        reason?.message ||
-                        String(
-                            reason ||
-                            ""
-                        )
-                })
-            );
+            cancel(reason);
+            unregister?.();
+            unregister = null;
         }
     });
 
     if (registerDownload) {
-        unregister = registerDownload(
-            reason => {
-                cancelled = true;
-
-                if (currentReader) {
-                    void currentReader.cancel(reason).catch(() => {});
-                }
-            }
-        );
+        unregister =
+            registerDownload(cancel);
     }
 
     return stream;
-}
-
-async function getMessageMediaInfo(
-    client,
-    env,
-    chatId,
-    messageId,
-    existingMessage = null
-) {
-    const message =
-        existingMessage ||
-        await getMessage(
-            client,
-            env,
-            chatId,
-            messageId
-        );
-
-    const media =
-        getMessageMedia(message);
-
-    if (!media) {
-        return {
-            messageId:
-                Number(messageId),
-            chatId:
-                Number(chatId),
-            type:
-                message?.type || null,
-            media: null
-        };
-    }
-
-    const thumbnails =
-        getMediaThumbnails(media);
-
-    return {
-        messageId:
-            Number(messageId),
-        chatId:
-            Number(chatId),
-        messageType:
-            message.type,
-        mediaType:
-            media.constructor?.name ||
-            null,
-        fileId:
-            media.fileId ?? null,
-        fileUniqueId:
-            media.fileUniqueId ?? null,
-        fileSize:
-            media.fileSize ?? null,
-        mimeType:
-            getMediaMimeType(
-                media,
-                message
-            ),
-        width:
-            media.width ?? null,
-        height:
-            media.height ?? null,
-        duration:
-            media.duration ?? null,
-        fileName:
-            media.fileName ?? null,
-        thumbnails:
-            thumbnails.map(
-                item => ({
-                    fileId:
-                        item.fileId ??
-                        null,
-                    fileUniqueId:
-                        item.fileUniqueId ??
-                        null,
-                    fileSize:
-                        item.fileSize ??
-                        null,
-                    width:
-                        item.width ??
-                        null,
-                    height:
-                        item.height ??
-                        null
-                })
-            )
-    };
-}
-
-async function handleImageViewer(
-    request,
-    url
-) {
-    if (
-        request.method !== "GET"
-    ) {
-        return new Response(null, {
-            status: 405,
-            headers: {
-                Allow: "GET"
-            }
-        });
-    }
-
-    const chat =
-        url.searchParams.get("chat");
-
-    const message =
-        url.searchParams.get("message");
-
-    if (!chat || !message) {
-        return new Response(
-            "Missing chat or message.",
-            {
-                status: 400,
-                headers: {
-                    "Content-Type":
-                        "text/plain; charset=utf-8"
-                }
-            }
-        );
-    }
-
-    const mediaUrl =
-        "/media?chat=" +
-        encodeURIComponent(chat) +
-        "&message=" +
-        encodeURIComponent(message);
-
-    const html = `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Image</title>
-<style>
-html, body {
-    margin: 0;
-    width: 100%;
-    height: 100%;
-    background: #111;
-}
-
-body {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    overflow: auto;
-}
-
-img {
-    max-width: 100%;
-    max-height: 100%;
-    object-fit: contain;
-}
-
-#status {
-    color: #ccc;
-    font-family: sans-serif;
-}
-</style>
-</head>
-<body>
-<div id="status">Loading image...</div>
-
-<script>
-(async () => {
-    const status =
-        document.getElementById("status");
-
-    const image =
-        document.createElement("img");
-
-    image.alt = "";
-
-    image.onload = () => {
-        status.remove();
-        document.body.appendChild(
-            image
-        );
-    };
-
-    image.onerror = () => {
-        status.textContent =
-            "Failed to load image.";
-    };
-
-    image.src =
-        ${JSON.stringify(mediaUrl)};
-})();
-</script>
-</body>
-</html>`;
-
-    return new Response(
-        html,
-        {
-            headers: {
-                "Content-Type":
-                    "text/html; charset=utf-8",
-                "Cache-Control":
-                    "no-store"
-            }
-        }
-    );
-}
-
-async function handleDirectMediaRequest(
-    request,
-    env,
-    url,
-    ctx
-) {
-    if (
-        request.method !== "GET" &&
-        request.method !== "HEAD"
-    ) {
-        return new Response(null, {
-            status: 405,
-            headers: {
-                Allow: "GET, HEAD"
-            }
-        });
-    }
-
-    const cacheable =
-        request.method === "GET" &&
-        !request.headers.get("Range");
-
-    const cache =
-        cacheable
-            ? caches.default
-            : null;
-
-    if (cache) {
-        try {
-            const cached =
-                await cache.match(
-                    request
-                );
-
-            if (cached) {
-                return cached;
-            }
-        } catch {}
-    }
-
-    const totalStart =
-        Date.now();
-
-    const timings = {};
-
-    function addTimingHeader(
-        headers
-    ) {
-        headers[
-            "X-Media-Timing"
-        ] =
-            Object.entries(
-                timings
-            )
-                .map(
-                    ([key, value]) =>
-                        `${key}=${value}ms`
-                )
-                .join(", ");
-
-        return headers;
-    }
-
-    const pathParts =
-        url.pathname
-            .split("/")
-            .filter(Boolean);
-
-    let chatId =
-        url.searchParams.get(
-            "chat"
-        );
-
-    let messageId =
-        url.searchParams.get(
-            "message"
-        );
-
-    if (
-        pathParts[0] === "media" &&
-        pathParts.length >= 3
-    ) {
-        chatId =
-            decodeURIComponent(
-                pathParts[1]
-            );
-
-        messageId =
-            decodeURIComponent(
-                pathParts[2]
-            );
-    }
-
-    const thumbnail =
-        url.searchParams.has(
-            "thumb"
-        ) ||
-        url.searchParams.has(
-            "thumbnail"
-        );
-
-    if (!chatId || !messageId) {
-        return json({
-            success: false,
-            error:
-                "Missing chat or message."
-        }, 400);
-    }
-
-    const stub =
-        getConnectionStub(env);
-
-    const infoStart =
-        Date.now();
-
-    const info =
-        await stub.getMediaInfo(
-            chatId,
-            messageId
-        );
-
-    timings.getMediaInfo =
-        Date.now() -
-        infoStart;
-
-    if (!info.fileId) {
-        return json({
-            success: false,
-            error:
-                "Message does not contain supported media."
-        }, 404);
-    }
-
-    /*
-     * Multipart files are represented by several Telegram documents
-     * whose filenames end in .partNNNofNNN.
-     *
-     * A URL referring to ANY one of those messages resolves to the
-     * complete logical file.
-     *
-     * Thumbnails deliberately remain attached to the individual
-     * Telegram message and therefore bypass multipart resolution.
-     */
-    let multipartInfo = null;
-
-    if (!thumbnail) {
-        const multipartStart =
-            Date.now();
-
-        multipartInfo =
-            await stub.getMultipartMediaInfo(
-                chatId,
-                messageId
-            );
-        console.log(
-    "multipart resolution:",
-    JSON.stringify({
-        chatId,
-        messageId,
-        fileName:
-            info.fileName,
-        multipart:
-            Boolean(multipartInfo),
-        originalName:
-            multipartInfo?.originalName ??
-            null,
-        totalParts:
-            multipartInfo?.totalParts ??
-            null,
-        fileSize:
-            multipartInfo?.fileSize ??
-            null,
-        parts:
-            multipartInfo?.parts?.map(
-                part => ({
-                    messageId:
-                        part.messageId,
-                    part:
-                        part.part,
-                    total:
-                        part.total,
-                    fileName:
-                        part.fileName,
-                    fileSize:
-                        part.fileSize
-                })
-            ) ??
-            null
-    })
-);
-
-        timings.multipartResolve =
-            Date.now() -
-            multipartStart;
-    }
-
-    let fileId =
-        info.fileId;
-
-    let fileSize =
-        Number(info.fileSize);
-
-    let mimeType =
-        info.mimeType;
-
-    let filename =
-        info.fileName ||
-        `telegram-${chatId}-${messageId}`;
-
-    if (multipartInfo) {
-        fileSize =
-            multipartInfo.fileSize;
-
-        mimeType =
-            multipartInfo.mimeType ||
-            mimeType ||
-            "application/octet-stream";
-
-        filename =
-            multipartInfo.originalName;
-    }
-
-    if (thumbnail) {
-        if (!info.thumbnails.length) {
-            return json({
-                success: false,
-                error:
-                    "Media has no thumbnail."
-            }, 404);
-        }
-
-        const selected =
-            info.thumbnails[
-                info.thumbnails.length - 1
-            ];
-
-        fileId =
-            selected.fileId;
-
-        fileSize =
-            Number(
-                selected.fileSize
-            );
-
-        mimeType =
-            "image/jpeg";
-
-        filename +=
-            "-thumbnail.jpg";
-    }
-
-    if (
-        !Number.isSafeInteger(
-            fileSize
-        ) ||
-        fileSize <= 0
-    ) {
-        return json({
-            success: false,
-            error:
-                "Media does not contain a downloadable file."
-        }, 500);
-    }
-
-    const rangeHeader =
-        request.headers.get(
-            "Range"
-        );
-
-    if (rangeHeader) {
-        const rangeStart =
-            Date.now();
-
-        const range =
-            parseRange(
-                rangeHeader,
-                fileSize
-            );
-
-        timings.parseRange =
-            Date.now() -
-            rangeStart;
-
-        if (!range) {
-            return new Response(null, {
-                status: 416,
-                headers: {
-                    "Content-Range":
-                        `bytes */${fileSize}`,
-                    "Accept-Ranges":
-                        "bytes",
-                    "Cache-Control":
-                        CACHE_CONTROL,
-                    "Access-Control-Allow-Origin":
-                        "*"
-                }
-            });
-        }
-
-        /*
-         * Do not stream the entire range the browser asked for. Chromium,
-         * Safari and other media stacks can request something like
-         * bytes=0-1999999999 as a probe. For a multi-gigabyte logical file
-         * that would keep this HTTP response open for minutes, which prevents
-         * the player from getting to a later seek request.
-         *
-         * A 206 response is allowed to describe the portion we actually send.
-         * The browser sees Content-Range and will request the next portion
-         * when it needs it. This is also much friendlier to cancellation.
-         */
-        const effectiveStart =
-            range.start;
-
-        const effectiveEnd =
-            Math.min(
-                range.end,
-                effectiveStart +
-                    MAX_HTTP_RANGE_SIZE -
-                    1
-            );
-
-        console.log(
-            "media HTTP range:",
-            JSON.stringify({
-                requestedStart:
-                    range.start,
-                requestedEnd:
-                    range.end,
-                effectiveStart,
-                effectiveEnd,
-                requestedBytes:
-                    range.end -
-                    range.start +
-                    1,
-                servedBytes:
-                    effectiveEnd -
-                    effectiveStart +
-                    1
-            })
-        );
-
-        const headers =
-            createMediaHeaders({
-                mimeType,
-                size:
-                    fileSize,
-                filename,
-                start:
-                    effectiveStart,
-                end:
-                    effectiveEnd
-            });
-
-        /* Never cache byte ranges.  Media players routinely issue overlapping
-         * speculative ranges while seeking; caching a partial response can
-         * make a stale/aborted range look like a valid response forever. */
-        headers["Cache-Control"] = "no-store";
-        headers["CDN-Cache-Control"] = "no-store";
-
-        if (
-            request.method ===
-            "HEAD"
-        ) {
-            timings.total =
-                Date.now() -
-                totalStart;
-
-            addTimingHeader(
-                headers
-            );
-
-            return new Response(null, {
-                status: 206,
-                headers
-            });
-        }
-
-        const downloadStart =
-            Date.now();
-
-        let stream;
-
-        if (multipartInfo) {
-            stream =
-                await stub.downloadMultipartRangeStream(
-                    multipartInfo.parts,
-                    effectiveStart,
-                    effectiveEnd
-                );
-        } else {
-            stream =
-                await stub.downloadRangeStream(
-                    fileId,
-                    fileSize,
-                    effectiveStart,
-                    effectiveEnd
-                );
-        }
-
-        timings.streamSetup =
-            Date.now() -
-            downloadStart;
-
-        timings.total =
-            Date.now() -
-            totalStart;
-
-        addTimingHeader(
-            headers
-        );
-
-        return new Response(
-            stream,
-            {
-                status: 206,
-                headers
-            }
-        );
-    }
-
-    if (
-        request.method === "HEAD"
-    ) {
-        timings.total =
-            Date.now() -
-            totalStart;
-
-        const headers =
-            createMediaHeaders({
-                mimeType,
-                size:
-                    fileSize,
-                filename
-            });
-
-        addTimingHeader(
-            headers
-        );
-
-        return new Response(null, {
-            status: 200,
-            headers
-        });
-    }
-
-    const downloadStart =
-        Date.now();
-
-    /*
-     * Multipart files are intentionally never buffered. Even a
-     * 3-part file whose individual pieces are small must be streamed
-     * as one logical file.
-     */
-    if (multipartInfo) {
-        const stream =
-            await stub.downloadMultipartRangeStream(
-                multipartInfo.parts,
-                0,
-                fileSize - 1
-            );
-
-        timings.streamSetup =
-            Date.now() -
-            downloadStart;
-
-        timings.total =
-            Date.now() -
-            totalStart;
-
-        const headers =
-            createMediaHeaders({
-                mimeType,
-                size:
-                    fileSize,
-                filename
-            });
-
-        addTimingHeader(
-            headers
-        );
-
-        return new Response(
-            stream,
-            {
-                status: 200,
-                headers
-            }
-        );
-    }
-
-    const bufferable =
-        cache &&
-        (
-            thumbnail ||
-            fileSize <=
-                MAX_BUFFERED_SIZE
-        );
-
-    if (bufferable) {
-        const body =
-            await stub.downloadBuffer(
-                fileId
-            );
-
-        timings.download =
-            Date.now() -
-            downloadStart;
-
-        timings.total =
-            Date.now() -
-            totalStart;
-
-        const headers =
-            createMediaHeaders({
-                mimeType,
-                size:
-                    body.byteLength,
-                filename
-            });
-
-        addTimingHeader(
-            headers
-        );
-
-        const response =
-            new Response(
-                body,
-                {
-                    status: 200,
-                    headers
-                }
-            );
-
-        safeCachePut(
-            ctx,
-            cache,
-            request,
-            response
-        );
-
-        return response;
-    }
-
-    const stream =
-        await stub.downloadStream(
-            fileId
-        );
-
-    timings.streamSetup =
-        Date.now() -
-        downloadStart;
-
-    timings.total =
-        Date.now() -
-        totalStart;
-
-    const headers =
-        createMediaHeaders({
-            mimeType,
-            size:
-                fileSize,
-            filename
-        });
-
-    addTimingHeader(
-        headers
-    );
-
-    return new Response(
-        stream,
-        {
-            status: 200,
-            headers
-        }
-    );
-}
-
-async function handlePieceRequest(
-    request,
-    env,
-    url,
-    ctx
-) {
-    if (
-        request.method !== "GET" &&
-        request.method !== "HEAD"
-    ) {
-        return new Response(null, {
-            status: 405,
-            headers: {
-                Allow: "GET, HEAD"
-            }
-        });
-    }
-
-    // Piece URLs are content-addressed (fileId + fileSize + offset +
-    // length + mime, always serialized in the same order by fetchPiece),
-    // so they're safe to cache at Cloudflare's edge with the Cache API.
-    // A cache hit costs essentially no CPU and never touches Telegram --
-    // this is what makes repeat views of the same media (reloads, other
-    // viewers, retried requests) nearly free.
-    const cache = caches.default;
-
-    try {
-        const cached =
-            await cache.match(request);
-
-        if (cached) {
-            return cached;
-        }
-    } catch {
-        // Fall through to a normal fetch if the cache read fails.
-    }
-
-    const requestStart =
-        Date.now();
-
-    const fileId =
-        url.searchParams.get(
-            "fileId"
-        );
-
-    const fileSize =
-        Number(
-            url.searchParams.get(
-                "fileSize"
-            )
-        );
-
-    const offset =
-        Number(
-            url.searchParams.get(
-                "offset"
-            )
-        );
-
-    const length =
-        Number(
-            url.searchParams.get(
-                "length"
-            )
-        );
-
-    const mimeType =
-        url.searchParams.get(
-            "mime"
-        ) ||
-        "application/octet-stream";
-
-    if (!fileId) {
-        return json({
-            success: false,
-            error:
-                "Missing fileId."
-        }, 400);
-    }
-
-    if (
-        !Number.isSafeInteger(fileSize) ||
-        !Number.isSafeInteger(offset) ||
-        !Number.isSafeInteger(length) ||
-        fileSize <= 0 ||
-        offset < 0 ||
-        length <= 0
-    ) {
-        return json({
-            success: false,
-            error:
-                "Invalid fileSize, offset, or length."
-        }, 400);
-    }
-
-    if (
-        offset >= fileSize
-    ) {
-        return new Response(null, {
-            status: 416,
-            headers: {
-                "Content-Range":
-                    `bytes */${fileSize}`,
-                "Cache-Control":
-                    "no-store"
-            }
-        });
-    }
-
-    if (
-        offset %
-        TELEGRAM_OFFSET_ALIGNMENT !==
-        0
-    ) {
-        return json({
-            success: false,
-            error:
-                `Offset must be divisible by ${TELEGRAM_OFFSET_ALIGNMENT}.`
-        }, 400);
-    }
-
-    const actualLength =
-        Math.min(
-            length,
-            fileSize - offset
-        );
-
-    const end =
-        offset +
-        actualLength -
-        1;
-
-    const headers = {
-        "Content-Type":
-            mimeType,
-        "Content-Length":
-            String(actualLength),
-        "Cache-Control":
-            CACHE_CONTROL,
-        "Accept-Ranges":
-            "bytes",
-        "Access-Control-Allow-Origin":
-            "*"
-    };
-
-    if (
-        request.method === "HEAD"
-    ) {
-        return new Response(null, {
-            status: 200,
-            headers
-        });
-    }
-
-    const stub =
-        getConnectionStub(env);
-
-    const downloadStart =
-        Date.now();
-
-    const chunks = [];
-    let downloaded = 0;
-    let currentOffset = offset;
-
-    while (
-        downloaded <
-        actualLength
-    ) {
-        const requestLength =
-            Math.min(
-                TELEGRAM_CHUNK_SIZE,
-                actualLength -
-                    downloaded
-            );
-
-        const bytes =
-            await stub.downloadChunk(
-                fileId,
-                currentOffset,
-                requestLength
-            );
-
-            if (
-                !bytes ||
-                bytes.length === 0
-            ) {
-                throw new Error(
-                    "Telegram returned no data at offset " +
-                    currentOffset +
-                    "."
-                );
-            }
-
-            const usableLength =
-                Math.min(
-                    bytes.length,
-                    actualLength -
-                        downloaded
-                );
-
-            chunks.push(
-                usableLength ===
-                bytes.length
-                    ? bytes
-                    : bytes.slice(
-                        0,
-                        usableLength)
-            );
-
-            downloaded +=
-                usableLength;
-
-            currentOffset +=
-                usableLength;
-
-            if (
-                usableLength <
-                bytes.length
-            ) {
-                break;
-            }
-        }
-
-        const downloadTime =
-            Date.now() -
-            downloadStart;
-
-        const output =
-            new Uint8Array(
-                downloaded
-            );
-
-        let position = 0;
-
-        for (
-            const chunk of chunks
-        ) {
-            output.set(
-                chunk,
-                position
-            );
-
-            position +=
-                chunk.length;
-        }
-
-        const totalTime =
-            Date.now() -
-            requestStart;
-
-        headers[
-            "Content-Length"
-        ] =
-            String(output.length);
-
-        headers[
-            "X-Piece-Range"
-        ] =
-            `bytes ${offset}-${offset + output.length - 1}/${fileSize}`;
-
-        headers[
-            "X-Timing-Download"
-        ] =
-            `${downloadTime} ms`;
-
-        headers[
-            "X-Timing-Total"
-        ] =
-            `${totalTime} ms`;
-
-        headers[
-            "X-Piece-Offset"
-        ] =
-            String(offset);
-
-        headers[
-            "X-Piece-Bytes"
-        ] =
-            String(output.length);
-
-    const response =
-        new Response(
-            output,
-            {
-                status: 200,
-                headers
-            }
-        );
-
-    if (
-        request.method === "GET"
-    ) {
-        safeCachePut(
-            ctx,
-            cache,
-            request,
-            response
-        );
-    }
-
-    return response;
-}
-
-async function testDownload(
-    client,
-    fileId
-) {
-    const iterator =
-        client.download(
-            fileId,
-            {
-                chunkSize:
-                    TELEGRAM_CHUNK_SIZE
-            }
-        );
-
-    let total = 0;
-    let chunks = 0;
-
-    try {
-        for await (
-            const chunk of iterator
-        ) {
-            total += chunk.length;
-            chunks++;
-
-            if (chunks >= 2) {
-                break;
-            }
-        }
-    } finally {
-        try {
-            await iterator.return?.();
-        } catch {}
-    }
-
-    return {
-        bytes: total,
-        chunks
-    };
-}
-
-async function handleApi(
-    request,
-    env,
-    url
-) {
-    const path =
-        url.pathname;
-
-    if (path === "/api/chats") {
-        const start =
-            Date.now();
-
-        const stub =
-            getConnectionStub(env);
-
-        const chats =
-            await stub.getChats();
-
-        return json({
-            success: true,
-            timings: {
-                total:
-                    `${Date.now() - start} ms`
-            },
-            chats
-        });
-    }
-
-    if (path === "/api/chat") {
-        const chatId =
-            url.searchParams.get(
-                "chat"
-            );
-
-        if (!chatId) {
-            return json({
-                success: false,
-                error: "Missing chat."
-            }, 400);
-        }
-
-        const start =
-            Date.now();
-
-        const stub =
-            getConnectionStub(env);
-
-        const chat =
-            await stub.getChat(
-                chatId
-            );
-
-        return json({
-            success: true,
-
-            timings: {
-                total:
-                    `${Date.now() - start} ms`
-            },
-
-            chat
-        });
-    }
-
-    if (path === "/api/messages") {
-        const chatId =
-            url.searchParams.get(
-                "chat"
-            );
-    
-        if (!chatId) {
-            return json({
-                success: false,
-                error: "Missing chat."
-            }, 400);
-        }
-    
-        const start =
-            Date.now();
-
-        const stub =
-            getConnectionStub(env);
-
-        const messages =
-            await stub.getMessages(
-                chatId
-            );
-
-        return json({
-            success: true,
-
-            timings: {
-                total:
-                    `${Date.now() - start} ms`
-            },
-
-            chatId:
-                Number(chatId),
-
-            messages
-        });
-    }
-
-    // Batch thumbnails into one request.
-    //
-    // Each thumbnail loaded individually via /media?thumb=1 pays a full
-    // client.start() (a real MTProto round trip, not CPU) on its own.
-    // That's the ~750-1200ms cold-load latency: it's dominated by
-    // network round trips to Telegram, one full set of which happens
-    // per request, not by bytes transferred (thumbnails are tiny).
-    //
-    // This is the practical equivalent of a sprite sheet: instead of N
-    // separate "sheets" (requests) each paying setup cost once, load one
-    // sheet's worth of thumbnails together. Rather than stitching pixels
-    // into one image (which would mean decoding and re-encoding JPEGs --
-    // real CPU work this endpoint doesn't need), it returns each
-    // thumbnail as its own small buffer in one JSON response. Same
-    // latency win, none of the image-processing complexity or CPU cost.
-    if (path === "/api/thumbnails") {
-        const chatId =
-            url.searchParams.get(
-                "chat"
-            );
-
-        const messagesParam =
-            url.searchParams.get(
-                "messages"
-            );
-
-        if (!chatId || !messagesParam) {
-            return json({
-                success: false,
-                error:
-                    "Missing chat or messages."
-            }, 400);
-        }
-
-        const messageIds =
-            messagesParam
-                .split(",")
-                .map(part =>
-                    Number(part.trim())
-                )
-                .filter(id =>
-                    Number.isSafeInteger(id) &&
-                    id > 0
-                );
-
-        const MAX_BATCH = 60;
-
-        if (!messageIds.length) {
-            return json({
-                success: false,
-                error:
-                    "No valid message IDs."
-            }, 400);
-        }
-
-        if (
-            messageIds.length >
-            MAX_BATCH
-        ) {
-            return json({
-                success: false,
-                error:
-                    `Too many messages requested (max ${MAX_BATCH}).`
-            }, 400);
-        }
-
-        const start =
-            Date.now();
-
-        const stub =
-            getConnectionStub(env);
-
-        const thumbnails = {};
-
-        for (
-            const messageId of messageIds
-        ) {
-            try {
-                const buffer =
-                    await stub.getThumbnailBuffer(
-                        chatId,
-                        messageId
-                    );
-
-                if (!buffer) {
-                    thumbnails[
-                        messageId
-                    ] = null;
-
-                    continue;
-                }
-
-                thumbnails[
-                    messageId
-                ] = {
-                    mimeType:
-                        "image/jpeg",
-                    dataUrl:
-                        "data:image/jpeg;base64," +
-                        bufferToBase64(
-                            buffer
-                        )
-                };
-            } catch (error) {
-                // One bad message must not fail the whole batch.
-                console.log(
-                    "Batch thumbnail failed:",
-                    messageId,
-                    error?.message ||
-                        String(error)
-                );
-
-                thumbnails[
-                    messageId
-                ] = null;
-            }
-        }
-
-        return json({
-            success: true,
-            timings: {
-                total:
-                    `${Date.now() - start} ms`
-            },
-            thumbnails
-        }, 200, {
-            "Cache-Control":
-                CACHE_CONTROL
-        });
-    }
-
-    if (path === "/api/media-info") {
-        const chatId =
-            url.searchParams.get(
-                "chat"
-            );
-
-        const messageId =
-            url.searchParams.get(
-                "message"
-            );
-
-        if (!chatId || !messageId) {
-            return json({
-                success: false,
-                error:
-                    "Missing chat or message."
-            }, 400);
-        }
-
-        const stub =
-            getConnectionStub(env);
-
-        return json({
-            success: true,
-            ...(
-                await stub.getMediaInfo(
-                    chatId,
-                    messageId
-                )
-            )
-        });
-    }
-
-    if (path === "/api/message") {
-        const chatId =
-            url.searchParams.get(
-                "chat"
-            );
-
-        const messageId =
-            url.searchParams.get(
-                "message"
-            );
-
-        if (!chatId || !messageId) {
-            return json({
-                success: false,
-                error:
-                    "Missing chat or message."
-            }, 400);
-        }
-
-        const stub =
-            getConnectionStub(env);
-
-        const message =
-            await stub.getMessageDetail(
-                chatId,
-                messageId
-            );
-
-        return json({
-            success: true,
-            message
-        });
-    }
-
-    if (path === "/api/test-download") {
-        const chatId =
-            url.searchParams.get(
-                "chat"
-            );
-
-        const messageId =
-            url.searchParams.get(
-                "message"
-            );
-
-        if (!chatId || !messageId) {
-            return json({
-                success: false,
-                error:
-                    "Missing chat or message."
-            }, 400);
-        }
-
-        const stub =
-            getConnectionStub(env);
-
-        const result =
-            await stub.runTestDownload(
-                chatId,
-                messageId
-            );
-
-        if (!result) {
-            return json({
-                success: false,
-                error:
-                    "Message has no downloadable media."
-            }, 404);
-        }
-
-        return json({
-            success: true,
-            ...result
-        });
-    }
-
-    return json({
-        success: false,
-        error:
-            "Unknown API endpoint."
-    }, 404);
 }
 
 function renderPage() {
@@ -4694,75 +3202,92 @@ async function loadMedia(
             return;
         }
 
-        const pieces =
-            await fetchMediaPieces(
-                info.fileId,
-                size,
-                mime,
-                token
-            );
-
         if (
-            token !==
-            mediaLoadToken
-        ) {
-            return;
-        }
-
-        const blob =
-            new Blob(
-                pieces,
-                {
-                    type: mime
-                }
-            );
-
-        currentObjectUrl =
-            URL.createObjectURL(
-                blob
-            );
-
-        if (
-            mime.startsWith("video/")
-        ) {
-            const video =
-                document.createElement(
-                    "video"
-                );
-
-            video.controls = true;
-            video.preload =
-                "metadata";
-            video.src =
-                currentObjectUrl;
-
-            mediaContainer.appendChild(
-                video
-            );
-
-            mediaStatus.textContent =
-                "Video loaded.";
-        } else if (
+            mime.startsWith("video/") ||
             mime.startsWith("audio/")
         ) {
-            const audio =
-                document.createElement(
-                    "audio"
+            // Let the browser's media stack drive HTTP Range requests directly.
+            // The /media endpoint maps each logical range to the correct
+            // Telegram part and streams only that byte window.  Do not build a
+            // multi-gigabyte Blob here: doing so defeats seeking and forces the
+            // entire multipart file through the browser before playback.
+            const mediaUrl =
+                "/media?chat=" +
+                encodeURIComponent(chatId) +
+                "&message=" +
+                encodeURIComponent(messageId);
+
+            if (
+                token !==
+                mediaLoadToken
+            ) {
+                return;
+            }
+
+            if (
+                mime.startsWith("video/")
+            ) {
+                const video =
+                    document.createElement(
+                        "video"
+                    );
+
+                video.controls = true;
+                video.preload = "metadata";
+                video.src = mediaUrl;
+
+                mediaContainer.appendChild(
+                    video
                 );
 
-            audio.controls = true;
-            audio.preload =
-                "metadata";
-            audio.src =
-                currentObjectUrl;
+                mediaStatus.textContent =
+                    "Video ready for streaming.";
+            } else {
+                const audio =
+                    document.createElement(
+                        "audio"
+                    );
 
-            mediaContainer.appendChild(
-                audio
-            );
+                audio.controls = true;
+                audio.preload = "metadata";
+                audio.src = mediaUrl;
 
-            mediaStatus.textContent =
-                "Audio loaded.";
+                mediaContainer.appendChild(
+                    audio
+                );
+
+                mediaStatus.textContent =
+                    "Audio ready for streaming.";
+            }
         } else {
+            const pieces =
+                await fetchMediaPieces(
+                    info.fileId,
+                    size,
+                    mime,
+                    token
+                );
+
+            if (
+                token !==
+                mediaLoadToken
+            ) {
+                return;
+            }
+
+            const blob =
+                new Blob(
+                    pieces,
+                    {
+                        type: mime
+                    }
+                );
+
+            currentObjectUrl =
+                URL.createObjectURL(
+                    blob
+                );
+
             const link =
                 document.createElement(
                     "a"

@@ -130,8 +130,9 @@ async function loadChats() {
             );
         }
 
-        chats =
-            await response.json();
+        const result = await response.json();
+
+        chats = result.chats || [];
 
         chatSelect.innerHTML = "";
 
@@ -192,7 +193,7 @@ async function loadMessages(
 
         const response =
             await fetch(
-                `/api/messages?chatId=${encodeURIComponent(chatId)}`
+                `/api/messages?chat=${encodeURIComponent(chatId)}`
             );
 
         if (!response.ok) {

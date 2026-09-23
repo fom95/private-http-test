@@ -6,6 +6,14 @@ const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 
 const MAX_ACTIVE_MULTIPART_DOWNLOADS = 1;
 
+// Never let a media player request make us stream hundreds of megabytes or
+// gigabytes as one HTTP 206 response. Browsers commonly send ranges such as
+// bytes=0-1999999999 even when they only need the first few megabytes. A huge
+// response delays metadata/seek handling and can keep the old range alive for
+// many minutes. Returning a bounded 206 range lets the browser issue another
+// range request as soon as it needs more data.
+const MAX_HTTP_RANGE_SIZE = 8 * 1024 * 1024;
+
 const CACHE_CONTROL = "public, max-age=31536000, immutable";
 
 // Files at or under this size are downloaded into memory and served as a
@@ -2639,6 +2647,48 @@ async function handleDirectMediaRequest(
             });
         }
 
+        /*
+         * Do not stream the entire range the browser asked for. Chromium,
+         * Safari and other media stacks can request something like
+         * bytes=0-1999999999 as a probe. For a multi-gigabyte logical file
+         * that would keep this HTTP response open for minutes, which prevents
+         * the player from getting to a later seek request.
+         *
+         * A 206 response is allowed to describe the portion we actually send.
+         * The browser sees Content-Range and will request the next portion
+         * when it needs it. This is also much friendlier to cancellation.
+         */
+        const effectiveStart =
+            range.start;
+
+        const effectiveEnd =
+            Math.min(
+                range.end,
+                effectiveStart +
+                    MAX_HTTP_RANGE_SIZE -
+                    1
+            );
+
+        console.log(
+            "media HTTP range:",
+            JSON.stringify({
+                requestedStart:
+                    range.start,
+                requestedEnd:
+                    range.end,
+                effectiveStart,
+                effectiveEnd,
+                requestedBytes:
+                    range.end -
+                    range.start +
+                    1,
+                servedBytes:
+                    effectiveEnd -
+                    effectiveStart +
+                    1
+            })
+        );
+
         const headers =
             createMediaHeaders({
                 mimeType,
@@ -2646,9 +2696,9 @@ async function handleDirectMediaRequest(
                     fileSize,
                 filename,
                 start:
-                    range.start,
+                    effectiveStart,
                 end:
-                    range.end
+                    effectiveEnd
             });
 
         /* Never cache byte ranges.  Media players routinely issue overlapping
@@ -2684,16 +2734,16 @@ async function handleDirectMediaRequest(
             stream =
                 await stub.downloadMultipartRangeStream(
                     multipartInfo.parts,
-                    range.start,
-                    range.end
+                    effectiveStart,
+                    effectiveEnd
                 );
         } else {
             stream =
                 await stub.downloadRangeStream(
                     fileId,
                     fileSize,
-                    range.start,
-                    range.end
+                    effectiveStart,
+                    effectiveEnd
                 );
         }
 

@@ -1860,199 +1860,225 @@ async function streamMultipartRangeDownload(
     end,
     onFatalError
 ) {
-    const startedAt =
-        Date.now();
-
     let partIndex = 0;
-    let globalOffset = 0;
-    let localStart = 0;
+    let partStart = 0;
 
-    while (
-        partIndex < parts.length &&
-        globalOffset +
-            Number(parts[partIndex].fileSize) <=
-            start
-    ) {
-        globalOffset +=
-            Number(
-                parts[partIndex].fileSize
+    function getPartSize(part) {
+        const size = Number(part.fileSize);
+
+        if (
+            !Number.isSafeInteger(size) ||
+            size <= 0
+        ) {
+            throw new Error(
+                `Invalid multipart part size: ${part.fileSize}`
             );
+        }
 
+        return size;
+    }
+
+    // Find the part containing the requested start offset.
+    while (
+        partIndex < parts.length
+    ) {
+        const partSize =
+            getPartSize(parts[partIndex]);
+
+        if (
+            start <
+            partStart + partSize
+        ) {
+            break;
+        }
+
+        partStart += partSize;
         partIndex++;
     }
 
-    if (
-        partIndex >=
-        parts.length
-    ) {
-        throw new Error(
-            "Multipart range starts beyond the available file."
-        );
-    }
-
-    localStart =
-        start -
-        globalOffset;
-
-    let currentReader = null;
+    let current = null;
     let cancelled = false;
+    let completed = false;
 
     return new ReadableStream({
         async pull(controller) {
-            if (cancelled) {
+            if (
+                cancelled ||
+                completed
+            ) {
                 return;
             }
 
             try {
-                while (
-                    partIndex <
-                    parts.length
-                ) {
-                    if (cancelled) {
-                        return;
-                    }
-
-                    const part =
-                        parts[partIndex];
-
-                    const partSize =
-                        Number(
-                            part.fileSize
-                        );
-
-                    const localEnd =
-                        Math.min(
-                            partSize - 1,
-                            end -
-                                globalOffset
-                        );
-
-                    const stream =
-                        await streamRangeDownload(
-                            client,
-                            part.fileId,
-                            partSize,
-                            localStart,
-                            localEnd,
-                            onFatalError
-                        );
-
-                    currentReader =
-                        stream.getReader();
-
-                    while (true) {
-                        if (cancelled) {
+                while (!cancelled) {
+                    // No active part stream: create one.
+                    if (!current) {
+                        if (
+                            partIndex >= parts.length ||
+                            partStart > end
+                        ) {
+                            completed = true;
+                            controller.close();
                             return;
                         }
 
-                        const result =
-                            await currentReader.read();
+                        const part =
+                            parts[partIndex];
 
-                        if (result.done) {
-                            break;
+                        const partSize =
+                            getPartSize(part);
+
+                        const partEnd =
+                            partStart +
+                            partSize -
+                            1;
+
+                        const localStart =
+                            Math.max(
+                                start,
+                                partStart
+                            ) -
+                            partStart;
+
+                        const localEnd =
+                            Math.min(
+                                end,
+                                partEnd
+                            ) -
+                            partStart;
+
+                        if (
+                            localStart >
+                            localEnd
+                        ) {
+                            partStart =
+                                partEnd + 1;
+
+                            partIndex++;
+                            continue;
                         }
 
-                        controller.enqueue(
-                            result.value
+                        const stream =
+                            await streamRangeDownload(
+                                client,
+                                part.fileId,
+                                partSize,
+                                localStart,
+                                localEnd,
+                                onFatalError
+                            );
+
+                        current = {
+                            reader:
+                                stream.getReader(),
+                            partEnd,
+                            expected:
+                                localEnd -
+                                localStart +
+                                1,
+                            sent: 0
+                        };
+                    }
+
+                    const result =
+                        await current.reader.read();
+
+                    if (!result.done) {
+                        const value =
+                            result.value;
+
+                        const byteLength =
+                            value?.byteLength ??
+                            value?.length ??
+                            0;
+
+                        if (byteLength <= 0) {
+                            throw new Error(
+                                "Multipart stream returned an empty chunk."
+                            );
+                        }
+
+                        const remaining =
+                            current.expected -
+                            current.sent;
+
+                        // The inner stream must never return more bytes
+                        // than the requested range.
+                        if (
+                            byteLength >
+                            remaining
+                        ) {
+                            throw new Error(
+                                "Multipart stream returned too many bytes."
+                            );
+                        }
+
+                        controller.enqueue(value);
+
+                        current.sent +=
+                            byteLength;
+
+                        // Return after one chunk. This prevents the whole
+                        // multipart file from being queued in one pull().
+                        return;
+                    }
+
+                    const finishedPart =
+                        current;
+
+                    try {
+                        await finishedPart.reader.cancel();
+                    } catch {}
+
+                    current = null;
+
+                    if (
+                        finishedPart.sent !==
+                        finishedPart.expected
+                    ) {
+                        throw new Error(
+                            `Multipart part ended early: ` +
+                            `${finishedPart.sent}/${finishedPart.expected} bytes.`
                         );
                     }
 
-                    try {
-                        await currentReader.cancel();
-                    } catch {}
-
-                    currentReader = null;
-
-                    globalOffset +=
-                        localEnd -
-                        localStart +
-                        1;
+                    // Advance by the entire part size, not merely by the
+                    // number of bytes requested from that part.
+                    partStart =
+                        finishedPart.partEnd + 1;
 
                     partIndex++;
 
-                    localStart = 0;
-                }
-
-                if (!cancelled) {
-                    controller.close();
-
-                    console.log(
-                        "media multipart range:",
-                        JSON.stringify({
-                            event:
-                                "complete",
-                            requestedStart:
-                                start,
-                            requestedEnd:
-                                end,
-                            elapsed:
-                                Date.now() -
-                                startedAt
-                        })
-                    );
+                    // Continue here only to initialize the next part or
+                    // close the outer stream.
                 }
             } catch (error) {
                 if (cancelled) {
                     return;
                 }
 
-                console.log("media multipart range:",
-                    JSON.stringify({
-                        event:
-                            "error",
-                        requestedStart:
-                            start,
-                        requestedEnd:
-                            end,
-                        elapsed:
-                            Date.now() -
-                            startedAt,
-                        error:
-                            error?.message ||
-                            String(error)
-                    })
-                );
+                try {
+                    await current?.reader.cancel();
+                } catch {}
 
-                controller.error(
-                    error
-                );
+                current = null;
 
-                onFatalError?.(
-                    error
-                );
+                controller.error(error);
+
+                onFatalError?.(error);
             }
         },
 
         async cancel(reason) {
             cancelled = true;
 
-            if (currentReader) {
+            if (current?.reader) {
                 try {
-                    await currentReader.cancel(
-                        reason
-                    );
+                    await current.reader.cancel(reason);
                 } catch {}
-
-                currentReader = null;
             }
 
-            console.log(
-                "media multipart range:",
-                JSON.stringify({
-                    event:
-                        "cancel",
-                    requestedStart:
-                        start,
-                    requestedEnd:
-                        end,
-                    reason:
-                        reason?.message ||
-                        String(
-                            reason ||
-                            ""
-                        )
-                })
-            );
+            current = null;
         }
     });
 }

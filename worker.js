@@ -4,7 +4,7 @@ import { DurableObject } from "cloudflare:workers";
 const TELEGRAM_CHUNK_SIZE = 256 * 1024;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 
-const MAX_ACTIVE_MULTIPART_DOWNLOADS = 3;
+const MAX_ACTIVE_MULTIPART_DOWNLOADS = 1;
 
 const CACHE_CONTROL = "public, max-age=31536000, immutable";
 
@@ -2612,6 +2612,12 @@ async function handleDirectMediaRequest(
                 end:
                     range.end
             });
+
+        /* Never cache byte ranges.  Media players routinely issue overlapping
+         * speculative ranges while seeking; caching a partial response can
+         * make a stale/aborted range look like a valid response forever. */
+        headers["Cache-Control"] = "no-store";
+        headers["CDN-Cache-Control"] = "no-store";
 
         if (
             request.method ===
@@ -5455,22 +5461,45 @@ export class TelegramConnectionDO extends DurableObject {
     ) {
         const client =
             await this.#ensureClient();
-    
-        return streamMultipartRangeDownload(
-            client,
-            parts,
-            start,
-            end,
-            error =>
-                this.#discardClientOnConnectionError(
-                    error
-                )
-            /*,
-            cancel =>
-                this.#registerMultipartDownload(
-                    cancel
-                )*/
-        );
+
+        /*
+         * A browser can issue several overlapping range requests while
+         * seeking a large media resource.  They are not useful once a newer
+         * range has arrived, and keeping all of them alive makes the single
+         * Telegram connection spend its time downloading stale data.
+         *
+         * Keep only the newest multipart stream alive.  Cancellation is
+         * deliberately registered after the ReadableStream exists so the
+         * cancellation callback can call the stream's real cancel() method.
+         */
+        const stream =
+            await streamMultipartRangeDownload(
+                client,
+                parts,
+                start,
+                end,
+                error =>
+                    this.#discardClientOnConnectionError(
+                        error
+                    )
+            );
+
+        const unregister =
+            this.#registerMultipartDownload(
+                reason => {
+                    stream.cancel(reason).catch(() => {});
+                }
+            );
+
+        /*
+         * A completed/cancelled stream may remain in this one-entry queue
+         * until the next request.  That is intentional: the next request
+         * removes it before registering itself, while keeping the code safe
+         * even if the browser never issues another range.
+         */
+        void unregister;
+
+        return stream;
     }
 }
 

@@ -1641,6 +1641,7 @@ async function streamRangeDownload(
     let bytesSent = 0;
     let telegramWait = 0;
     let processingTime = 0;
+    let cancelled = false;
 
     function report(
         event,
@@ -1752,6 +1753,10 @@ async function streamRangeDownload(
                 telegramWait +=
                     Date.now() -
                     telegramStarted;
+
+                if (cancelled) {
+                    return;
+                }
 
                 if (
                     !bytes ||
@@ -1880,6 +1885,8 @@ async function streamRangeDownload(
         },
 
         async cancel(reason) {
+            cancelled = true;
+
             report(
                 "cancel",
                 {
@@ -1889,8 +1896,9 @@ async function streamRangeDownload(
                 }
             );
 
-            // Client lives in the Durable Object and is reused across
-            // many streams -- nothing to close here.
+            // downloadChunk() cannot be force-aborted, but the flag above
+            // makes the stream stop immediately after the in-flight Telegram
+            // call returns, without enqueueing another stale chunk.
         }
     });
 }
@@ -1900,7 +1908,8 @@ async function streamMultipartRangeDownload(
     parts,
     start,
     end,
-    onFatalError
+    onFatalError,
+    registerDownload = null
 ) {
     const startedAt =
         Date.now();
@@ -1938,8 +1947,9 @@ async function streamMultipartRangeDownload(
 
     let currentReader = null;
     let cancelled = false;
+    let unregister = null;
 
-    return new ReadableStream({
+    const stream = new ReadableStream({
         async pull(controller) {
             if (cancelled) {
                 return;
@@ -2018,6 +2028,11 @@ async function streamMultipartRangeDownload(
                 if (!cancelled) {
                     controller.close();
 
+                    if (unregister) {
+                        unregister();
+                        unregister = null;
+                    }
+
                     console.log(
                         "media multipart range:",
                         JSON.stringify({
@@ -2035,6 +2050,10 @@ async function streamMultipartRangeDownload(
                 }
             } catch (error) {
                 if (cancelled) {
+                    if (unregister) {
+                        unregister();
+                        unregister = null;
+                    }
                     return;
                 }
 
@@ -2078,6 +2097,11 @@ async function streamMultipartRangeDownload(
                 currentReader = null;
             }
 
+            if (unregister) {
+                unregister();
+                unregister = null;
+            }
+
             console.log(
                 "media multipart range:",
                 JSON.stringify({
@@ -2097,6 +2121,20 @@ async function streamMultipartRangeDownload(
             );
         }
     });
+
+    if (registerDownload) {
+        unregister = registerDownload(
+            reason => {
+                cancelled = true;
+
+                if (currentReader) {
+                    void currentReader.cancel(reason).catch(() => {});
+                }
+            }
+        );
+    }
+
+    return stream;
 }
 
 async function getMessageMediaInfo(
@@ -5463,43 +5501,31 @@ export class TelegramConnectionDO extends DurableObject {
             await this.#ensureClient();
 
         /*
-         * A browser can issue several overlapping range requests while
-         * seeking a large media resource.  They are not useful once a newer
-         * range has arrived, and keeping all of them alive makes the single
-         * Telegram connection spend its time downloading stale data.
+         * Register the cancellation callback INSIDE the Durable Object,
+         * before the stream is returned through RPC.  The previous version
+         * registered after returning the stream and tried to call
+         * stream.cancel() on the RPC-transferred stream.  That does not
+         * reliably cancel the producer, which is why stale Range: 0-...
+         * downloads kept generating chunks during a seek.
          *
-         * Keep only the newest multipart stream alive.  Cancellation is
-         * deliberately registered after the ReadableStream exists so the
-         * cancellation callback can call the stream's real cancel() method.
+         * The callback below flips the producer's own cancellation flag and
+         * cancels its current reader.  The in-flight Telegram call is allowed
+         * to finish, but no further stale chunks are requested or enqueued.
          */
-        const stream =
-            await streamMultipartRangeDownload(
-                client,
-                parts,
-                start,
-                end,
-                error =>
-                    this.#discardClientOnConnectionError(
-                        error
-                    )
-            );
-
-        const unregister =
-            this.#registerMultipartDownload(
-                reason => {
-                    stream.cancel(reason).catch(() => {});
-                }
-            );
-
-        /*
-         * A completed/cancelled stream may remain in this one-entry queue
-         * until the next request.  That is intentional: the next request
-         * removes it before registering itself, while keeping the code safe
-         * even if the browser never issues another range.
-         */
-        void unregister;
-
-        return stream;
+        return streamMultipartRangeDownload(
+            client,
+            parts,
+            start,
+            end,
+            error =>
+                this.#discardClientOnConnectionError(
+                    error
+                ),
+            register =>
+                this.#registerMultipartDownload(
+                    register
+                )
+        );
     }
 }
 

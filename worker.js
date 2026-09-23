@@ -1110,6 +1110,93 @@ function parseMultipartFilename(filename) {
     };
 }
 
+async function getMessageMediaInfo(
+    client,
+    env,
+    chatId,
+    messageId,
+    existingMessage = null
+) {
+    const message =
+        existingMessage ||
+        await getMessage(
+            client,
+            env,
+            chatId,
+            messageId
+        );
+
+    const media =
+        getMessageMedia(message);
+
+    if (!media) {
+        return {
+            messageId:
+                Number(messageId),
+            chatId:
+                Number(chatId),
+            type:
+                message?.type || null,
+            media: null
+        };
+    }
+
+    const thumbnails =
+        getMediaThumbnails(media);
+
+    return {
+        messageId:
+            Number(messageId),
+        chatId:
+            Number(chatId),
+        messageType:
+            message.type,
+        mediaType:
+            media.constructor?.name ||
+            null,
+        fileId:
+            media.fileId ?? null,
+        fileUniqueId:
+            media.fileUniqueId ?? null,
+        fileSize:
+            media.fileSize ?? null,
+        mimeType:
+            getMediaMimeType(
+                media,
+                message
+            ),
+        width:
+            media.width ?? null,
+        height:
+            media.height ?? null,
+        duration:
+            media.duration ?? null,
+        fileName:
+            media.fileName ?? null,
+        thumbnails:
+            thumbnails.map(
+                item => ({
+                    fileId:
+                        item.fileId ??
+                        null,
+                    fileUniqueId:
+                        item.fileUniqueId ??
+                        null,
+                    fileSize:
+                        item.fileSize ??
+                        null,
+                    width:
+                        item.width ??
+                        null,
+                    height:
+                        item.height ??
+                        null
+                })
+            )
+    };
+}
+
+
 async function getMultipartMediaInfo(
     client,
     env,
@@ -2127,6 +2214,1358 @@ async function streamMultipartRangeDownload(
 
     return stream;
 }
+
+async function handleImageViewer(
+    request,
+    url
+) {
+    if (
+        request.method !== "GET"
+    ) {
+        return new Response(null, {
+            status: 405,
+            headers: {
+                Allow: "GET"
+            }
+        });
+    }
+
+    const chat =
+        url.searchParams.get("chat");
+
+    const message =
+        url.searchParams.get("message");
+
+    if (!chat || !message) {
+        return new Response(
+            "Missing chat or message.",
+            {
+                status: 400,
+                headers: {
+                    "Content-Type":
+                        "text/plain; charset=utf-8"
+                }
+            }
+        );
+    }
+
+    const mediaUrl =
+        "/media?chat=" +
+        encodeURIComponent(chat) +
+        "&message=" +
+        encodeURIComponent(message);
+
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Image</title>
+<style>
+html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    background: #111;
+}
+
+body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: auto;
+}
+
+img {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+}
+
+#status {
+    color: #ccc;
+    font-family: sans-serif;
+}
+</style>
+</head>
+<body>
+<div id="status">Loading image...</div>
+
+<script>
+(async () => {
+    const status =
+        document.getElementById("status");
+
+    const image =
+        document.createElement("img");
+
+    image.alt = "";
+
+    image.onload = () => {
+        status.remove();
+        document.body.appendChild(
+            image
+        );
+    };
+
+    image.onerror = () => {
+        status.textContent =
+            "Failed to load image.";
+    };
+
+    image.src =
+        ${JSON.stringify(mediaUrl)};
+})();
+</script>
+</body>
+</html>`;
+
+    return new Response(
+        html,
+        {
+            headers: {
+                "Content-Type":
+                    "text/html; charset=utf-8",
+                "Cache-Control":
+                    "no-store"
+            }
+        }
+    );
+}
+
+async function handleDirectMediaRequest(
+    request,
+    env,
+    url,
+    ctx
+) {
+    if (
+        request.method !== "GET" &&
+        request.method !== "HEAD"
+    ) {
+        return new Response(null, {
+            status: 405,
+            headers: {
+                Allow: "GET, HEAD"
+            }
+        });
+    }
+
+    const cacheable =
+        request.method === "GET" &&
+        !request.headers.get("Range");
+
+    const cache =
+        cacheable
+            ? caches.default
+            : null;
+
+    if (cache) {
+        try {
+            const cached =
+                await cache.match(
+                    request
+                );
+
+            if (cached) {
+                return cached;
+            }
+        } catch {}
+    }
+
+    const totalStart =
+        Date.now();
+
+    const timings = {};
+
+    function addTimingHeader(
+        headers
+    ) {
+        headers[
+            "X-Media-Timing"
+        ] =
+            Object.entries(
+                timings
+            )
+                .map(
+                    ([key, value]) =>
+                        `${key}=${value}ms`
+                )
+                .join(", ");
+
+        return headers;
+    }
+
+    const pathParts =
+        url.pathname
+            .split("/")
+            .filter(Boolean);
+
+    let chatId =
+        url.searchParams.get(
+            "chat"
+        );
+
+    let messageId =
+        url.searchParams.get(
+            "message"
+        );
+
+    if (
+        pathParts[0] === "media" &&
+        pathParts.length >= 3
+    ) {
+        chatId =
+            decodeURIComponent(
+                pathParts[1]
+            );
+
+        messageId =
+            decodeURIComponent(
+                pathParts[2]
+            );
+    }
+
+    const thumbnail =
+        url.searchParams.has(
+            "thumb"
+        ) ||
+        url.searchParams.has(
+            "thumbnail"
+        );
+
+    if (!chatId || !messageId) {
+        return json({
+            success: false,
+            error:
+                "Missing chat or message."
+        }, 400);
+    }
+
+    const stub =
+        getConnectionStub(env);
+
+    const infoStart =
+        Date.now();
+
+    const info =
+        await stub.getMediaInfo(
+            chatId,
+            messageId
+        );
+
+    timings.getMediaInfo =
+        Date.now() -
+        infoStart;
+
+    if (!info.fileId) {
+        return json({
+            success: false,
+            error:
+                "Message does not contain supported media."
+        }, 404);
+    }
+
+    /*
+     * Multipart files are represented by several Telegram documents
+     * whose filenames end in .partNNNofNNN.
+     *
+     * A URL referring to ANY one of those messages resolves to the
+     * complete logical file.
+     *
+     * Thumbnails deliberately remain attached to the individual
+     * Telegram message and therefore bypass multipart resolution.
+     */
+    let multipartInfo = null;
+
+    if (!thumbnail) {
+        const multipartStart =
+            Date.now();
+
+        multipartInfo =
+            await stub.getMultipartMediaInfo(
+                chatId,
+                messageId
+            );
+        console.log(
+    "multipart resolution:",
+    JSON.stringify({
+        chatId,
+        messageId,
+        fileName:
+            info.fileName,
+        multipart:
+            Boolean(multipartInfo),
+        originalName:
+            multipartInfo?.originalName ??
+            null,
+        totalParts:
+            multipartInfo?.totalParts ??
+            null,
+        fileSize:
+            multipartInfo?.fileSize ??
+            null,
+        parts:
+            multipartInfo?.parts?.map(
+                part => ({
+                    messageId:
+                        part.messageId,
+                    part:
+                        part.part,
+                    total:
+                        part.total,
+                    fileName:
+                        part.fileName,
+                    fileSize:
+                        part.fileSize
+                })
+            ) ??
+            null
+    })
+);
+
+        timings.multipartResolve =
+            Date.now() -
+            multipartStart;
+    }
+
+    let fileId =
+        info.fileId;
+
+    let fileSize =
+        Number(info.fileSize);
+
+    let mimeType =
+        info.mimeType;
+
+    let filename =
+        info.fileName ||
+        `telegram-${chatId}-${messageId}`;
+
+    if (multipartInfo) {
+        fileSize =
+            multipartInfo.fileSize;
+
+        mimeType =
+            multipartInfo.mimeType ||
+            mimeType ||
+            "application/octet-stream";
+
+        filename =
+            multipartInfo.originalName;
+    }
+
+    if (thumbnail) {
+        if (!info.thumbnails.length) {
+            return json({
+                success: false,
+                error:
+                    "Media has no thumbnail."
+            }, 404);
+        }
+
+        const selected =
+            info.thumbnails[
+                info.thumbnails.length - 1
+            ];
+
+        fileId =
+            selected.fileId;
+
+        fileSize =
+            Number(
+                selected.fileSize
+            );
+
+        mimeType =
+            "image/jpeg";
+
+        filename +=
+            "-thumbnail.jpg";
+    }
+
+    if (
+        !Number.isSafeInteger(
+            fileSize
+        ) ||
+        fileSize <= 0
+    ) {
+        return json({
+            success: false,
+            error:
+                "Media does not contain a downloadable file."
+        }, 500);
+    }
+
+    const rangeHeader =
+        request.headers.get(
+            "Range"
+        );
+
+    if (rangeHeader) {
+        const rangeStart =
+            Date.now();
+
+        const range =
+            parseRange(
+                rangeHeader,
+                fileSize
+            );
+
+        timings.parseRange =
+            Date.now() -
+            rangeStart;
+
+        if (!range) {
+            return new Response(null, {
+                status: 416,
+                headers: {
+                    "Content-Range":
+                        `bytes */${fileSize}`,
+                    "Accept-Ranges":
+                        "bytes",
+                    "Cache-Control":
+                        CACHE_CONTROL,
+                    "Access-Control-Allow-Origin":
+                        "*"
+                }
+            });
+        }
+
+        // Keep one HTTP 206 response bounded. Browsers are allowed to
+        // ask for a very large range (for example bytes=0-1999999999),
+        // but streaming that entire range would make a seek wait behind
+        // hundreds or thousands of Telegram reads. The next browser
+        // request can continue from effectiveEnd + 1.
+        const effectiveEnd =
+            Math.min(
+                range.end,
+                range.start +
+                    MAX_HTTP_RANGE_SIZE -
+                    1
+            );
+
+        const headers =
+            createMediaHeaders({
+                mimeType,
+                size:
+                    fileSize,
+                filename,
+                start:
+                    range.start,
+                end:
+                    effectiveEnd
+            });
+
+        if (
+            request.method ===
+            "HEAD"
+        ) {
+            timings.total =
+                Date.now() -
+                totalStart;
+
+            addTimingHeader(
+                headers
+            );
+
+            return new Response(null, {
+                status: 206,
+                headers
+            });
+        }
+
+        const downloadStart =
+            Date.now();
+
+        let stream;
+
+        if (multipartInfo) {
+            stream =
+                await stub.downloadMultipartRangeStream(
+                    multipartInfo.parts,
+                    range.start,
+                    effectiveEnd
+                );
+        } else {
+            stream =
+                await stub.downloadRangeStream(
+                    fileId,
+                    fileSize,
+                    range.start,
+                    effectiveEnd
+                );
+        }
+
+        timings.streamSetup =
+            Date.now() -
+            downloadStart;
+
+        timings.total =
+            Date.now() -
+            totalStart;
+
+        addTimingHeader(
+            headers
+        );
+
+        return new Response(
+            stream,
+            {
+                status: 206,
+                headers
+            }
+        );
+    }
+
+    if (
+        request.method === "HEAD"
+    ) {
+        timings.total =
+            Date.now() -
+            totalStart;
+
+        const headers =
+            createMediaHeaders({
+                mimeType,
+                size:
+                    fileSize,
+                filename
+            });
+
+        addTimingHeader(
+            headers
+        );
+
+        return new Response(null, {
+            status: 200,
+            headers
+        });
+    }
+
+    const downloadStart =
+        Date.now();
+
+    /*
+     * Multipart files are intentionally never buffered. Even a
+     * 3-part file whose individual pieces are small must be streamed
+     * as one logical file.
+     */
+    if (multipartInfo) {
+        const stream =
+            await stub.downloadMultipartRangeStream(
+                multipartInfo.parts,
+                0,
+                fileSize - 1
+            );
+
+        timings.streamSetup =
+            Date.now() -
+            downloadStart;
+
+        timings.total =
+            Date.now() -
+            totalStart;
+
+        const headers =
+            createMediaHeaders({
+                mimeType,
+                size:
+                    fileSize,
+                filename
+            });
+
+        addTimingHeader(
+            headers
+        );
+
+        return new Response(
+            stream,
+            {
+                status: 200,
+                headers
+            }
+        );
+    }
+
+    const bufferable =
+        cache &&
+        (
+            thumbnail ||
+            fileSize <=
+                MAX_BUFFERED_SIZE
+        );
+
+    if (bufferable) {
+        const body =
+            await stub.downloadBuffer(
+                fileId
+            );
+
+        timings.download =
+            Date.now() -
+            downloadStart;
+
+        timings.total =
+            Date.now() -
+            totalStart;
+
+        const headers =
+            createMediaHeaders({
+                mimeType,
+                size:
+                    body.byteLength,
+                filename
+            });
+
+        addTimingHeader(
+            headers
+        );
+
+        const response =
+            new Response(
+                body,
+                {
+                    status: 200,
+                    headers
+                }
+            );
+
+        safeCachePut(
+            ctx,
+            cache,
+            request,
+            response
+        );
+
+        return response;
+    }
+
+    const stream =
+        await stub.downloadStream(
+            fileId
+        );
+
+    timings.streamSetup =
+        Date.now() -
+        downloadStart;
+
+    timings.total =
+        Date.now() -
+        totalStart;
+
+    const headers =
+        createMediaHeaders({
+            mimeType,
+            size:
+                fileSize,
+            filename
+        });
+
+    addTimingHeader(
+        headers
+    );
+
+    return new Response(
+        stream,
+        {
+            status: 200,
+            headers
+        }
+    );
+}
+
+async function handlePieceRequest(
+    request,
+    env,
+    url,
+    ctx
+) {
+    if (
+        request.method !== "GET" &&
+        request.method !== "HEAD"
+    ) {
+        return new Response(null, {
+            status: 405,
+            headers: {
+                Allow: "GET, HEAD"
+            }
+        });
+    }
+
+    // Piece URLs are content-addressed (fileId + fileSize + offset +
+    // length + mime, always serialized in the same order by fetchPiece),
+    // so they're safe to cache at Cloudflare's edge with the Cache API.
+    // A cache hit costs essentially no CPU and never touches Telegram --
+    // this is what makes repeat views of the same media (reloads, other
+    // viewers, retried requests) nearly free.
+    const cache = caches.default;
+
+    try {
+        const cached =
+            await cache.match(request);
+
+        if (cached) {
+            return cached;
+        }
+    } catch {
+        // Fall through to a normal fetch if the cache read fails.
+    }
+
+    const requestStart =
+        Date.now();
+
+    const fileId =
+        url.searchParams.get(
+            "fileId"
+        );
+
+    const fileSize =
+        Number(
+            url.searchParams.get(
+                "fileSize"
+            )
+        );
+
+    const offset =
+        Number(
+            url.searchParams.get(
+                "offset"
+            )
+        );
+
+    const length =
+        Number(
+            url.searchParams.get(
+                "length"
+            )
+        );
+
+    const mimeType =
+        url.searchParams.get(
+            "mime"
+        ) ||
+        "application/octet-stream";
+
+    if (!fileId) {
+        return json({
+            success: false,
+            error:
+                "Missing fileId."
+        }, 400);
+    }
+
+    if (
+        !Number.isSafeInteger(fileSize) ||
+        !Number.isSafeInteger(offset) ||
+        !Number.isSafeInteger(length) ||
+        fileSize <= 0 ||
+        offset < 0 ||
+        length <= 0
+    ) {
+        return json({
+            success: false,
+            error:
+                "Invalid fileSize, offset, or length."
+        }, 400);
+    }
+
+    if (
+        offset >= fileSize
+    ) {
+        return new Response(null, {
+            status: 416,
+            headers: {
+                "Content-Range":
+                    `bytes */${fileSize}`,
+                "Cache-Control":
+                    "no-store"
+            }
+        });
+    }
+
+    if (
+        offset %
+        TELEGRAM_OFFSET_ALIGNMENT !==
+        0
+    ) {
+        return json({
+            success: false,
+            error:
+                `Offset must be divisible by ${TELEGRAM_OFFSET_ALIGNMENT}.`
+        }, 400);
+    }
+
+    const actualLength =
+        Math.min(
+            length,
+            fileSize - offset
+        );
+
+    const end =
+        offset +
+        actualLength -
+        1;
+
+    const headers = {
+        "Content-Type":
+            mimeType,
+        "Content-Length":
+            String(actualLength),
+        "Cache-Control":
+            CACHE_CONTROL,
+        "Accept-Ranges":
+            "bytes",
+        "Access-Control-Allow-Origin":
+            "*"
+    };
+
+    if (
+        request.method === "HEAD"
+    ) {
+        return new Response(null, {
+            status: 200,
+            headers
+        });
+    }
+
+    const stub =
+        getConnectionStub(env);
+
+    const downloadStart =
+        Date.now();
+
+    const chunks = [];
+    let downloaded = 0;
+    let currentOffset = offset;
+
+    while (
+        downloaded <
+        actualLength
+    ) {
+        const requestLength =
+            Math.min(
+                TELEGRAM_CHUNK_SIZE,
+                actualLength -
+                    downloaded
+            );
+
+        const bytes =
+            await stub.downloadChunk(
+                fileId,
+                currentOffset,
+                requestLength
+            );
+
+            if (
+                !bytes ||
+                bytes.length === 0
+            ) {
+                throw new Error(
+                    "Telegram returned no data at offset " +
+                    currentOffset +
+                    "."
+                );
+            }
+
+            const usableLength =
+                Math.min(
+                    bytes.length,
+                    actualLength -
+                        downloaded
+                );
+
+            chunks.push(
+                usableLength ===
+                bytes.length
+                    ? bytes
+                    : bytes.slice(
+                        0,
+                        usableLength)
+            );
+
+            downloaded +=
+                usableLength;
+
+            currentOffset +=
+                usableLength;
+
+            if (
+                usableLength <
+                bytes.length
+            ) {
+                break;
+            }
+        }
+
+        const downloadTime =
+            Date.now() -
+            downloadStart;
+
+        const output =
+            new Uint8Array(
+                downloaded
+            );
+
+        let position = 0;
+
+        for (
+            const chunk of chunks
+        ) {
+            output.set(
+                chunk,
+                position
+            );
+
+            position +=
+                chunk.length;
+        }
+
+        const totalTime =
+            Date.now() -
+            requestStart;
+
+        headers[
+            "Content-Length"
+        ] =
+            String(output.length);
+
+        headers[
+            "X-Piece-Range"
+        ] =
+            `bytes ${offset}-${offset + output.length - 1}/${fileSize}`;
+
+        headers[
+            "X-Timing-Download"
+        ] =
+            `${downloadTime} ms`;
+
+        headers[
+            "X-Timing-Total"
+        ] =
+            `${totalTime} ms`;
+
+        headers[
+            "X-Piece-Offset"
+        ] =
+            String(offset);
+
+        headers[
+            "X-Piece-Bytes"
+        ] =
+            String(output.length);
+
+    const response =
+        new Response(
+            output,
+            {
+                status: 200,
+                headers
+            }
+        );
+
+    if (
+        request.method === "GET"
+    ) {
+        safeCachePut(
+            ctx,
+            cache,
+            request,
+            response
+        );
+    }
+
+    return response;
+}
+
+async function testDownload(
+    client,
+    fileId
+) {
+    const iterator =
+        client.download(
+            fileId,
+            {
+                chunkSize:
+                    TELEGRAM_CHUNK_SIZE
+            }
+        );
+
+    let total = 0;
+    let chunks = 0;
+
+    try {
+        for await (
+            const chunk of iterator
+        ) {
+            total += chunk.length;
+            chunks++;
+
+            if (chunks >= 2) {
+                break;
+            }
+        }
+    } finally {
+        try {
+            await iterator.return?.();
+        } catch {}
+    }
+
+    return {
+        bytes: total,
+        chunks
+    };
+}
+
+async function handleApi(
+    request,
+    env,
+    url
+) {
+    const path =
+        url.pathname;
+
+    if (path === "/api/chats") {
+        const start =
+            Date.now();
+
+        const stub =
+            getConnectionStub(env);
+
+        const chats =
+            await stub.getChats();
+
+        return json({
+            success: true,
+            timings: {
+                total:
+                    `${Date.now() - start} ms`
+            },
+            chats
+        });
+    }
+
+    if (path === "/api/chat") {
+        const chatId =
+            url.searchParams.get(
+                "chat"
+            );
+
+        if (!chatId) {
+            return json({
+                success: false,
+                error: "Missing chat."
+            }, 400);
+        }
+
+        const start =
+            Date.now();
+
+        const stub =
+            getConnectionStub(env);
+
+        const chat =
+            await stub.getChat(
+                chatId
+            );
+
+        return json({
+            success: true,
+
+            timings: {
+                total:
+                    `${Date.now() - start} ms`
+            },
+
+            chat
+        });
+    }
+
+    if (path === "/api/messages") {
+        const chatId =
+            url.searchParams.get(
+                "chat"
+            );
+    
+        if (!chatId) {
+            return json({
+                success: false,
+                error: "Missing chat."
+            }, 400);
+        }
+    
+        const start =
+            Date.now();
+
+        const stub =
+            getConnectionStub(env);
+
+        const messages =
+            await stub.getMessages(
+                chatId
+            );
+
+        return json({
+            success: true,
+
+            timings: {
+                total:
+                    `${Date.now() - start} ms`
+            },
+
+            chatId:
+                Number(chatId),
+
+            messages
+        });
+    }
+
+    // Batch thumbnails into one request.
+    //
+    // Each thumbnail loaded individually via /media?thumb=1 pays a full
+    // client.start() (a real MTProto round trip, not CPU) on its own.
+    // That's the ~750-1200ms cold-load latency: it's dominated by
+    // network round trips to Telegram, one full set of which happens
+    // per request, not by bytes transferred (thumbnails are tiny).
+    //
+    // This is the practical equivalent of a sprite sheet: instead of N
+    // separate "sheets" (requests) each paying setup cost once, load one
+    // sheet's worth of thumbnails together. Rather than stitching pixels
+    // into one image (which would mean decoding and re-encoding JPEGs --
+    // real CPU work this endpoint doesn't need), it returns each
+    // thumbnail as its own small buffer in one JSON response. Same
+    // latency win, none of the image-processing complexity or CPU cost.
+    if (path === "/api/thumbnails") {
+        const chatId =
+            url.searchParams.get(
+                "chat"
+            );
+
+        const messagesParam =
+            url.searchParams.get(
+                "messages"
+            );
+
+        if (!chatId || !messagesParam) {
+            return json({
+                success: false,
+                error:
+                    "Missing chat or messages."
+            }, 400);
+        }
+
+        const messageIds =
+            messagesParam
+                .split(",")
+                .map(part =>
+                    Number(part.trim())
+                )
+                .filter(id =>
+                    Number.isSafeInteger(id) &&
+                    id > 0
+                );
+
+        const MAX_BATCH = 60;
+
+        if (!messageIds.length) {
+            return json({
+                success: false,
+                error:
+                    "No valid message IDs."
+            }, 400);
+        }
+
+        if (
+            messageIds.length >
+            MAX_BATCH
+        ) {
+            return json({
+                success: false,
+                error:
+                    `Too many messages requested (max ${MAX_BATCH}).`
+            }, 400);
+        }
+
+        const start =
+            Date.now();
+
+        const stub =
+            getConnectionStub(env);
+
+        const thumbnails = {};
+
+        for (
+            const messageId of messageIds
+        ) {
+            try {
+                const buffer =
+                    await stub.getThumbnailBuffer(
+                        chatId,
+                        messageId
+                    );
+
+                if (!buffer) {
+                    thumbnails[
+                        messageId
+                    ] = null;
+
+                    continue;
+                }
+
+                thumbnails[
+                    messageId
+                ] = {
+                    mimeType:
+                        "image/jpeg",
+                    dataUrl:
+                        "data:image/jpeg;base64," +
+                        bufferToBase64(
+                            buffer
+                        )
+                };
+            } catch (error) {
+                // One bad message must not fail the whole batch.
+                console.log(
+                    "Batch thumbnail failed:",
+                    messageId,
+                    error?.message ||
+                        String(error)
+                );
+
+                thumbnails[
+                    messageId
+                ] = null;
+            }
+        }
+
+        return json({
+            success: true,
+            timings: {
+                total:
+                    `${Date.now() - start} ms`
+            },
+            thumbnails
+        }, 200, {
+            "Cache-Control":
+                CACHE_CONTROL
+        });
+    }
+
+    if (path === "/api/media-info") {
+        const chatId =
+            url.searchParams.get(
+                "chat"
+            );
+
+        const messageId =
+            url.searchParams.get(
+                "message"
+            );
+
+        if (!chatId || !messageId) {
+            return json({
+                success: false,
+                error:
+                    "Missing chat or message."
+            }, 400);
+        }
+
+        const stub =
+            getConnectionStub(env);
+
+        return json({
+            success: true,
+            ...(
+                await stub.getMediaInfo(
+                    chatId,
+                    messageId
+                )
+            )
+        });
+    }
+
+    if (path === "/api/message") {
+        const chatId =
+            url.searchParams.get(
+                "chat"
+            );
+
+        const messageId =
+            url.searchParams.get(
+                "message"
+            );
+
+        if (!chatId || !messageId) {
+            return json({
+                success: false,
+                error:
+                    "Missing chat or message."
+            }, 400);
+        }
+
+        const stub =
+            getConnectionStub(env);
+
+        const message =
+            await stub.getMessageDetail(
+                chatId,
+                messageId
+            );
+
+        return json({
+            success: true,
+            message
+        });
+    }
+
+    if (path === "/api/test-download") {
+        const chatId =
+            url.searchParams.get(
+                "chat"
+            );
+
+        const messageId =
+            url.searchParams.get(
+                "message"
+            );
+
+        if (!chatId || !messageId) {
+            return json({
+                success: false,
+                error:
+                    "Missing chat or message."
+            }, 400);
+        }
+
+        const stub =
+            getConnectionStub(env);
+
+        const result =
+            await stub.runTestDownload(
+                chatId,
+                messageId
+            );
+
+        if (!result) {
+            return json({
+                success: false,
+                error:
+                    "Message has no downloadable media."
+            }, 404);
+        }
+
+        return json({
+            success: true,
+            ...result
+        });
+    }
+
+    return json({
+        success: false,
+        error:
+            "Unknown API endpoint."
+    }, 404);
+}
+
 
 function renderPage() {
     return new Response(`<!doctype html>

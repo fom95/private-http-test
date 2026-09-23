@@ -997,8 +997,7 @@ function parseRange(rangeHeader, size) {
         );
 
     if (!match) {
-        return null;
-    }
+        return null;}
 
     let start;
     let end;
@@ -1371,15 +1370,12 @@ function createMediaHeaders({
     size,
     filename,
     start = null,
-    end = null,
-    noStore = false
+    end = null
 }) {
     const headers = {
         "Content-Type": mimeType || "application/octet-stream",
         "Accept-Ranges": "bytes",
-        "Cache-Control": noStore
-            ? "no-store, no-cache, must-revalidate"
-            : CACHE_CONTROL,
+        "Cache-Control": CACHE_CONTROL,
         "Access-Control-Allow-Origin": "*",
         "Content-Disposition": `inline; filename="${String(filename || "media").replace(/["\\]/g, "_")}"`
     };
@@ -1693,30 +1689,50 @@ async function streamRangeDownload(
                     currentOffset +
                     1;
 
-                // Telegram's upload.getFile/downloadChunk API expects the
-                // offset and requested limit to use the file-part alignment.
-                // A browser is allowed to ask us for tiny ranges (for example
-                // bytes=0-0 or the last few bytes of a file). Passing that
-                // tiny range straight through can make Telegram return an
-                // empty chunk. The old code then never had useful bytes to
-                // enqueue, so media clients would retry the same HTTP range
-                // indefinitely.
-                //
-                // Always make the Telegram request at least one 4096-byte
-                // block (while still limiting normal requests to
-                // TELEGRAM_CHUNK_SIZE), then slice the response down to the
-                // exact HTTP range below.
-                const telegramRequestSize =
+                /*
+                 * Telegram upload.getFile has an easy-to-miss constraint:
+                 * without the `precise` flag, every request must stay inside
+                 * one 1 MiB file fragment. A 256 KiB request is valid only
+                 * when it does not cross a 1 MiB boundary.
+                 *
+                 * This is exactly what was breaking seeking. For example,
+                 * offset 479133696 is 960 KiB into its 1 MiB fragment; asking
+                 * Telegram for another 256 KiB crosses the boundary and
+                 * produces LIMIT_INVALID.
+                 *
+                 * Keep the normal 256 KiB size when possible, but reduce the
+                 * request at a boundary to a valid divisor of 1 MiB.
+                 */
+                const TELEGRAM_FRAGMENT_SIZE =
+                    1024 * 1024;
+
+                const fragmentOffset =
+                    currentOffset %
+                    TELEGRAM_FRAGMENT_SIZE;
+
+                const fragmentRemaining =
+                    TELEGRAM_FRAGMENT_SIZE -
+                    fragmentOffset;
+
+                const desiredSize =
                     Math.min(
                         TELEGRAM_CHUNK_SIZE,
-                        Math.max(
-                            TELEGRAM_OFFSET_ALIGNMENT,
-                            Math.ceil(
-                                remaining /
-                                TELEGRAM_OFFSET_ALIGNMENT
-                            ) *
+                        remaining,
+                        fragmentRemaining
+                    );
+
+                /*
+                 * upload.getFile requires `limit` to divide 1 MiB. Use the
+                 * largest allowed 4 KiB multiple no larger than desiredSize.
+                 */
+                const requestSize =
+                    Math.max(
+                        TELEGRAM_OFFSET_ALIGNMENT,
+                        Math.floor(
+                            desiredSize /
                             TELEGRAM_OFFSET_ALIGNMENT
-                        )
+                        ) *
+                        TELEGRAM_OFFSET_ALIGNMENT
                     );
 
                 const telegramStarted =
@@ -1729,7 +1745,7 @@ async function streamRangeDownload(
                             offset:
                                 currentOffset,
                             chunkSize:
-                                telegramRequestSize
+                                requestSize
                         }
                     );
 
@@ -1820,9 +1836,11 @@ async function streamRangeDownload(
                             chunk:
                                 chunks,
                             requestedBytes:
-                                telegramRequestSize,
+                                requestSize,
                             receivedBytes:
                                 bytes.length,
+                            fragmentOffset,
+                            fragmentRemaining,
                             offset:
                                 chunkStart,
                             chunkEnd,
@@ -1884,194 +1902,166 @@ async function streamMultipartRangeDownload(
     end,
     onFatalError
 ) {
-    const startedAt = Date.now();
-    const expectedLength = end - start + 1;
+    const startedAt =
+        Date.now();
 
-    // Locate the Telegram part containing the first requested byte.
     let partIndex = 0;
     let globalOffset = 0;
+    let localStart = 0;
 
     while (
         partIndex < parts.length &&
-        globalOffset + Number(parts[partIndex].fileSize) <= start
+        globalOffset +
+            Number(parts[partIndex].fileSize) <=
+            start
     ) {
-        globalOffset += Number(parts[partIndex].fileSize);
+        globalOffset +=
+            Number(
+                parts[partIndex].fileSize
+            );
+
         partIndex++;
     }
 
-    if (partIndex >= parts.length) {
+    if (
+        partIndex >=
+        parts.length
+    ) {
         throw new Error(
-            `Multipart range starts beyond the available file: ${start}-${end}.`
+            "Multipart range starts beyond the available file."
         );
     }
 
-    let localStart = start - globalOffset;
-    let bytesSent = 0;
+    localStart =
+        start -
+        globalOffset;
+
     let currentReader = null;
     let cancelled = false;
-    let closed = false;
-
-    function finish(controller) {
-        if (closed || cancelled) return;
-        closed = true;
-        controller.close();
-        console.log(
-            "media multipart range:",
-            JSON.stringify({
-                event: "complete",
-                requestedStart: start,
-                requestedEnd: end,
-                expectedLength,
-                bytesSent,
-                elapsed: Date.now() - startedAt
-            })
-        );
-    }
 
     return new ReadableStream({
         async pull(controller) {
-            if (cancelled || closed) return;
+            if (cancelled) {
+                return;
+            }
 
             try {
-                while (partIndex < parts.length) {
-                    if (cancelled || closed) return;
-
-                    const part = parts[partIndex];
-                    const partSize = Number(part.fileSize);
-
-                    if (!Number.isSafeInteger(partSize) || partSize <= 0) {
-                        throw new Error(`Invalid multipart part size at part ${partIndex + 1}.`);
-                    }
-
-                    // Never ask the child range stream for bytes outside the
-                    // exact HTTP range. This is deliberately based on the
-                    // number of bytes still owed, rather than on globalOffset,
-                    // so an off-by-one can never turn into a 0-byte child range.
-                    const remaining = expectedLength - bytesSent;
-                    if (remaining <= 0) {
-                        finish(controller);
+                while (
+                    partIndex <
+                    parts.length
+                ) {
+                    if (cancelled) {
                         return;
                     }
 
-                    const localEnd = Math.min(
-                        partSize - 1,
-                        localStart + remaining - 1
-                    );
+                    const part =
+                        parts[partIndex];
 
-                    if (localEnd < localStart) {
-                        throw new Error(
-                            `Invalid multipart local range ${localStart}-${localEnd} for part ${partIndex + 1}.`
+                    const partSize =
+                        Number(
+                            part.fileSize
                         );
-                    }
 
-                    const stream = await streamRangeDownload(
-                        client,
-                        part.fileId,
-                        partSize,
-                        localStart,
-                        localEnd,
-                        onFatalError
-                    );
+                    const localEnd =
+                        Math.min(
+                            partSize - 1,
+                            end -
+                                globalOffset
+                        );
 
-                    currentReader = stream.getReader();
-                    let partBytes = 0;
+                    const stream =
+                        await streamRangeDownload(
+                            client,
+                            part.fileId,
+                            partSize,
+                            localStart,
+                            localEnd,
+                            onFatalError
+                        );
+
+                    currentReader =
+                        stream.getReader();
 
                     while (true) {
-                        if (cancelled || closed) return;
-
-                        const result = await currentReader.read();
-                        if (result.done) break;
-
-                        const value = result.value;
-                        const valueLength =
-                            value?.byteLength ?? value?.length ?? 0;
-
-                        // A child stream must never contribute more than the
-                        // remaining HTTP response length. If it somehow does,
-                        // slice it rather than sending a body longer than the
-                        // Content-Length advertised by the Worker.
-                        const allowed = Math.min(
-                            valueLength,
-                            expectedLength - bytesSent
-                        );
-
-                        if (allowed > 0) {
-                            const output =
-                                allowed === valueLength
-                                    ? value
-                                    : value.slice(0, allowed);
-
-                            controller.enqueue(output);
-                            bytesSent += allowed;
-                            partBytes += allowed;
-                        }
-
-                        if (bytesSent >= expectedLength) {
-                            try {
-                                await currentReader.cancel();
-                            } catch {}
-                            currentReader = null;
-                            finish(controller);
+                        if (cancelled) {
                             return;
                         }
+
+                        const result =
+                            await currentReader.read();
+
+                        if (result.done) {
+                            break;
+                        }
+
+                        controller.enqueue(
+                            result.value
+                        );
                     }
 
                     try {
                         await currentReader.cancel();
                     } catch {}
+
                     currentReader = null;
 
-                    const requestedPartLength = localEnd - localStart + 1;
+                    globalOffset +=
+                        localEnd -
+                        localStart +
+                        1;
 
-                    // If the child stream ended before delivering the bytes it
-                    // promised, do not silently close a shorter HTTP 206. A
-                    // media element will retry a truncated range forever. Fail
-                    // the response instead so the browser can recover/retry
-                    // rather than accepting a corrupt cached range.
-                    if (partBytes !== requestedPartLength) {
-                        throw new Error(
-                            `Multipart child stream ended early: part ${partIndex + 1}, ` +
-                            `expected ${requestedPartLength} bytes, got ${partBytes}.`
-                        );
-                    }
-
-                    if (bytesSent >= expectedLength) {
-                        finish(controller);
-                        return;
-                    }
-
-                    // We reached the end of this Telegram part. Continue with
-                    // the next part, starting at byte zero of that part.
                     partIndex++;
+
                     localStart = 0;
                 }
 
-                if (bytesSent !== expectedLength) {
-                    throw new Error(
-                        `Multipart stream ended short: expected ${expectedLength} bytes, got ${bytesSent}.`
+                if (!cancelled) {
+                    controller.close();
+
+                    console.log(
+                        "media multipart range:",
+                        JSON.stringify({
+                            event:
+                                "complete",
+                            requestedStart:
+                                start,
+                            requestedEnd:
+                                end,
+                            elapsed:
+                                Date.now() -
+                                startedAt
+                        })
                     );
                 }
-
-                finish(controller);
             } catch (error) {
-                if (cancelled || closed) return;
+                if (cancelled) {
+                    return;
+                }
 
-                console.log(
-                    "media multipart range:",
+                console.log("media multipart range:",
                     JSON.stringify({
-                        event: "error",
-                        requestedStart: start,
-                        requestedEnd: end,
-                        expectedLength,
-                        bytesSent,
-                        elapsed: Date.now() - startedAt,
-                        error: error?.message || String(error)
+                        event:
+                            "error",
+                        requestedStart:
+                            start,
+                        requestedEnd:
+                            end,
+                        elapsed:
+                            Date.now() -
+                            startedAt,
+                        error:
+                            error?.message ||
+                            String(error)
                     })
                 );
 
-                closed = true;
-                controller.error(error);
-                onFatalError?.(error);
+                controller.error(
+                    error
+                );
+
+                onFatalError?.(
+                    error
+                );
             }
         },
 
@@ -2080,20 +2070,29 @@ async function streamMultipartRangeDownload(
 
             if (currentReader) {
                 try {
-                    await currentReader.cancel(reason);
+                    await currentReader.cancel(
+                        reason
+                    );
                 } catch {}
+
                 currentReader = null;
             }
 
             console.log(
                 "media multipart range:",
                 JSON.stringify({
-                    event: "cancel",
-                    requestedStart: start,
-                    requestedEnd: end,
-                    expectedLength,
-                    bytesSent,
-                    reason: reason?.message || String(reason || "")
+                    event:
+                        "cancel",
+                    requestedStart:
+                        start,
+                    requestedEnd:
+                        end,
+                    reason:
+                        reason?.message ||
+                        String(
+                            reason ||
+                            ""
+                        )
                 })
             );
         }
@@ -2321,14 +2320,9 @@ async function handleDirectMediaRequest(
         });
     }
 
-    // Never cache HTTP range responses in the browser/edge. A media
-    // element is allowed to probe the same byte range repeatedly, and
-    // caching a broken/empty 206 response can make the player retry that
-    // range forever even after the worker has been fixed.
-    const hasRange = Boolean(request.headers.get("Range"));
     const cacheable =
         request.method === "GET" &&
-        !hasRange;
+        !request.headers.get("Range");
 
     const cache =
         cacheable
@@ -2600,9 +2594,7 @@ async function handleDirectMediaRequest(
                     "Accept-Ranges":
                         "bytes",
                     "Cache-Control":
-                        "no-store, no-cache, must-revalidate",
-                    "CDN-Cache-Control":
-                        "no-store",
+                        CACHE_CONTROL,
                     "Access-Control-Allow-Origin":
                         "*"
                 }
@@ -2618,11 +2610,8 @@ async function handleDirectMediaRequest(
                 start:
                     range.start,
                 end:
-                    range.end,
-                noStore: true
+                    range.end
             });
-
-        headers["CDN-Cache-Control"] = "no-store";
 
         if (
             request.method ===
@@ -2739,8 +2728,7 @@ async function handleDirectMediaRequest(
                 mimeType,
                 size:
                     fileSize,
-                filename,
-                noStore: true
+                filename
             });
 
         addTimingHeader(
@@ -3049,8 +3037,7 @@ async function handlePieceRequest(
                     ? bytes
                     : bytes.slice(
                         0,
-                        usableLength
-                    )
+                        usableLength)
             );
 
             downloaded +=
@@ -4049,8 +4036,7 @@ async function loadMessages(chatId) {
                     )
                     .join("\\n")
             ) +
-            "</pre>";
-    }
+            "</pre>";}
 }
 
 async function fetchPiece(
@@ -5049,8 +5035,7 @@ export class TelegramConnectionDO extends DurableObject {
         "multipart download queue:",
         JSON.stringify({
             event:
-                "start",
-            id,
+                "start",id,
             active:
                 this.#activeMultipartDownloads.size
         })

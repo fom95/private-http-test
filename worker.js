@@ -997,8 +997,7 @@ function parseRange(rangeHeader, size) {
         );
 
     if (!match) {
-        return null;
-    }
+        return null;}
 
     let start;
     let end;
@@ -1997,8 +1996,7 @@ async function streamMultipartRangeDownload(
                     return;
                 }
 
-                console.log(
-                    "media multipart range:",
+                console.log("media multipart range:",
                     JSON.stringify({
                         event:
                             "error",
@@ -2997,8 +2995,7 @@ async function handlePieceRequest(
                     ? bytes
                     : bytes.slice(
                         0,
-                        usableLength
-                    )
+                        usableLength)
             );
 
             downloaded +=
@@ -3997,8 +3994,7 @@ async function loadMessages(chatId) {
                     )
                     .join("\\n")
             ) +
-            "</pre>";
-    }
+            "</pre>";}
 }
 
 async function fetchPiece(
@@ -4997,8 +4993,7 @@ export class TelegramConnectionDO extends DurableObject {
         "multipart download queue:",
         JSON.stringify({
             event:
-                "start",
-            id,
+                "start",id,
             active:
                 this.#activeMultipartDownloads.size
         })

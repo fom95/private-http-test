@@ -53,6 +53,56 @@ async function mapLimit(items, limit, fn) {
     return results;
 }
 
+// Global cap on simultaneous Telegram download requests, with a priority
+// lane. Small, latency-sensitive downloads (thumbnails) jump ahead of bulk
+// stream chunks, so a big image or video can't starve them on the shared
+// connection. Cancelled stream chunks are skipped before they start.
+const TELEGRAM_MAX_IN_FLIGHT = 8;
+
+class TelegramScheduler {
+    constructor(limit) {
+        this.limit = limit;
+        this.active = 0;
+        this.high = [];
+        this.low = [];
+    }
+
+    run(fn, priority = "low") {
+        return new Promise((resolve, reject) => {
+            (priority === "high" ? this.high : this.low)
+                .push({ fn, resolve, reject });
+            this.#pump();
+        });
+    }
+
+    #pump() {
+        while (this.active < this.limit) {
+            const job = this.high.shift() || this.low.shift();
+            if (!job) return;
+
+            this.active++;
+
+            Promise.resolve()
+                .then(job.fn)
+                .then(job.resolve, job.reject)
+                .finally(() => {
+                    this.active--;
+                    this.#pump();
+                });
+        }
+    }
+
+    stats() {
+        return {
+            active: this.active,
+            queuedHigh: this.high.length,
+            queuedLow: this.low.length
+        };
+    }
+}
+
+const telegramScheduler = new TelegramScheduler(TELEGRAM_MAX_IN_FLIGHT);
+
 function json(data, status = 200, extraHeaders = {}) {
     return new Response(JSON.stringify(data, null, 2), {
         status,
@@ -1394,55 +1444,56 @@ function createMediaHeaders({
 // A fully-buffered body has no such coupling: cloning it is an instant
 // refcount, both readers are already-resolved data, and nothing holds the
 // Telegram connection open. Only use this for genuinely small files.
-async function bufferFullDownload(
-    client,
-    fileId
-) {
-    const chunks = [];
-    let total = 0;
+async function bufferFullDownload(client, fileId) {
+    const queuedAt = Date.now();
 
-    const iterator =
-        client.download(fileId, {
-            chunkSize:
-                TELEGRAM_CHUNK_SIZE
+    return telegramScheduler.run(async () => {
+        const startedAt = Date.now();
+        const chunks = [];
+        let total = 0;
+
+        const iterator = client.download(fileId, {
+            chunkSize: TELEGRAM_CHUNK_SIZE
         });
 
-    try {
-        while (true) {
-            const result =
-                await iterator.next();
-
-            if (result.done) {
-                break;
-            }
-
-            const chunk =
-                result.value;
-
-            chunks.push(chunk);
-            total += chunk.length;
-        }
-    } finally {
         try {
-            await iterator.return?.();
-        } catch {}
-    }
+            while (true) {
+                const result = await iterator.next();
+                if (result.done) break;
 
-    if (chunks.length === 1) {
-        return chunks[0];
-    }
+                chunks.push(result.value);
+                total += result.value.length;
+            }
+        } finally {
+            try { await iterator.return?.(); } catch {}
+        }
 
-    const output =
-        new Uint8Array(total);
+        const finishedAt = Date.now();
 
-    let position = 0;
+        if (finishedAt - queuedAt > SLOW_MS) {
+            console.log("slow buffer download:", JSON.stringify({
+                fileId: String(fileId),
+                bytes: total,
+                queueWait: startedAt - queuedAt,
+                telegram: finishedAt - startedAt,
+                ...telegramScheduler.stats()
+            }));
+        }
 
-    for (const chunk of chunks) {
-        output.set(chunk, position);
-        position += chunk.length;
-    }
+        if (chunks.length === 1) {
+            return chunks[0];
+        }
 
-    return output;
+        const output = new Uint8Array(total);
+        let position = 0;
+
+        for (const chunk of chunks) {
+            output.set(chunk, position);
+            position += chunk.length;
+        }
+
+        return output;
+    }, "high");
 }
 
 async function streamFullDownload(client, fileId, onFatalError) {
@@ -1536,21 +1587,34 @@ async function streamRangeDownload(
     }
 
     async function fetchChunk(offset, requestedSize) {
-        const began = Date.now();
+        const queuedAt = Date.now();
+        let telegramStartedAt = 0;
 
-        const bytes = await client.downloadChunk(fileId, {
-            offset,
-            chunkSize: requestedSize
-        });
+        const bytes = await telegramScheduler.run(async () => {
+            if (cancelled) return null;
 
-        const took = Date.now() - began;
+            telegramStartedAt = Date.now();
 
-        if (took > SLOW_MS) {
+            return client.downloadChunk(fileId, {
+                offset,
+                chunkSize: requestedSize
+            });
+        }, "low");
+
+        if (cancelled || bytes === null) {
+            return null;
+        }
+
+        const finishedAt = Date.now();
+
+        if (finishedAt - queuedAt > SLOW_MS) {
             console.log("slow telegram chunk:", JSON.stringify({
                 fileId: String(fileId),
                 offset,
                 requestedSize,
-                ms: took
+                queueWait: telegramStartedAt - queuedAt,
+                telegram: finishedAt - telegramStartedAt,
+                ...telegramScheduler.stats()
             }));
         }
 
@@ -2181,7 +2245,12 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
         return response;
     }
 
-    const stream = await stub.downloadStream(fileId);
+    // Large single-file GET without a Range header: use the parallel
+    // read-ahead streamer (same bytes, 200 response) instead of the serial
+    // one-chunk-at-a-time iterator.
+    const stream = await stub.downloadRangeStream(
+        fileId, fileSize, 0, fileSize - 1
+    );
 
     timings.streamSetup = Date.now() - downloadStart;
 
@@ -4730,13 +4799,7 @@ export class TelegramConnectionDO extends DurableObject {
     ) {
         return this.#withClient(
             client =>
-                client.downloadChunk(
-                    fileId,
-                    {
-                        offset,
-                        chunkSize
-                    }
-                )
+                telegramScheduler.run(() => client.downloadChunk(fileId, { offset, chunkSize }), "low")
         );
     }
 

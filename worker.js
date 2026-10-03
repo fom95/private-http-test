@@ -67,25 +67,60 @@ class TelegramScheduler {
         this.low = [];
     }
 
-    run(fn, priority = "low") {
+    // order: lower runs first among "low" jobs, so an older stream finishes
+    // before a newer one gets slots (instead of every stream crawling).
+    // timeoutMs frees the slot if Telegram never answers; the underlying
+    // call can't be aborted, but it no longer blocks everyone else.
+    run(fn, priority = "low", order = 0, timeoutMs = 0) {
         return new Promise((resolve, reject) => {
             (priority === "high" ? this.high : this.low)
-                .push({ fn, resolve, reject });
+                .push({ fn, resolve, reject, order, timeoutMs });
             this.#pump();
         });
     }
 
+    #next() {
+        if (this.high.length) return this.high.shift();
+        if (!this.low.length) return null;
+
+        let best = 0;
+
+        for (let i = 1; i < this.low.length; i++) {
+            if (this.low[i].order < this.low[best].order) best = i;
+        }
+
+        return this.low.splice(best, 1)[0];
+    }
+
     #pump() {
         while (this.active < this.limit) {
-            const job = this.high.shift() || this.low.shift();
+            const job = this.#next();
             if (!job) return;
 
             this.active++;
 
-            Promise.resolve()
-                .then(job.fn)
+            let timer = null;
+            const work = Promise.resolve().then(job.fn);
+
+            const raced = job.timeoutMs
+                ? Promise.race([
+                    work,
+                    new Promise((_, reject) => {
+                        timer = setTimeout(
+                            () => reject(new Error(
+                                "Telegram request timed out after " +
+                                Math.round(job.timeoutMs / 1000) + "s."
+                            )),
+                            job.timeoutMs
+                        );
+                    })
+                ])
+                : work;
+
+            raced
                 .then(job.resolve, job.reject)
                 .finally(() => {
+                    if (timer) clearTimeout(timer);
                     this.active--;
                     this.#pump();
                 });
@@ -99,6 +134,30 @@ class TelegramScheduler {
             queuedLow: this.low.length
         };
     }
+}
+
+const TELEGRAM_CHUNK_TIMEOUT_MS = 30 * 1000;
+const TELEGRAM_BUFFER_TIMEOUT_MS = 60 * 1000;
+let streamSeq = 0;
+
+// upload.getFile only accepts a limit that is 4096 * 2^k (max 1 MiB), at an
+// offset that is a multiple of that limit, and the read must stay inside one
+// 1 MiB fragment. Any other size (e.g. a "remaining bytes" tail) is rejected
+// with LIMIT_INVALID. Callers slice off whatever extra bytes come back.
+function telegramRequestSize(offset, remaining) {
+    let want = TELEGRAM_OFFSET_ALIGNMENT;
+
+    while (want < remaining && want < TELEGRAM_FRAGMENT_SIZE) {
+        want *= 2;
+    }
+
+    let align = TELEGRAM_FRAGMENT_SIZE;
+
+    while (align > TELEGRAM_OFFSET_ALIGNMENT && offset % align !== 0) {
+        align /= 2;
+    }
+
+    return Math.min(want, align);
 }
 
 const telegramScheduler = new TelegramScheduler(TELEGRAM_MAX_IN_FLIGHT);
@@ -1493,7 +1552,7 @@ async function bufferFullDownload(client, fileId) {
         }
 
         return output;
-    }, "high");
+    }, "high", 0, TELEGRAM_BUFFER_TIMEOUT_MS);
 }
 
 async function streamFullDownload(client, fileId, onFatalError) {
@@ -1556,9 +1615,10 @@ async function streamRangeDownload(
     end,
     onFatalError
 ) {
+    // Start on a 1 MiB boundary so every request has a valid offset/limit.
     const alignedStart =
-        Math.floor(start / TELEGRAM_OFFSET_ALIGNMENT) *
-        TELEGRAM_OFFSET_ALIGNMENT;
+        Math.floor(start / TELEGRAM_FRAGMENT_SIZE) *
+        TELEGRAM_FRAGMENT_SIZE;
 
     let nextOffset = alignedStart;
     let cancelled = false;
@@ -1568,38 +1628,52 @@ async function streamRangeDownload(
     const queue = [];
     const startedAt = Date.now();
 
-    // A Telegram read must not cross a 1 MiB fragment boundary.
+    const order = ++streamSeq;
+
     function requestSizeAt(offset, remaining) {
-        const fragmentRemaining =
-            TELEGRAM_FRAGMENT_SIZE - (offset % TELEGRAM_FRAGMENT_SIZE);
-
-        const desired = Math.min(
-            TELEGRAM_CHUNK_SIZE,
-            remaining,
-            fragmentRemaining
-        );
-
-        return Math.max(
-            TELEGRAM_OFFSET_ALIGNMENT,
-            Math.floor(desired / TELEGRAM_OFFSET_ALIGNMENT) *
-                TELEGRAM_OFFSET_ALIGNMENT
-        );
+        return telegramRequestSize(offset, remaining);
     }
 
     async function fetchChunk(offset, requestedSize) {
         const queuedAt = Date.now();
         let telegramStartedAt = 0;
+        let bytes = null;
 
-        const bytes = await telegramScheduler.run(async () => {
-            if (cancelled) return null;
+        for (let attempt = 0; ; attempt++) {
+            try {
+                bytes = await telegramScheduler.run(async () => {
+                    if (cancelled) return null;
 
-            telegramStartedAt = Date.now();
+                    telegramStartedAt = Date.now();
 
-            return client.downloadChunk(fileId, {
-                offset,
-                chunkSize: requestedSize
-            });
-        }, "low");
+                    return client.downloadChunk(fileId, {
+                        offset,
+                        chunkSize: requestedSize
+                    });
+                }, "low", order, TELEGRAM_CHUNK_TIMEOUT_MS);
+
+                break;
+            } catch (error) {
+                if (cancelled) return null;
+
+                const message = error?.message || String(error);
+
+                if (!message.includes("timed out")) {
+                    throw error;
+                }
+
+                if (attempt >= 1) {
+                    throw new Error(message + " (connection stalled)");
+                }
+
+                console.log("retrying stalled telegram chunk:", JSON.stringify({
+                    fileId: String(fileId),
+                    offset,
+                    requestedSize,
+                    ...telegramScheduler.stats()
+                }));
+            }
+        }
 
         if (cancelled || bytes === null) {
             return null;
@@ -2429,11 +2503,7 @@ async function handlePieceRequest(
         actualLength
     ) {
         const requestLength =
-            Math.min(
-                TELEGRAM_CHUNK_SIZE,
-                actualLength -
-                    downloaded
-            );
+            telegramRequestSize(currentOffset, actualLength - downloaded);
 
         const bytes =
             await stub.downloadChunk(

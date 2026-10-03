@@ -1465,6 +1465,34 @@ async function getMultipartMediaInfo(
     };
 }
 
+function contentDispositionInline(filename) {
+    const name =
+        String(filename || "media");
+
+    // ASCII-only fallback for old clients: replace anything outside
+    // printable ASCII, plus quotes and backslashes, with "_".
+    const fallback =
+        name
+            .replace(/[^\x20-\x7e]/g, "_")
+            .replace(/["\\]/g, "_");
+
+    // RFC 5987 encoding for the real, Unicode name.
+    // encodeURIComponent leaves ! ' ( ) * unescaped, but those are
+    // not allowed in an RFC 5987 value, so escape them manually.
+    const encoded =
+        encodeURIComponent(name)
+            .replace(
+                /['()*!]/g,
+                c =>
+                    "%" +
+                    c.charCodeAt(0)
+                        .toString(16)
+                        .toUpperCase()
+            );
+
+    return `inline; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
+
 function createMediaHeaders({
     mimeType,
     size,
@@ -1477,7 +1505,7 @@ function createMediaHeaders({
         "Accept-Ranges": "bytes",
         "Cache-Control": CACHE_CONTROL,
         "Access-Control-Allow-Origin": "*",
-        "Content-Disposition": `inline; filename="${String(filename || "media").replace(/["\\]/g, "_")}"`
+        "Content-Disposition": contentDispositionInline(filename)
     };
 
     if (start !== null && end !== null) {

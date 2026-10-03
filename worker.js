@@ -33,6 +33,8 @@ const SLOW_MS = 5000;
 // video player's many Range requests don't each redo Telegram lookups.
 const MEDIA_CACHE_TTL_MS = 15 * 60 * 1000;
 const MEDIA_CACHE_MAX = 500;
+const THUMB_CACHE_MAX_ROWS = 5000;
+const THUMB_CACHE_MAX_BYTES = 1.5 * 1024 * 1024;
 
 async function mapLimit(items, limit, fn) {
     const results = new Array(items.length);
@@ -59,29 +61,50 @@ async function mapLimit(items, limit, fn) {
 // connection. Cancelled stream chunks are skipped before they start.
 const TELEGRAM_MAX_IN_FLIGHT = 8;
 
+// Bulk (stream/chunk) downloads may only use this many of those slots.
+// Everything is multiplexed over ONE Telegram connection, so each extra
+// 1 MiB bulk chunk in flight is another megabyte a tiny thumbnail response
+// has to wait behind. Keeping bulk low leaves the pipe nearly empty for
+// thumbnails. Raise it if single big downloads feel too slow; lower it if
+// thumbnails are still slow while big files stream.
+const TELEGRAM_MAX_BULK_IN_FLIGHT = 3;
+
 class TelegramScheduler {
-    constructor(limit) {
+    constructor(limit, lowLimit) {
         this.limit = limit;
+        this.lowLimit = lowLimit;
         this.active = 0;
+        this.activeLow = 0;
         this.high = [];
         this.low = [];
     }
 
     // order: lower runs first among "low" jobs, so an older stream finishes
-    // before a newer one gets slots (instead of every stream crawling).
-    // timeoutMs frees the slot if Telegram never answers; the underlying
-    // call can't be aborted, but it no longer blocks everyone else.
+    // before a newer one gets slots. timeoutMs frees the slot if Telegram
+    // never answers (the underlying call can't be aborted, but it no longer
+    // blocks everyone else).
     run(fn, priority = "low", order = 0, timeoutMs = 0) {
         return new Promise((resolve, reject) => {
             (priority === "high" ? this.high : this.low)
-                .push({ fn, resolve, reject, order, timeoutMs });
+                .push({
+                    fn,
+                    resolve,
+                    reject,
+                    order,
+                    timeoutMs,
+                    isLow: priority !== "high"
+                });
+
             this.#pump();
         });
     }
 
     #next() {
         if (this.high.length) return this.high.shift();
-        if (!this.low.length) return null;
+
+        if (!this.low.length || this.activeLow >= this.lowLimit) {
+            return null;
+        }
 
         let best = 0;
 
@@ -98,6 +121,7 @@ class TelegramScheduler {
             if (!job) return;
 
             this.active++;
+            if (job.isLow) this.activeLow++;
 
             let timer = null;
             const work = Promise.resolve().then(job.fn);
@@ -122,6 +146,7 @@ class TelegramScheduler {
                 .finally(() => {
                     if (timer) clearTimeout(timer);
                     this.active--;
+                    if (job.isLow) this.activeLow--;
                     this.#pump();
                 });
         }
@@ -130,11 +155,17 @@ class TelegramScheduler {
     stats() {
         return {
             active: this.active,
+            activeBulk: this.activeLow,
             queuedHigh: this.high.length,
             queuedLow: this.low.length
         };
     }
 }
+
+const telegramScheduler = new TelegramScheduler(
+    TELEGRAM_MAX_IN_FLIGHT,
+    TELEGRAM_MAX_BULK_IN_FLIGHT
+);
 
 const TELEGRAM_CHUNK_TIMEOUT_MS = 30 * 1000;
 const TELEGRAM_BUFFER_TIMEOUT_MS = 60 * 1000;
@@ -160,7 +191,6 @@ function telegramRequestSize(offset, remaining) {
     return Math.min(want, align);
 }
 
-const telegramScheduler = new TelegramScheduler(TELEGRAM_MAX_IN_FLIGHT);
 
 function json(data, status = 200, extraHeaders = {}) {
     return new Response(JSON.stringify(data, null, 2), {
@@ -2165,6 +2195,32 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
         return json({ success: false, error: "Missing chat or message." }, 400);
     }
 
+    const thumbKey = `t:${Number(chatId)}:${Number(messageId)}`;
+
+    if (
+        thumbnail &&
+        request.method === "GET" &&
+        !request.headers.get("Range")
+    ) {
+        const hit = await getConnectionStub(env).getCachedThumbnail(thumbKey);
+
+        if (hit) {
+            const headers = createMediaHeaders({
+                mimeType: "image/jpeg",
+                size: hit.byteLength,
+                filename: `telegram-${chatId}-${messageId}-thumbnail.jpg`
+            });
+
+            timings.cachedThumbnail = Date.now() - totalStart;
+            addTimingHeader(headers);
+
+            const response = new Response(hit, { status: 200, headers });
+            safeCachePut(ctx, cache, request, response);
+
+            return response;
+        }
+    }
+
     const stub = getConnectionStub(env);
 
     // Single RPC: message lookup + media info + multipart resolution,
@@ -2301,7 +2357,10 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
         cache && (thumbnail || fileSize <= MAX_BUFFERED_SIZE);
 
     if (bufferable) {
-        const body = await stub.downloadBuffer(fileId);
+        const body = await stub.downloadBuffer(
+            fileId,
+            thumbnail ? thumbKey : null
+        );
 
         timings.download = Date.now() - downloadStart;
 
@@ -4460,6 +4519,109 @@ export class TelegramConnectionDO extends DurableObject {
 
     #nextMultipartDownloadId = 1;
 
+    #bufferInflight = new Map();
+    #sqlReady = false;
+    #thumbPuts = 0;
+
+    constructor(ctx, env) {
+        super(ctx, env);
+
+        // Thumbnails are tiny and effectively immutable, so persist them in
+        // this Durable Object's SQLite storage. After the first successful
+        // download a thumbnail never needs Telegram again, even across
+        // Worker isolates, edge locations and Durable Object restarts.
+        try {
+            ctx.storage.sql.exec(
+                "CREATE TABLE IF NOT EXISTS thumb_cache (" +
+                "k TEXT PRIMARY KEY, data BLOB NOT NULL, ts INTEGER NOT NULL)"
+            );
+
+            this.#sqlReady = true;
+        } catch (error) {
+            console.log(
+                "thumbnail cache unavailable:",
+                error?.message || String(error)
+            );
+        }
+    }
+
+    #thumbGet(key) {
+        if (!this.#sqlReady || !key) return null;
+
+        try {
+            const rows = this.ctx.storage.sql
+                .exec("SELECT data FROM thumb_cache WHERE k = ?", key)
+                .toArray();
+
+            if (!rows.length || !rows[0].data) return null;
+
+            return new Uint8Array(rows[0].data);
+        } catch {
+            return null;
+        }
+    }
+
+    #thumbPut(key, bytes) {
+        if (!this.#sqlReady || !key || !bytes) return;
+        if (bytes.byteLength === 0 || bytes.byteLength > THUMB_CACHE_MAX_BYTES) return;
+
+        try {
+            const buffer = bytes.buffer.slice(
+                bytes.byteOffset,
+                bytes.byteOffset + bytes.byteLength
+            );
+
+            this.ctx.storage.sql.exec(
+                "INSERT OR REPLACE INTO thumb_cache (k, data, ts) VALUES (?, ?, ?)",
+                key,
+                buffer,
+                Date.now()
+            );
+
+            if (++this.#thumbPuts % 25 === 0) {
+                this.ctx.storage.sql.exec(
+                    "DELETE FROM thumb_cache WHERE k IN (" +
+                    "SELECT k FROM thumb_cache ORDER BY ts DESC " +
+                    "LIMIT -1 OFFSET ?)",
+                    THUMB_CACHE_MAX_ROWS
+                );
+            }
+        } catch (error) {
+            console.log(
+                "thumbnail cache write failed:",
+                error?.message || String(error)
+            );
+        }
+    }
+
+    // Share one download between identical concurrent requests and fill the
+    // persistent cache when a cacheKey is given.
+    async #bufferOnce(inflightKey, cacheKey, load) {
+        const cached = this.#thumbGet(cacheKey);
+        if (cached) return cached;
+
+        let pending = this.#bufferInflight.get(inflightKey);
+
+        if (!pending) {
+            pending = load()
+                .then(bytes => {
+                    if (bytes && cacheKey) this.#thumbPut(cacheKey, bytes);
+                    return bytes;
+                })
+                .finally(() => {
+                    this.#bufferInflight.delete(inflightKey);
+                });
+
+            this.#bufferInflight.set(inflightKey, pending);
+        }
+
+        return pending;
+    }
+
+    getCachedThumbnail(key) {
+        return this.#thumbGet(key);
+    }
+
     #mediaCache = new Map();
     #mediaInflight = new Map();
 
@@ -4807,58 +4969,38 @@ export class TelegramConnectionDO extends DurableObject {
         );
     }
 
-    // Used by /api/thumbnails: getMessage + pick-a-thumbnail + download,
-    // all as one RPC call so a batch of N messages costs N stub calls
-    // (cheap, local) rather than N round trips each needing its own
-    // getMediaInfo-then-downloadBuffer pair.
-    async getThumbnailBuffer(
-        chatId,
-        messageId
-    ) {
-        return this.#withClient(
-            async client => {
-                const message =
-                    await getMessage(
-                        client,
-                        this.env,
-                        chatId,
-                        messageId
-                    );
+    // Used by /api/thumbnails. Served from the persistent cache when
+    // possible; otherwise getMessage + pick-a-thumbnail + download.
+    async getThumbnailBuffer(chatId, messageId) {
+        const key = `t:${Number(chatId)}:${Number(messageId)}`;
 
-                const media =
-                    getMessageMedia(
-                        message
-                    );
+        return this.#bufferOnce(key, key, () =>
+            this.#withClient(async client => {
+                const message = await getMessage(
+                    client, this.env, chatId, messageId
+                );
 
-                const thumbs =
-                    getMediaThumbnails(
-                        media
-                    );
+                const thumbs = getMediaThumbnails(getMessageMedia(message));
 
                 if (!thumbs.length) {
                     return null;
                 }
 
-                const selected =
-                    thumbs[
-                        thumbs.length - 1
-                    ];
-
                 return bufferFullDownload(
                     client,
-                    selected.fileId
+                    thumbs[thumbs.length - 1].fileId
                 );
-            }
+            })
         );
     }
 
-    async downloadBuffer(fileId) {
-        return this.#withClient(
-            client =>
-                bufferFullDownload(
-                    client,
-                    fileId
-                )
+    async downloadBuffer(fileId, cacheKey = null) {
+        return this.#bufferOnce(
+            cacheKey || `f:${fileId}`,
+            cacheKey,
+            () => this.#withClient(
+                client => bufferFullDownload(client, fileId)
+            )
         );
     }
 

@@ -3164,6 +3164,28 @@ async function handleApi(
         return json({ success: true, ...result });
     }
 
+    if (path === "/api/sustained") {
+        const chatId = url.searchParams.get("chat");
+        const messageId = url.searchParams.get("message");
+
+        if (!chatId || !messageId) {
+            return json({ success: false, error: "Missing chat or message." }, 400);
+        }
+
+        const n = Math.min(200, Math.max(1, Number(url.searchParams.get("n")) || 60));
+        const c = Math.min(12, Math.max(1, Number(url.searchParams.get("c")) || 4));
+        const mode = url.searchParams.get("mode") === "sched" ? "sched" : "direct";
+
+        const result = await getConnectionStub(env)
+            .runSustainedTest(chatId, messageId, n, c, mode);
+
+        if (!result) {
+            return json({ success: false, error: "Message has no media." }, 404);
+        }
+
+        return json({ success: true, ...result });
+    }
+
     if (path === "/api/test-download") {
         const chatId =
             url.searchParams.get(
@@ -5175,6 +5197,98 @@ export class TelegramConnectionDO extends DurableObject {
             }
 
             return out;
+        });
+    }
+
+    // Diagnostic: sustained download of n sequential 1 MiB chunks with c in
+    // flight, to see whether per-chunk time degrades over time (rate
+    // limiting) and whether our scheduler/cache path ("sched") is slower
+    // than raw client calls ("direct"). Stops launching after 90s.
+    async runSustainedTest(chatId, messageId, n, c, mode) {
+        return this.#withClient(async client => {
+            const message = await getMessage(client, this.env, chatId, messageId);
+            const media = getMessageMedia(message);
+
+            if (!media?.fileId) return null;
+
+            const fileId = media.fileId;
+            const size = Number(media.fileSize);
+            const slots = Math.max(1, Math.floor(size / TELEGRAM_FRAGMENT_SIZE));
+            const base = Math.floor(Math.random() * Math.max(1, slots - n));
+            const order = ++streamSeq;
+
+            const completions = []; // [secondsSinceStart, chunkMs]
+            const errors = [];
+            let next = 0;
+            const t0 = Date.now();
+
+            const withTimeout = p => Promise.race([
+                p,
+                new Promise((_, rej) =>
+                    setTimeout(() => rej(new Error("timeout 60s")), 60000))
+            ]);
+
+            const worker = async () => {
+                while (true) {
+                    if (Date.now() - t0 > 90000) return;
+
+                    const i = next++;
+                    if (i >= n) return;
+
+                    const offset = ((base + i) % slots) * TELEGRAM_FRAGMENT_SIZE;
+                    const started = Date.now();
+
+                    try {
+                        if (mode === "sched") {
+                            await withTimeout(
+                                cachedChunk(client, fileId, offset, order, () => false)
+                            );
+                        } else {
+                            await withTimeout(
+                                client.downloadChunk(fileId, {
+                                    offset,
+                                    chunkSize: TELEGRAM_FRAGMENT_SIZE
+                                })
+                            );
+                        }
+
+                        completions.push([
+                            Math.round((Date.now() - t0) / 100) / 10,
+                            Date.now() - started
+                        ]);
+                    } catch (error) {
+                        errors.push({
+                            i,
+                            ms: Date.now() - started,
+                            error: error?.message || String(error)
+                        });
+                    }
+                }
+            };
+
+            await Promise.all(Array.from({ length: c }, worker));
+
+            const wall = Date.now() - t0;
+            const sorted = completions.map(x => x[1]).sort((a, b) => a - b);
+            const pct = q => sorted.length
+                ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))]
+                : null;
+
+            return {
+                mode,
+                concurrency: c,
+                requested: n,
+                completed: completions.length,
+                wallMs: wall,
+                throughputKBps: Math.round(
+                    completions.length * TELEGRAM_FRAGMENT_SIZE / 1024 / (wall / 1000)
+                ),
+                p50ms: pct(0.5),
+                p90ms: pct(0.9),
+                maxMs: sorted.length ? sorted[sorted.length - 1] : null,
+                errors,
+                completions
+            };
         });
     }
 

@@ -5983,10 +5983,23 @@ export default {
                 });
             }
 
-            if (!env.AUTH_PASSWORD) {
+            if (!env.AUTH_PASSWORD || typeof env.AUTH_PASSWORD !== "string") {
+                // Fails closed. Reports names/types only, never values.
+                const names = Object.keys(env).sort().join(", ") || "(none)";
+
                 return new Response(
-                    "Server not configured: AUTH_PASSWORD secret is not set.",
-                    { status: 503 }
+                    "Server not configured: AUTH_PASSWORD is " +
+                    (env.AUTH_PASSWORD === undefined
+                        ? "missing"
+                        : typeof env.AUTH_PASSWORD === "string"
+                            ? "an empty string"
+                            : "a " + typeof env.AUTH_PASSWORD +
+                              " (it must be a plain secret, not a Secrets Store binding)") +
+                    ".\nVariables this worker can see: " + names + "\n",
+                    {
+                        status: 503,
+                        headers: { "Content-Type": "text/plain; charset=utf-8" }
+                    }
                 );
             }
 

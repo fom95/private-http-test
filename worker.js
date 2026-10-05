@@ -5,7 +5,7 @@ import { DurableObject } from "cloudflare:workers";
 // streamRangeDownload still splits at fragment boundaries, so this avoids
 // LIMIT_INVALID while reducing thousands of tiny Telegram round trips.
 const TELEGRAM_CHUNK_SIZE = 1024 * 1024;
-const TELEGRAM_PARALLEL_REQUESTS = 5;
+const TELEGRAM_PARALLEL_REQUESTS = 8;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 const TELEGRAM_FRAGMENT_SIZE = 1024 * 1024;
 
@@ -59,7 +59,7 @@ async function mapLimit(items, limit, fn) {
 // lane. Small, latency-sensitive downloads (thumbnails) jump ahead of bulk
 // stream chunks, so a big image or video can't starve them on the shared
 // connection. Cancelled stream chunks are skipped before they start.
-const TELEGRAM_MAX_IN_FLIGHT = 8;
+const TELEGRAM_MAX_IN_FLIGHT = 12;
 
 // Bulk (stream/chunk) downloads may only use this many of those slots.
 // Everything is multiplexed over ONE Telegram connection, so each extra
@@ -67,7 +67,7 @@ const TELEGRAM_MAX_IN_FLIGHT = 8;
 // has to wait behind. Keeping bulk low leaves the pipe nearly empty for
 // thumbnails. Raise it if single big downloads feel too slow; lower it if
 // thumbnails are still slow while big files stream.
-const TELEGRAM_MAX_BULK_IN_FLIGHT = 6;
+const TELEGRAM_MAX_BULK_IN_FLIGHT = 8;
 
 class TelegramScheduler {
     constructor(limit, lowLimit) {
@@ -77,6 +77,7 @@ class TelegramScheduler {
         this.activeLow = 0;
         this.high = [];
         this.low = [];
+        this.running = new Set();
     }
 
     // order: lower runs first among "low" jobs, so an older stream finishes
@@ -137,6 +138,7 @@ class TelegramScheduler {
 
             this.active++;
             if (job.isLow) this.activeLow++;
+            this.running.add(job);
 
             let timer = null;
             const work = Promise.resolve().then(job.fn);
@@ -160,11 +162,34 @@ class TelegramScheduler {
                 .then(job.resolve, job.reject)
                 .finally(() => {
                     if (timer) clearTimeout(timer);
-                    this.active--;
-                    if (job.isLow) this.activeLow--;
+                    this.running.delete(job);
+
+                    if (!job.freed) {
+                        this.active--;
+                        if (job.isLow) this.activeLow--;
+                    }
+
                     this.#pump();
                 });
         }
+    }
+
+    // A Telegram call can't be aborted, but once every stream waiting on it
+    // is cancelled (e.g. the user seeked) its result is useless. Free its
+    // slot now so the new stream doesn't wait for the old call to finish.
+    sweepCancelled() {
+        let freed = false;
+
+        for (const job of this.running) {
+            if (!job.freed && job.isLow && job.isCancelled?.()) {
+                job.freed = true;
+                this.active--;
+                this.activeLow--;
+                freed = true;
+            }
+        }
+
+        if (freed) this.#pump();
     }
 
     stats() {
@@ -194,6 +219,32 @@ const chunkCache = new Map();    // key -> Uint8Array (insertion order = LRU)
 const chunkInflight = new Map(); // key -> { promise, waiters, order }
 let chunkCacheBytes = 0;
 
+const chunkStats = { n: 0, ms: 0, bytes: 0, since: Date.now() };
+
+// One summary line per 10 chunks: average per-chunk time and real
+// aggregate throughput (KB/s over wall-clock time, all chunks in flight).
+function recordChunkStat(ms, bytes) {
+    chunkStats.n++;
+    chunkStats.ms += ms;
+    chunkStats.bytes += bytes;
+
+    if (chunkStats.n >= 10) {
+        const wall = Date.now() - chunkStats.since;
+
+        console.log("chunk stats:", JSON.stringify({
+            chunks: chunkStats.n,
+            avgChunkMs: Math.round(chunkStats.ms / chunkStats.n),
+            throughputKBps: Math.round(chunkStats.bytes / 1024 / (wall / 1000)),
+            ...telegramScheduler.stats()
+        }));
+
+        chunkStats.n = 0;
+        chunkStats.ms = 0;
+        chunkStats.bytes = 0;
+        chunkStats.since = Date.now();
+    }
+}
+
 function cachedChunk(client, fileId, offset, order, isCancelled) {
     const key = fileId + ":" + offset;
 
@@ -216,11 +267,17 @@ function cachedChunk(client, fileId, offset, order, isCancelled) {
     entry = { waiters: new Set([isCancelled]), order };
     const current = entry;
 
+    let startedAt = 0;
+
     entry.promise = telegramScheduler.run(
-        () => client.downloadChunk(fileId, {
-            offset,
-            chunkSize: TELEGRAM_FRAGMENT_SIZE
-        }),
+        () => {
+            startedAt = Date.now();
+
+            return client.downloadChunk(fileId, {
+                offset,
+                chunkSize: TELEGRAM_FRAGMENT_SIZE
+            });
+        },
         "low",
         () => current.order,
         TELEGRAM_CHUNK_TIMEOUT_MS,
@@ -228,6 +285,7 @@ function cachedChunk(client, fileId, offset, order, isCancelled) {
         () => [...current.waiters].every(f => f())
     ).then(bytes => {
         if (bytes?.length) {
+            recordChunkStat(Date.now() - startedAt, bytes.length);
             chunkCache.set(key, bytes);
             chunkCacheBytes += bytes.length;
 
@@ -1933,6 +1991,7 @@ async function streamRangeDownload(
             // their results are dropped and nothing new is started.
             cancelled = true;
             queue.length = 0;
+            telegramScheduler.sweepCancelled();
         }
     });
 }
@@ -3086,6 +3145,23 @@ async function handleApi(
             success: true,
             message
         });
+    }
+
+    if (path === "/api/speedtest") {
+        const chatId = url.searchParams.get("chat");
+        const messageId = url.searchParams.get("message");
+
+        if (!chatId || !messageId) {
+            return json({ success: false, error: "Missing chat or message." }, 400);
+        }
+
+        const result = await getConnectionStub(env).runSpeedTest(chatId, messageId);
+
+        if (!result) {
+            return json({ success: false, error: "Message has no media." }, 404);
+        }
+
+        return json({ success: true, ...result });
     }
 
     if (path === "/api/test-download") {
@@ -5030,6 +5106,76 @@ export class TelegramConnectionDO extends DurableObject {
         }
 
         return pending;
+    }
+
+    // Diagnostic: bypasses scheduler and cache and hits Telegram directly.
+    // Compares tiny-request latency, serial 1 MiB chunks, and parallel
+    // batches to tell latency-bound from bandwidth-capped.
+    async runSpeedTest(chatId, messageId) {
+        return this.#withClient(async client => {
+            const message = await getMessage(client, this.env, chatId, messageId);
+            const media = getMessageMedia(message);
+
+            if (!media?.fileId) return null;
+
+            const fileId = media.fileId;
+            const size = Number(media.fileSize);
+            const slots = Math.max(1, Math.floor(size / TELEGRAM_FRAGMENT_SIZE));
+            let counter = 0;
+
+            // Distinct offsets per call so nothing can be reused.
+            const nextOffset = () =>
+                (counter++ % slots) * TELEGRAM_FRAGMENT_SIZE;
+
+            const withTimeout = p => Promise.race([
+                p,
+                new Promise((_, rej) =>
+                    setTimeout(() => rej(new Error("timeout 120s")), 120000))
+            ]);
+
+            const one = async chunkSize => {
+                const t = Date.now();
+
+                try {
+                    const bytes = await withTimeout(
+                        client.downloadChunk(fileId, {
+                            offset: nextOffset(),
+                            chunkSize
+                        })
+                    );
+
+                    return { ms: Date.now() - t, bytes: bytes?.length || 0 };
+                } catch (error) {
+                    return { ms: Date.now() - t, error: error?.message || String(error) };
+                }
+            };
+
+            const out = { fileSize: size };
+
+            out.tiny4KiB_serial = [];
+            for (let i = 0; i < 3; i++) out.tiny4KiB_serial.push(await one(4096));
+
+            out.chunk1MiB_serial = [];
+            for (let i = 0; i < 3; i++) out.chunk1MiB_serial.push(await one(TELEGRAM_FRAGMENT_SIZE));
+
+            for (const n of [4, 8]) {
+                const t = Date.now();
+                const results = await Promise.all(
+                    Array.from({ length: n }, () => one(TELEGRAM_FRAGMENT_SIZE))
+                );
+                const wall = Date.now() - t;
+                const bytes = results.reduce((a, r) => a + (r.bytes || 0), 0);
+
+                out["parallel" + n] = {
+                    wallMs: wall,
+                    perChunkMs: results.map(r => r.ms),
+                    errors: results.filter(r => r.error).map(r => r.error),
+                    throughputKBps: Math.round(bytes / 1024 / (wall / 1000))
+                };
+            }
+
+            return out;
+        });
     }
 
     async runTestDownload(

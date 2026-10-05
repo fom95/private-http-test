@@ -9,7 +9,7 @@ const TELEGRAM_PARALLEL_REQUESTS = 5;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 const TELEGRAM_FRAGMENT_SIZE = 1024 * 1024;
 
-const MAX_ACTIVE_MULTIPART_DOWNLOADS = 3;
+const MAX_ACTIVE_MULTIPART_DOWNLOADS = 8;
 
 // Never let a media player request make us stream hundreds of megabytes or
 // gigabytes as one HTTP 206 response. Browsers commonly send ranges such as
@@ -67,7 +67,7 @@ const TELEGRAM_MAX_IN_FLIGHT = 8;
 // has to wait behind. Keeping bulk low leaves the pipe nearly empty for
 // thumbnails. Raise it if single big downloads feel too slow; lower it if
 // thumbnails are still slow while big files stream.
-const TELEGRAM_MAX_BULK_IN_FLIGHT = 3;
+const TELEGRAM_MAX_BULK_IN_FLIGHT = 6;
 
 class TelegramScheduler {
     constructor(limit, lowLimit) {
@@ -83,7 +83,7 @@ class TelegramScheduler {
     // before a newer one gets slots. timeoutMs frees the slot if Telegram
     // never answers (the underlying call can't be aborted, but it no longer
     // blocks everyone else).
-    run(fn, priority = "low", order = 0, timeoutMs = 0) {
+    run(fn, priority = "low", order = 0, timeoutMs = 0, isCancelled = null) {
         return new Promise((resolve, reject) => {
             (priority === "high" ? this.high : this.low)
                 .push({
@@ -92,6 +92,7 @@ class TelegramScheduler {
                     reject,
                     order,
                     timeoutMs,
+                    isCancelled,
                     isLow: priority !== "high"
                 });
 
@@ -102,14 +103,28 @@ class TelegramScheduler {
     #next() {
         if (this.high.length) return this.high.shift();
 
+        // Drop jobs whose stream was cancelled before they ever started.
+        this.low = this.low.filter(job => {
+            if (job.isCancelled?.()) {
+                job.resolve(null);
+                return false;
+            }
+            return true;
+        });
+
         if (!this.low.length || this.activeLow >= this.lowLimit) {
             return null;
         }
 
+        const orderOf = job =>
+            typeof job.order === "function" ? job.order() : job.order;
+
+        // Newest stream first (the one the user just seeked to). Ties
+        // (same stream) keep queue order because the comparison is strict.
         let best = 0;
 
         for (let i = 1; i < this.low.length; i++) {
-            if (this.low[i].order < this.low[best].order) best = i;
+            if (orderOf(this.low[i]) > orderOf(this.low[best])) best = i;
         }
 
         return this.low.splice(best, 1)[0];
@@ -167,9 +182,71 @@ const telegramScheduler = new TelegramScheduler(
     TELEGRAM_MAX_BULK_IN_FLIGHT
 );
 
-const TELEGRAM_CHUNK_TIMEOUT_MS = 30 * 1000;
+const TELEGRAM_CHUNK_TIMEOUT_MS = 60 * 1000;
 const TELEGRAM_BUFFER_TIMEOUT_MS = 60 * 1000;
 let streamSeq = 0;
+
+// Chunk cache with in-flight dedupe. Overlapping browser range requests,
+// stale + new seek streams, and prefetches all share one Telegram fetch per
+// 1 MiB-aligned chunk. Lives in the Durable Object's isolate.
+const CHUNK_CACHE_MAX_BYTES = 48 * 1024 * 1024;
+const chunkCache = new Map();    // key -> Uint8Array (insertion order = LRU)
+const chunkInflight = new Map(); // key -> { promise, waiters, order }
+let chunkCacheBytes = 0;
+
+function cachedChunk(client, fileId, offset, order, isCancelled) {
+    const key = fileId + ":" + offset;
+
+    const hit = chunkCache.get(key);
+
+    if (hit) {
+        chunkCache.delete(key);
+        chunkCache.set(key, hit);
+        return Promise.resolve(hit);
+    }
+
+    let entry = chunkInflight.get(key);
+
+    if (entry) {
+        entry.waiters.add(isCancelled);
+        entry.order = Math.max(entry.order, order);
+        return entry.promise;
+    }
+
+    entry = { waiters: new Set([isCancelled]), order };
+    const current = entry;
+
+    entry.promise = telegramScheduler.run(
+        () => client.downloadChunk(fileId, {
+            offset,
+            chunkSize: TELEGRAM_FRAGMENT_SIZE
+        }),
+        "low",
+        () => current.order,
+        TELEGRAM_CHUNK_TIMEOUT_MS,
+        // Only skip if EVERY stream waiting on this chunk is cancelled.
+        () => [...current.waiters].every(f => f())
+    ).then(bytes => {
+        if (bytes?.length) {
+            chunkCache.set(key, bytes);
+            chunkCacheBytes += bytes.length;
+
+            while (chunkCacheBytes > CHUNK_CACHE_MAX_BYTES) {
+                const [oldKey, old] = chunkCache.entries().next().value;
+                chunkCache.delete(oldKey);
+                chunkCacheBytes -= old.length;
+            }
+        }
+
+        return bytes;
+    }).finally(() => {
+        if (chunkInflight.get(key) === current) chunkInflight.delete(key);
+    });
+
+    chunkInflight.set(key, entry);
+
+    return entry.promise;
+}
 
 // upload.getFile only accepts a limit that is 4096 * 2^k (max 1 MiB), at an
 // offset that is a multiple of that limit, and the read must stay inside one
@@ -1653,6 +1730,7 @@ async function streamRangeDownload(
     let nextOffset = alignedStart;
     let cancelled = false;
     let firstByteChecked = false;
+    let prefetched = false;
 
     // Ordered queue of in-flight chunk fetches (the read-ahead window).
     const queue = [];
@@ -1660,8 +1738,9 @@ async function streamRangeDownload(
 
     const order = ++streamSeq;
 
-    function requestSizeAt(offset, remaining) {
-        return telegramRequestSize(offset, remaining);
+    // Always full 1 MiB aligned chunks so cache keys are stable.
+    function requestSizeAt() {
+        return TELEGRAM_FRAGMENT_SIZE;
     }
 
     async function fetchChunk(offset, requestedSize) {
@@ -1671,16 +1750,14 @@ async function streamRangeDownload(
 
         for (let attempt = 0; ; attempt++) {
             try {
-                bytes = await telegramScheduler.run(async () => {
-                    if (cancelled) return null;
+                telegramStartedAt = Date.now();
 
-                    telegramStartedAt = Date.now();
+                bytes = await cachedChunk(
+                    client, fileId, offset, order, () => cancelled
+                );
 
-                    return client.downloadChunk(fileId, {
-                        offset,
-                        chunkSize: requestedSize
-                    });
-                }, "low", order, TELEGRAM_CHUNK_TIMEOUT_MS);
+                // Dropped as "cancelled" by a sibling waiter; retry.
+                if (bytes === null && !cancelled && attempt < 2) continue;
 
                 break;
             } catch (error) {
@@ -1752,6 +1829,33 @@ async function streamRangeDownload(
             promise.catch(() => {}); // avoid unhandled rejection if abandoned
             queue.push(promise);
             nextOffset += size;
+        }
+
+        prefetchAhead();
+    }
+
+    // Warm the first chunks past this window so the browser's next range
+    // request (which starts at end + 1) hits the cache. Order 0 is lowest
+    // priority under newest-first scheduling, and a prefetch is never
+    // cancelled with this stream since the next range wants it.
+    function prefetchAhead() {
+        if (cancelled || prefetched) return;
+        if (nextOffset <= end || nextOffset >= fileSize) return;
+
+        prefetched = true;
+
+        for (
+            let i = 0;
+            i < 2 && nextOffset + i * TELEGRAM_FRAGMENT_SIZE < fileSize;
+            i++
+        ) {
+            cachedChunk(
+                client,
+                fileId,
+                nextOffset + i * TELEGRAM_FRAGMENT_SIZE,
+                0,
+                () => false
+            ).catch(() => {});
         }
     }
 

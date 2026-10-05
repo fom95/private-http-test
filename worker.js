@@ -2341,10 +2341,11 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
         request.method === "GET" && !request.headers.get("Range");
 
     const cache = cacheable ? caches.default : null;
+    const cacheKey = cacheKeyFor(url);
 
     if (cache) {
         try {
-            const cached = await cache.match(request);
+            const cached = await cache.match(cacheKey);
             if (cached) return cached;
         } catch {}
     }
@@ -2409,7 +2410,7 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
             addTimingHeader(headers);
 
             const response = new Response(hit, { status: 200, headers });
-            safeCachePut(ctx, cache, request, response);
+            safeCachePut(ctx, cache, cacheKey, response);
 
             return response;
         }
@@ -2567,7 +2568,7 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
         addTimingHeader(headers);
 
         const response = new Response(body, { status: 200, headers });
-        safeCachePut(ctx, cache, request, response);
+        safeCachePut(ctx, cache, cacheKey, response);
 
         return response;
     }
@@ -5783,7 +5784,13 @@ async function verifyToken(token, password) {
 
     const expires = Number(match[1]);
 
-    if (!Number.isSafeInteger(expires) || expires < Date.now() / 1000) {
+    const nowSeconds = Date.now() / 1000;
+
+    if (
+        !Number.isSafeInteger(expires) ||
+        expires < nowSeconds ||
+        expires > nowSeconds + 60 * 60 * 24 * 400
+    ) {
         return false;
     }
 
@@ -5806,7 +5813,10 @@ async function isAuthed(request, password, url) {
 
     if (await verifyToken(bearer, password)) return true;
 
-    return verifyToken(url.searchParams.get("auth"), password);
+    return verifyToken(
+        url.searchParams.get("auth") || url.searchParams.get("auth_token"),
+        password
+    );
 }
 
 function loginPage(message, status = 200) {
@@ -5848,7 +5858,8 @@ p { color:#f88; margin:12px 0 0; min-height:1em; }
 async function handleLogin(request, env, url) {
     // Auto-login: /login?auth=<token>&next=/path sets the cookie and
     // redirects, so the token never stays in the address bar.
-    const token = url.searchParams.get("auth");
+    const token =
+        url.searchParams.get("auth") || url.searchParams.get("auth_token");
 
     if (
         request.method === "GET" &&
@@ -5908,6 +5919,51 @@ async function handleLogin(request, env, url) {
     return loginPage("");
 }
 
+// Used only to build the 401 message so a bad token is debuggable.
+function describeAuthFailure(request, url) {
+    const cookie = request.headers.get("Cookie") || "";
+
+    const candidate =
+        url.searchParams.get("auth") ||
+        url.searchParams.get("auth_token") ||
+        /^Bearer\s+(\S+)$/i.exec(request.headers.get("Authorization") || "")?.[1] ||
+        /(?:^|;\s*)tg_auth=([^;]+)/.exec(cookie)?.[1];
+
+    if (!candidate) {
+        return "no token found (expected ?auth=TOKEN, an Authorization: Bearer header, or the login cookie)";
+    }
+
+    const match = /^(\d+)\.([0-9a-f]+)$/.exec(candidate);
+
+    if (!match) {
+        return "token is malformed (expected <expiry-seconds>.<lowercase hex signature>)";
+    }
+
+    const expires = Number(match[1]);
+    const now = Math.floor(Date.now() / 1000);
+
+    if (expires > now + 60 * 60 * 24 * 400) {
+        return "expiry is too far in the future; it looks like milliseconds, use Unix seconds";
+    }
+
+    if (expires < now) {
+        return "token expired (expiry " + expires + ", server time " + now + ")";
+    }
+
+    return "signature does not match (wrong key, or the signed message is not exactly 'auth:' + expiry)";
+}
+
+// Cache by URL without the token, so every visitor's fresh token still hits
+// the same cached image instead of re-downloading it from Telegram.
+function cacheKeyFor(url) {
+    const clean = new URL(url);
+
+    clean.searchParams.delete("auth");
+    clean.searchParams.delete("auth_token");
+
+    return new Request(clean.toString(), { method: "GET" });
+}
+
 export default {
     async fetch(request, env, ctx) {
         const url =
@@ -5916,6 +5972,17 @@ export default {
             );
 
         try {
+            // Public on purpose: tell well-behaved crawlers to stay away
+            // instead of answering them with a 401 in the logs.
+            if (url.pathname === "/robots.txt") {
+                return new Response("User-agent: *\nDisallow: /\n", {
+                    headers: {
+                        "Content-Type": "text/plain; charset=utf-8",
+                        "Cache-Control": "public, max-age=86400"
+                    }
+                });
+            }
+
             if (!env.AUTH_PASSWORD) {
                 return new Response(
                     "Server not configured: AUTH_PASSWORD secret is not set.",
@@ -5949,7 +6016,11 @@ export default {
                     );
                 }
 
-                return json({ success: false, error: "Unauthorized." }, 401);
+                return json({
+                    success: false,
+                    error: "Unauthorized.",
+                    reason: describeAuthFailure(request, url)
+                }, 401);
             }
 
             if (

@@ -73,7 +73,7 @@ const TELEGRAM_MAX_BULK_IN_FLIGHT = 8;
 // Telegram appears to throttle bursts of upload.getFile calls (the whole
 // connection stalls for seconds). Set this to ~1000 / (safe requests per
 // second) once /api/paced shows which rate avoids the stalls.
-const TELEGRAM_BULK_GAP_MS = 0;
+const TELEGRAM_BULK_GAP_MS = 1000;
 
 class TelegramScheduler {
     constructor(limit, lowLimit, lowGapMs = 0) {
@@ -3237,6 +3237,26 @@ async function handleApi(
         return json({ success: true, ...result });
     }
 
+    if (path === "/api/seektest") {
+        const chatId = url.searchParams.get("chat");
+        const messageId = url.searchParams.get("message");
+
+        if (!chatId || !messageId) {
+            return json({ success: false, error: "Missing chat or message." }, 400);
+        }
+
+        const gapParam = url.searchParams.get("gap");
+        const gap = gapParam === null ? null : Number(gapParam);
+
+        const result = await getConnectionStub(env).runSeekTest(chatId, messageId, gap);
+
+        if (!result) {
+            return json({ success: false, error: "Message has no media." }, 404);
+        }
+
+        return json({ success: true, ...result });
+    }
+
     if (path === "/api/test-download") {
         const chatId =
             url.searchParams.get(
@@ -5423,6 +5443,117 @@ export class TelegramConnectionDO extends DurableObject {
                 slowOver2s: sorted.filter(x => x > 2000).length,
                 errors,
                 completions
+            };
+        });
+    }
+
+    // Diagnostic: simulates a player (read two 8 MiB windows, abort one
+    // half-way, then seek around) using the real streamRangeDownload, and
+    // reports time-to-first-byte for each step. ?gap=N temporarily overrides
+    // the bulk request gap (ms) for this run only.
+    async runSeekTest(chatId, messageId, gapMs) {
+        return this.#withClient(async client => {
+            const message = await getMessage(client, this.env, chatId, messageId);
+            const media = getMessageMedia(message);
+
+            if (!media?.fileId) return null;
+
+            const fileId = media.fileId;
+            const size = Number(media.fileSize);
+            const MiB = TELEGRAM_FRAGMENT_SIZE;
+            const WIN = MAX_HTTP_RANGE_SIZE;
+            const prevGap = telegramScheduler.lowGapMs;
+            const steps = [];
+            const t0 = Date.now();
+
+            if (Number.isFinite(gapMs) && gapMs >= 0) {
+                telegramScheduler.lowGapMs = gapMs;
+            }
+
+            const timeout = (p, label) => Promise.race([
+                p,
+                new Promise((_, rej) =>
+                    setTimeout(() => rej(new Error("timeout 45s: " + label)), 45000))
+            ]);
+
+            const open = (start, bytes) => streamRangeDownload(
+                client, fileId, size, start,
+                Math.min(size - 1, start + bytes - 1)
+            );
+
+            const readStep = async (label, start, windowBytes, stopAfter) => {
+                const began = Date.now();
+                const step = { label, start, atSec: Math.round((began - t0) / 100) / 10 };
+
+                try {
+                    const stream = await open(start, windowBytes);
+                    const reader = stream.getReader();
+                    let got = 0;
+                    step.ttfbMs = null;
+
+                    try {
+                        while (got < stopAfter) {
+                            const r = await timeout(reader.read(), label);
+                            if (r.done) break;
+                            if (step.ttfbMs === null) step.ttfbMs = Date.now() - began;
+                            got += r.value.length;
+                        }
+                    } finally {
+                        await reader.cancel().catch(() => {});
+                    }
+
+                    step.bytes = got;
+                } catch (error) {
+                    step.error = error?.message || String(error);
+                }
+
+                step.totalMs = Date.now() - began;
+                steps.push(step);
+            };
+
+            try {
+                await readStep("play window 1 (full 8 MiB)", 0, WIN, WIN);
+                await readStep("play window 2 (abort after 2 MiB)", WIN, WIN, 2 * MiB);
+                await readStep("seek to 60% (read 1 MiB)",
+                    Math.floor(size * 0.6) + 777, WIN, MiB);
+                await readStep("seek to 30% (read 1 MiB)",
+                    Math.floor(size * 0.3) + 777, WIN, MiB);
+
+                // Overlap: open a stream and abandon it, then seek at once.
+                const began = Date.now();
+                const step = { label: "abandon stream at 40%, seek to 80% right away" };
+
+                try {
+                    const abandoned = await open(Math.floor(size * 0.4), WIN);
+                    const abandonedReader = abandoned.getReader();
+                    const pendingRead = abandonedReader.read().catch(() => {});
+                    await new Promise(r => setTimeout(r, 100));
+
+                    const stream = await open(Math.floor(size * 0.8) + 777, WIN);
+                    const reader = stream.getReader();
+                    const r = await timeout(reader.read(), step.label);
+
+                    step.ttfbMs = Date.now() - began;
+                    step.bytes = r.value?.length || 0;
+
+                    await reader.cancel().catch(() => {});
+                    await abandonedReader.cancel().catch(() => {});
+                    await pendingRead;
+                } catch (error) {
+                    step.error = error?.message || String(error);
+                }
+
+                step.totalMs = Date.now() - began;
+                steps.push(step);
+            } finally {
+                telegramScheduler.lowGapMs = prevGap;
+            }
+
+            return {
+                gapMsUsed: Number.isFinite(gapMs) && gapMs >= 0 ? gapMs : prevGap,
+                fileSize: size,
+                totalSec: Math.round((Date.now() - t0) / 100) / 10,
+                steps
             };
         });
     }

@@ -5855,7 +5855,7 @@ p { color:#f88; margin:12px 0 0; min-height:1em; }
     });
 }
 
-async function handleLogin(request, env, url) {
+async function handleLogin(request, password, url) {
     // Auto-login: /login?auth=<token>&next=/path sets the cookie and
     // redirects, so the token never stays in the address bar.
     const token =
@@ -5864,7 +5864,7 @@ async function handleLogin(request, env, url) {
     if (
         request.method === "GET" &&
         token &&
-        await verifyToken(token, env.AUTH_PASSWORD)
+        await verifyToken(token, password)
     ) {
         const remaining =
             Number(token.split(".")[0]) - Math.floor(Date.now() / 1000);
@@ -5896,7 +5896,7 @@ async function handleLogin(request, env, url) {
 
         const ok = safeEqual(
             await hmacHex("login", submitted),
-            await hmacHex("login", env.AUTH_PASSWORD)
+            await hmacHex("login", password)
         );
 
         if (ok) {
@@ -5904,7 +5904,7 @@ async function handleLogin(request, env, url) {
                 status: 302,
                 headers: {
                     Location: "/",
-                    "Set-Cookie": await makeAuthCookie(env.AUTH_PASSWORD),
+                    "Set-Cookie": await makeAuthCookie(password),
                     "Cache-Control": "no-store"
                 }
             });
@@ -5917,6 +5917,43 @@ async function handleLogin(request, env, url) {
     }
 
     return loginPage("");
+}
+
+// AUTH_PASSWORD may be a plain Worker secret/variable (a string) or a
+// Secrets Store binding (an object with an async get()). The store value is
+// cached briefly in memory because each get() is a network round trip.
+let authPasswordCache = { value: null, at: 0 };
+const AUTH_PASSWORD_TTL_MS = 5 * 60 * 1000;
+
+async function getAuthPassword(env) {
+    const binding = env.AUTH_PASSWORD;
+
+    if (typeof binding === "string") return binding || null;
+
+    if (!binding || typeof binding.get !== "function") return null;
+
+    if (
+        authPasswordCache.value &&
+        Date.now() - authPasswordCache.at < AUTH_PASSWORD_TTL_MS
+    ) {
+        return authPasswordCache.value;
+    }
+
+    try {
+        const value = await binding.get();
+
+        if (typeof value === "string" && value) {
+            authPasswordCache = { value, at: Date.now() };
+            return value;
+        }
+    } catch (error) {
+        console.log(
+            "AUTH_PASSWORD read failed:",
+            error?.message || String(error)
+        );
+    }
+
+    return null;
 }
 
 // Used only to build the 401 message so a bad token is debuggable.
@@ -5983,18 +6020,18 @@ export default {
                 });
             }
 
-            if (!env.AUTH_PASSWORD || typeof env.AUTH_PASSWORD !== "string") {
+            const password = await getAuthPassword(env);
+
+            if (!password) {
                 // Fails closed. Reports names/types only, never values.
                 const names = Object.keys(env).sort().join(", ") || "(none)";
+                const kind = env.AUTH_PASSWORD === undefined
+                    ? "missing"
+                    : "present (" + typeof env.AUTH_PASSWORD +
+                      ") but empty or unreadable";
 
                 return new Response(
-                    "Server not configured: AUTH_PASSWORD is " +
-                    (env.AUTH_PASSWORD === undefined
-                        ? "missing"
-                        : typeof env.AUTH_PASSWORD === "string"
-                            ? "an empty string"
-                            : "a " + typeof env.AUTH_PASSWORD +
-                              " (it must be a plain secret, not a Secrets Store binding)") +
+                    "Server not configured: AUTH_PASSWORD is " + kind +
                     ".\nVariables this worker can see: " + names + "\n",
                     {
                         status: 503,
@@ -6004,7 +6041,7 @@ export default {
             }
 
             if (url.pathname === "/login") {
-                return await handleLogin(request, env, url);
+                return await handleLogin(request, password, url);
             }
 
             if (url.pathname === "/logout") {
@@ -6018,7 +6055,7 @@ export default {
                 });
             }
 
-            if (!(await isAuthed(request, env.AUTH_PASSWORD, url))) {
+            if (!(await isAuthed(request, password, url))) {
                 if (
                     request.method === "GET" &&
                     (url.pathname === "/" || url.pathname === "/index.html")

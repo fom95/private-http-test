@@ -5723,6 +5723,191 @@ export class TelegramConnectionDO extends DurableObject {
     }
 }
 
+// ---------------------------------------------------------------------
+// Password gate. Everything except /login requires a signed cookie.
+// The password lives in the AUTH_PASSWORD Worker secret. If it is not set,
+// the Worker refuses to serve anything (fails closed, never open).
+// ---------------------------------------------------------------------
+const AUTH_COOKIE = "tg_auth";
+const AUTH_MAX_AGE = 60 * 60 * 24 * 30; // 30 days
+const textEncoder = new TextEncoder();
+
+async function hmacHex(key, message) {
+    const cryptoKey = await crypto.subtle.importKey(
+        "raw",
+        textEncoder.encode(key),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"]
+    );
+
+    const signature = await crypto.subtle.sign(
+        "HMAC",
+        cryptoKey,
+        textEncoder.encode(message)
+    );
+
+    return [...new Uint8Array(signature)]
+        .map(b => b.toString(16).padStart(2, "0"))
+        .join("");
+}
+
+function safeEqual(a, b) {
+    if (a.length !== b.length) return false;
+
+    let diff = 0;
+
+    for (let i = 0; i < a.length; i++) {
+        diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    }
+
+    return diff === 0;
+}
+
+async function makeAuthCookie(password) {
+    const expires = Math.floor(Date.now() / 1000) + AUTH_MAX_AGE;
+    const signature = await hmacHex(password, "auth:" + expires);
+
+    return AUTH_COOKIE + "=" + expires + "." + signature +
+        "; Max-Age=" + AUTH_MAX_AGE +
+        "; Path=/; HttpOnly; Secure; SameSite=Lax";
+}
+
+// A token is "<expiryUnixSeconds>.<hex HMAC-SHA256(AUTH_PASSWORD, 'auth:' + expiry)>".
+// The worker issues these as its cookie, and another server that knows
+// AUTH_PASSWORD can mint them too (see the site integration notes).
+async function verifyToken(token, password) {
+    const match = /^(\d+)\.([0-9a-f]+)$/.exec(token || "");
+
+    if (!match) return false;
+
+    const expires = Number(match[1]);
+
+    if (!Number.isSafeInteger(expires) || expires < Date.now() / 1000) {
+        return false;
+    }
+
+    const expected = await hmacHex(password, "auth:" + expires);
+
+    return safeEqual(expected, match[2]);
+}
+
+// Accepts the cookie, an "Authorization: Bearer <token>" header, or an
+// "?auth=<token>" query parameter (needed for <video src> and links).
+async function isAuthed(request, password, url) {
+    const cookie = request.headers.get("Cookie") || "";
+    const fromCookie = /(?:^|;\s*)tg_auth=([^;]+)/.exec(cookie)?.[1];
+
+    if (await verifyToken(fromCookie, password)) return true;
+
+    const bearer = /^Bearer\s+(\S+)$/i.exec(
+        request.headers.get("Authorization") || ""
+    )?.[1];
+
+    if (await verifyToken(bearer, password)) return true;
+
+    return verifyToken(url.searchParams.get("auth"), password);
+}
+
+function loginPage(message, status = 200) {
+    return new Response(`<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in</title>
+<style>
+body { margin:0; background:#111; color:#eee; font-family:Arial,sans-serif;
+       display:flex; align-items:center; justify-content:center; height:100vh; }
+form { background:#181818; border:1px solid #2c2c2c; border-radius:8px;
+       padding:24px; width:300px; }
+input, button { width:100%; box-sizing:border-box; background:#222; color:#eee;
+       border:1px solid #444; border-radius:6px; padding:10px; font-size:15px;
+       margin-top:12px; }
+button { cursor:pointer; }
+p { color:#f88; margin:12px 0 0; min-height:1em; }
+</style>
+</head>
+<body>
+<form method="POST" action="/login">
+<div>Password</div>
+<input type="password" name="password" autofocus autocomplete="current-password">
+<button type="submit">Sign in</button>
+<p>${message}</p>
+</form>
+</body>
+</html>`, {
+        status,
+        headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store"
+        }
+    });
+}
+
+async function handleLogin(request, env, url) {
+    // Auto-login: /login?auth=<token>&next=/path sets the cookie and
+    // redirects, so the token never stays in the address bar.
+    const token = url.searchParams.get("auth");
+
+    if (
+        request.method === "GET" &&
+        token &&
+        await verifyToken(token, env.AUTH_PASSWORD)
+    ) {
+        const remaining =
+            Number(token.split(".")[0]) - Math.floor(Date.now() / 1000);
+
+        let next = url.searchParams.get("next") || "/";
+
+        if (!next.startsWith("/") || next.startsWith("//")) next = "/";
+
+        return new Response(null, {
+            status: 302,
+            headers: {
+                Location: next,
+                "Set-Cookie": AUTH_COOKIE + "=" + token +
+                    "; Max-Age=" + remaining +
+                    "; Path=/; HttpOnly; Secure; SameSite=Lax",
+                "Cache-Control": "no-store",
+                "Referrer-Policy": "no-referrer"
+            }
+        });
+    }
+
+    if (request.method === "POST") {
+        let submitted = "";
+
+        try {
+            const form = await request.formData();
+            submitted = String(form.get("password") || "");
+        } catch {}
+
+        const ok = safeEqual(
+            await hmacHex("login", submitted),
+            await hmacHex("login", env.AUTH_PASSWORD)
+        );
+
+        if (ok) {
+            return new Response(null, {
+                status: 302,
+                headers: {
+                    Location: "/",
+                    "Set-Cookie": await makeAuthCookie(env.AUTH_PASSWORD),
+                    "Cache-Control": "no-store"
+                }
+            });
+        }
+
+        // Slow down guessing.
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        return loginPage("Wrong password.", 401);
+    }
+
+    return loginPage("");
+}
+
 export default {
     async fetch(request, env, ctx) {
         const url =
@@ -5731,6 +5916,42 @@ export default {
             );
 
         try {
+            if (!env.AUTH_PASSWORD) {
+                return new Response(
+                    "Server not configured: AUTH_PASSWORD secret is not set.",
+                    { status: 503 }
+                );
+            }
+
+            if (url.pathname === "/login") {
+                return await handleLogin(request, env, url);
+            }
+
+            if (url.pathname === "/logout") {
+                return new Response(null, {
+                    status: 302,
+                    headers: {
+                        Location: "/login",
+                        "Set-Cookie": AUTH_COOKIE +
+                            "=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax"
+                    }
+                });
+            }
+
+            if (!(await isAuthed(request, env.AUTH_PASSWORD, url))) {
+                if (
+                    request.method === "GET" &&
+                    (url.pathname === "/" || url.pathname === "/index.html")
+                ) {
+                    return Response.redirect(
+                        new URL("/login", request.url).toString(),
+                        302
+                    );
+                }
+
+                return json({ success: false, error: "Unauthorized." }, 401);
+            }
+
             if (
                 url.pathname === "/" ||
                 url.pathname ===

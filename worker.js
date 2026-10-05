@@ -69,8 +69,17 @@ const TELEGRAM_MAX_IN_FLIGHT = 12;
 // thumbnails are still slow while big files stream.
 const TELEGRAM_MAX_BULK_IN_FLIGHT = 8;
 
+// Minimum gap between starting two bulk Telegram requests. 0 = no pacing.
+// Telegram appears to throttle bursts of upload.getFile calls (the whole
+// connection stalls for seconds). Set this to ~1000 / (safe requests per
+// second) once /api/paced shows which rate avoids the stalls.
+const TELEGRAM_BULK_GAP_MS = 0;
+
 class TelegramScheduler {
-    constructor(limit, lowLimit) {
+    constructor(limit, lowLimit, lowGapMs = 0) {
+        this.lowGapMs = lowGapMs;
+        this.nextLowAt = 0;
+        this.pumpTimer = null;
         this.limit = limit;
         this.lowLimit = lowLimit;
         this.active = 0;
@@ -133,8 +142,29 @@ class TelegramScheduler {
 
     #pump() {
         while (this.active < this.limit) {
+            // Pace bulk starts (thumbnails / "high" jobs are never delayed).
+            if (this.lowGapMs > 0 && !this.high.length && this.low.length) {
+                const wait = this.nextLowAt - Date.now();
+
+                if (wait > 0) {
+                    if (!this.pumpTimer) {
+                        this.pumpTimer = setTimeout(() => {
+                            this.pumpTimer = null;
+                            this.#pump();
+                        }, wait);
+                    }
+
+                    return;
+                }
+            }
+
             const job = this.#next();
             if (!job) return;
+
+            if (job.isLow && this.lowGapMs > 0) {
+                this.nextLowAt =
+                    Math.max(Date.now(), this.nextLowAt) + this.lowGapMs;
+            }
 
             this.active++;
             if (job.isLow) this.activeLow++;
@@ -204,7 +234,8 @@ class TelegramScheduler {
 
 const telegramScheduler = new TelegramScheduler(
     TELEGRAM_MAX_IN_FLIGHT,
-    TELEGRAM_MAX_BULK_IN_FLIGHT
+    TELEGRAM_MAX_BULK_IN_FLIGHT,
+    TELEGRAM_BULK_GAP_MS
 );
 
 const TELEGRAM_CHUNK_TIMEOUT_MS = 60 * 1000;
@@ -3186,6 +3217,26 @@ async function handleApi(
         return json({ success: true, ...result });
     }
 
+    if (path === "/api/paced") {
+        const chatId = url.searchParams.get("chat");
+        const messageId = url.searchParams.get("message");
+
+        if (!chatId || !messageId) {
+            return json({ success: false, error: "Missing chat or message." }, 400);
+        }
+
+        const n = Math.min(200, Math.max(1, Number(url.searchParams.get("n")) || 60));
+        const rate = Math.min(20, Math.max(0.1, Number(url.searchParams.get("rate")) || 1));
+
+        const result = await getConnectionStub(env).runPacedTest(chatId, messageId, n, rate);
+
+        if (!result) {
+            return json({ success: false, error: "Message has no media." }, 404);
+        }
+
+        return json({ success: true, ...result });
+    }
+
     if (path === "/api/test-download") {
         const chatId =
             url.searchParams.get(
@@ -5286,6 +5337,90 @@ export class TelegramConnectionDO extends DurableObject {
                 p50ms: pct(0.5),
                 p90ms: pct(0.9),
                 maxMs: sorted.length ? sorted[sorted.length - 1] : null,
+                errors,
+                completions
+            };
+        });
+    }
+
+    // Diagnostic: start one 1 MiB chunk request every 1000/rate ms
+    // (open loop, no concurrency cap) and record how long each takes.
+    // If a lower rate shows no multi-second stalls while a higher one does,
+    // Telegram is throttling request bursts.
+    async runPacedTest(chatId, messageId, n, rate) {
+        return this.#withClient(async client => {
+            const message = await getMessage(client, this.env, chatId, messageId);
+            const media = getMessageMedia(message);
+
+            if (!media?.fileId) return null;
+
+            const fileId = media.fileId;
+            const size = Number(media.fileSize);
+            const slots = Math.max(1, Math.floor(size / TELEGRAM_FRAGMENT_SIZE));
+            const base = Math.floor(Math.random() * Math.max(1, slots - n));
+            const gap = 1000 / rate;
+
+            const completions = [];
+            const errors = [];
+            const pending = [];
+            const t0 = Date.now();
+
+            const withTimeout = p => Promise.race([
+                p,
+                new Promise((_, rej) =>
+                    setTimeout(() => rej(new Error("timeout 60s")), 60000))
+            ]);
+
+            for (let i = 0; i < n; i++) {
+                const due = t0 + i * gap;
+                const wait = due - Date.now();
+
+                if (wait > 0) await new Promise(r => setTimeout(r, wait));
+                if (Date.now() - t0 > 75000) break;
+
+                const offset = ((base + i) % slots) * TELEGRAM_FRAGMENT_SIZE;
+                const started = Date.now();
+
+                pending.push(
+                    withTimeout(
+                        client.downloadChunk(fileId, {
+                            offset,
+                            chunkSize: TELEGRAM_FRAGMENT_SIZE
+                        })
+                    ).then(
+                        () => completions.push([
+                            Math.round((Date.now() - t0) / 100) / 10,
+                            Date.now() - started
+                        ]),
+                        error => errors.push({
+                            i,
+                            ms: Date.now() - started,
+                            error: error?.message || String(error)
+                        })
+                    )
+                );
+            }
+
+            await Promise.all(pending);
+
+            const wall = Date.now() - t0;
+            const sorted = completions.map(x => x[1]).sort((a, b) => a - b);
+            const pct = q => sorted.length
+                ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))]
+                : null;
+
+            return {
+                rateReqPerSec: rate,
+                started: pending.length,
+                completed: completions.length,
+                wallMs: wall,
+                throughputKBps: Math.round(
+                    completions.length * TELEGRAM_FRAGMENT_SIZE / 1024 / (wall / 1000)
+                ),
+                p50ms: pct(0.5),
+                p90ms: pct(0.9),
+                maxMs: sorted.length ? sorted[sorted.length - 1] : null,
+                slowOver2s: sorted.filter(x => x > 2000).length,
                 errors,
                 completions
             };

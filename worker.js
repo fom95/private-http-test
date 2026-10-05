@@ -5466,6 +5466,10 @@ export class TelegramConnectionDO extends DurableObject {
             const steps = [];
             const t0 = Date.now();
 
+            // Start cold so every step really hits Telegram.
+            chunkCache.clear();
+            chunkCacheBytes = 0;
+
             if (Number.isFinite(gapMs) && gapMs >= 0) {
                 telegramScheduler.lowGapMs = gapMs;
             }

@@ -21,6 +21,11 @@ const MAX_HTTP_RANGE_SIZE = 8 * 1024 * 1024;
 
 const CACHE_CONTROL = "public, max-age=31536000, immutable";
 
+// What the BROWSER is told for /media responses: always revalidate. The
+// ETag is the Telegram file id, so an unchanged image answers 304 instantly
+// and a replaced image is picked up on the very next request.
+const BROWSER_CACHE_CONTROL = "private, no-cache";
+
 // Files at or under this size are downloaded into memory and served as a
 // single buffer, which makes them safely cacheable (see
 // bufferFullDownload). Anything larger is streamed and not cached.
@@ -35,6 +40,13 @@ const MEDIA_CACHE_TTL_MS = 15 * 60 * 1000;
 const MEDIA_CACHE_MAX = 500;
 const THUMB_CACHE_MAX_ROWS = 5000;
 const THUMB_CACHE_MAX_BYTES = 1.5 * 1024 * 1024;
+
+// Un-versioned thumbnail rows (batch API) expire; versioned ones never need to.
+const THUMB_CACHE_TTL_MS = 10 * 60 * 1000;
+
+// How long the message lookup for an image/thumbnail is reused. Short, so an
+// edited message is noticed quickly; videos keep the longer MEDIA_CACHE_TTL_MS.
+const IMAGE_META_TTL_MS = 10 * 1000;
 
 async function mapLimit(items, limit, fn) {
     const results = new Array(items.length);
@@ -1666,15 +1678,18 @@ function createMediaHeaders({
     size,
     filename,
     start = null,
-    end = null
+    end = null,
+    etag = null
 }) {
     const headers = {
         "Content-Type": mimeType || "application/octet-stream",
         "Accept-Ranges": "bytes",
-        "Cache-Control": CACHE_CONTROL,
+        "Cache-Control": BROWSER_CACHE_CONTROL,
         "Access-Control-Allow-Origin": "*",
         "Content-Disposition": contentDispositionInline(filename)
     };
+
+    if (etag) headers["ETag"] = etag;
 
     if (start !== null && end !== null) {
         headers["Content-Length"] = String(end - start + 1);
@@ -2329,6 +2344,40 @@ img {
     );
 }
 
+// Responses are stored at the edge under a key that includes the file
+// version, so they can safely be kept "forever": a changed file never reuses
+// the old key. The stored copy and the copy sent to browsers differ in
+// Cache-Control, hence the two helpers.
+function cacheStore(ctx, cache, key, response) {
+    if (!ctx || !cache) return;
+
+    try {
+        const headers = new Headers(response.headers);
+        headers.set("Cache-Control", CACHE_CONTROL);
+
+        safeCachePut(
+            ctx,
+            cache,
+            key,
+            new Response(response.clone().body, {
+                status: response.status,
+                headers
+            })
+        );
+    } catch {
+        // Caching must never break the real response.
+    }
+}
+
+function browserFresh(cached, etag) {
+    const headers = new Headers(cached.headers);
+
+    headers.set("Cache-Control", BROWSER_CACHE_CONTROL);
+    headers.set("ETag", etag);
+
+    return new Response(cached.body, { status: cached.status, headers });
+}
+
 async function handleDirectMediaRequest(request, env, url, ctx) {
     if (request.method !== "GET" && request.method !== "HEAD") {
         return new Response(null, {
@@ -2341,14 +2390,6 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
         request.method === "GET" && !request.headers.get("Range");
 
     const cache = cacheable ? caches.default : null;
-    const cacheKey = cacheKeyFor(url);
-
-    if (cache) {
-        try {
-            const cached = await cache.match(cacheKey);
-            if (cached) return cached;
-        } catch {}
-    }
 
     const totalStart = Date.now();
     const timings = {};
@@ -2390,32 +2431,6 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
         return json({ success: false, error: "Missing chat or message." }, 400);
     }
 
-    const thumbKey = `t:${Number(chatId)}:${Number(messageId)}`;
-
-    if (
-        thumbnail &&
-        request.method === "GET" &&
-        !request.headers.get("Range")
-    ) {
-        const hit = await getConnectionStub(env).getCachedThumbnail(thumbKey);
-
-        if (hit) {
-            const headers = createMediaHeaders({
-                mimeType: "image/jpeg",
-                size: hit.byteLength,
-                filename: `telegram-${chatId}-${messageId}-thumbnail.jpg`
-            });
-
-            timings.cachedThumbnail = Date.now() - totalStart;
-            addTimingHeader(headers);
-
-            const response = new Response(hit, { status: 200, headers });
-            safeCachePut(ctx, cache, cacheKey, response);
-
-            return response;
-        }
-    }
-
     const stub = getConnectionStub(env);
 
     // Single RPC: message lookup + media info + multipart resolution,
@@ -2439,6 +2454,7 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
     }
 
     let fileId = info.fileId;
+    let version = info.fileUniqueId || info.fileId;
     let fileSize = Number(info.fileSize);
     let mimeType = info.mimeType;
     let filename = info.fileName || `telegram-${chatId}-${messageId}`;
@@ -2447,6 +2463,10 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
         fileSize = multipartInfo.fileSize;
         mimeType = multipartInfo.mimeType || mimeType || "application/octet-stream";
         filename = multipartInfo.originalName;
+
+        version = multipartInfo.parts
+            .map(part => part.fileUniqueId || part.fileId)
+            .join("-");
     }
 
     if (thumbnail) {
@@ -2455,6 +2475,8 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
         }
 
         const selected = info.thumbnails[info.thumbnails.length - 1];
+
+        version = selected.fileUniqueId || selected.fileId;
 
         fileId = selected.fileId;
         fileSize = Number(selected.fileSize);
@@ -2467,6 +2489,40 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
             success: false,
             error: "Media does not contain a downloadable file."
         }, 500);
+    }
+
+    // Freshness: the cache key and ETag both carry the current Telegram file
+    // id, so a replaced image is a cache miss / ETag mismatch automatically.
+    const etag = "\"" + String(version).replace(/[^A-Za-z0-9_.-]/g, "") + "\"";
+    const cacheKey = cacheKeyFor(url, version);
+    const thumbKey = `t:${Number(chatId)}:${Number(messageId)}:${version}`;
+    const mediaHeaders = options => createMediaHeaders({ ...options, etag });
+
+    if (cacheable) {
+        const ifNoneMatch = request.headers.get("If-None-Match");
+
+        if (
+            ifNoneMatch &&
+            ifNoneMatch.split(",").some(
+                tag => tag.trim().replace(/^W\//, "") === etag
+            )
+        ) {
+            return new Response(null, {
+                status: 304,
+                headers: {
+                    ETag: etag,
+                    "Cache-Control": BROWSER_CACHE_CONTROL,
+                    "Access-Control-Allow-Origin": "*"
+                }
+            });
+        }
+
+        if (cache && !multipartInfo) {
+            try {
+                const cached = await cache.match(cacheKey);
+                if (cached) return browserFresh(cached, etag);
+            } catch {}
+        }
     }
 
     const rangeHeader = request.headers.get("Range");
@@ -2492,7 +2548,7 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
             range.start + MAX_HTTP_RANGE_SIZE - 1
         );
 
-        const headers = createMediaHeaders({
+        const headers = mediaHeaders({
             mimeType,
             size: fileSize,
             filename,
@@ -2522,7 +2578,7 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
     }
 
     if (request.method === "HEAD") {
-        const headers = createMediaHeaders({
+        const headers = mediaHeaders({
             mimeType,
             size: fileSize,
             filename
@@ -2542,7 +2598,7 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
 
         timings.streamSetup = Date.now() - downloadStart;
 
-        const headers = createMediaHeaders({ mimeType, size: fileSize, filename });
+        const headers = mediaHeaders({ mimeType, size: fileSize, filename });
         addTimingHeader(headers);
 
         return new Response(stream, { status: 200, headers });
@@ -2559,7 +2615,7 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
 
         timings.download = Date.now() - downloadStart;
 
-        const headers = createMediaHeaders({
+        const headers = mediaHeaders({
             mimeType,
             size: body.byteLength,
             filename
@@ -2568,7 +2624,7 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
         addTimingHeader(headers);
 
         const response = new Response(body, { status: 200, headers });
-        safeCachePut(ctx, cache, cacheKey, response);
+        cacheStore(ctx, cache, cacheKey, response);
 
         return response;
     }
@@ -2582,7 +2638,7 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
 
     timings.streamSetup = Date.now() - downloadStart;
 
-    const headers = createMediaHeaders({ mimeType, size: fileSize, filename });
+    const headers = mediaHeaders({ mimeType, size: fileSize, filename });
     addTimingHeader(headers);
 
     return new Response(stream, { status: 200, headers });
@@ -4824,10 +4880,18 @@ export class TelegramConnectionDO extends DurableObject {
 
         try {
             const rows = this.ctx.storage.sql
-                .exec("SELECT data FROM thumb_cache WHERE k = ?", key)
+                .exec("SELECT data, ts FROM thumb_cache WHERE k = ?", key)
                 .toArray();
 
             if (!rows.length || !rows[0].data) return null;
+
+            // Versioned keys (t:chat:msg:fileUniqueId) can't go stale; the
+            // un-versioned batch-API keys (t:chat:msg) can, so they expire.
+            const versioned = String(key).split(":").length > 3;
+
+            if (!versioned && Date.now() - Number(rows[0].ts) > THUMB_CACHE_TTL_MS) {
+                return null;
+            }
 
             return new Uint8Array(rows[0].data);
         } catch {
@@ -5187,7 +5251,12 @@ export class TelegramConnectionDO extends DurableObject {
 
                     this.#mediaCache.set(key, {
                         value,
-                        expires: Date.now() + MEDIA_CACHE_TTL_MS
+                        expires: Date.now() + (
+                            thumbnail ||
+                            String(value?.info?.mimeType || "").startsWith("image/")
+                                ? IMAGE_META_TTL_MS
+                                : MEDIA_CACHE_TTL_MS
+                        )
                     });
 
                     return value;
@@ -5992,8 +6061,10 @@ function describeAuthFailure(request, url) {
 
 // Cache by URL without the token, so every visitor's fresh token still hits
 // the same cached image instead of re-downloading it from Telegram.
-function cacheKeyFor(url) {
+function cacheKeyFor(url, version = null) {
     const clean = new URL(url);
+
+    if (version) clean.searchParams.set("_v", String(version));
 
     clean.searchParams.delete("auth");
     clean.searchParams.delete("auth_token");

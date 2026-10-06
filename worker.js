@@ -1363,7 +1363,8 @@ function parseRange(rangeHeader, size) {
 
 function parseMultipartFilename(filename) {
     const match =
-        /^(.+)\.part(\d+)of(\d+)$/i.exec(
+        // Accepts "name.mp4.part001_002" and the older "name.mp4.part1of3".
+        /^(.+)\.part(\d+)(?:of|_)(\d+)$/i.exec(
             String(filename || "")
         );
 
@@ -1679,7 +1680,8 @@ function createMediaHeaders({
     filename,
     start = null,
     end = null,
-    etag = null
+    etag = null,
+    version = null
 }) {
     const headers = {
         "Content-Type": mimeType || "application/octet-stream",
@@ -1690,6 +1692,11 @@ function createMediaHeaders({
     };
 
     if (etag) headers["ETag"] = etag;
+
+    // Debugging aids. If a response in DevTools has NO X-Media-Version, it did
+    // not come from this code (it is an older copy held by a cache in front).
+    if (version) headers["X-Media-Version"] = String(version);
+    headers["X-Media-Source"] = "telegram";
 
     if (start !== null && end !== null) {
         headers["Content-Length"] = String(end - start + 1);
@@ -2374,6 +2381,8 @@ function browserFresh(cached, etag) {
 
     headers.set("Cache-Control", BROWSER_CACHE_CONTROL);
     headers.set("ETag", etag);
+    headers.set("X-Media-Version", etag.replace(/"/g, ""));
+    headers.set("X-Media-Source", "edge-cache");
 
     return new Response(cached.body, { status: cached.status, headers });
 }
@@ -2437,7 +2446,7 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
     // cached inside the Durable Object.
     //
     // Multipart files are several Telegram documents whose names end in
-    // .partNNNofNNN; a URL for ANY one of them resolves to the whole
+    // .partNNN_NNN (or .partNofN); a URL for ANY one of them resolves to the whole
     // logical file. Thumbnails stay attached to the individual message.
     const resolveStart = Date.now();
     const resolved = await stub.resolveMedia(chatId, messageId, thumbnail);
@@ -2496,7 +2505,7 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
     const etag = "\"" + String(version).replace(/[^A-Za-z0-9_.-]/g, "") + "\"";
     const cacheKey = cacheKeyFor(url, version);
     const thumbKey = `t:${Number(chatId)}:${Number(messageId)}:${version}`;
-    const mediaHeaders = options => createMediaHeaders({ ...options, etag });
+    const mediaHeaders = options => createMediaHeaders({ ...options, etag, version });
 
     if (cacheable) {
         const ifNoneMatch = request.headers.get("If-None-Match");
@@ -2512,7 +2521,9 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
                 headers: {
                     ETag: etag,
                     "Cache-Control": BROWSER_CACHE_CONTROL,
-                    "Access-Control-Allow-Origin": "*"
+                    "Access-Control-Allow-Origin": "*",
+                    "X-Media-Version": etag.replace(/"/g, ""),
+                    "X-Media-Source": "304-unchanged"
                 }
             });
         }
@@ -3312,6 +3323,51 @@ async function handleApi(
         }
 
         return json({ success: true, ...result });
+    }
+
+    if (path === "/api/multipart") {
+        const chatId = url.searchParams.get("chat");
+        const messageId = url.searchParams.get("message");
+
+        if (!chatId || !messageId) {
+            return json({ success: false, error: "Missing chat or message." }, 400);
+        }
+
+        const stub = getConnectionStub(env);
+        const info = await stub.getMediaInfo(chatId, messageId);
+
+        let multipart = null;
+        let multipartError = null;
+
+        try {
+            multipart = await stub.getMultipartMediaInfo(chatId, messageId);
+        } catch (error) {
+            multipartError = error?.message || String(error);
+        }
+
+        return json({
+            success: true,
+            thisMessage: {
+                messageId: info.messageId,
+                fileName: info.fileName,
+                fileSize: info.fileSize,
+                fileUniqueId: info.fileUniqueId,
+                mimeType: info.mimeType
+            },
+            detectedAsMultipart: Boolean(multipart),
+            multipartError,
+            totalSize: multipart?.fileSize ?? null,
+            parts: multipart
+                ? multipart.parts.map(part => ({
+                    part: part.part,
+                    of: part.total,
+                    messageId: part.messageId,
+                    fileName: part.fileName,
+                    fileSize: part.fileSize,
+                    fileUniqueId: part.fileUniqueId
+                }))
+                : null
+        });
     }
 
     if (path === "/api/test-download") {

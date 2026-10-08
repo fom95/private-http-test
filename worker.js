@@ -1,23 +1,19 @@
 import { Client } from "@mtkruto/mtkruto";
 import { DurableObject } from "cloudflare:workers";
 
-// Keep each Telegram request at the maximum 1 MiB fragment size.
-// streamRangeDownload still splits at fragment boundaries, so this avoids
-// LIMIT_INVALID while reducing thousands of tiny Telegram round trips.
+// Video streaming is deliberately separate from the /piece API.
+// Each browser Range request gets its own read-ahead pipeline, similar to
+// the behavior of the smooth local tgstreamer server: several Telegram
+// ranges are requested concurrently and yielded to the browser in order.
+// A seek cancels the old pipeline through AbortSignal immediately.
 const TELEGRAM_CHUNK_SIZE = 1024 * 1024;
-const TELEGRAM_PARALLEL_REQUESTS = 8;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 const TELEGRAM_FRAGMENT_SIZE = 1024 * 1024;
 
-const MAX_ACTIVE_MULTIPART_DOWNLOADS = 8;
+// Number of Telegram file reads kept ahead of the browser.
+const VIDEO_STREAM_WORKERS = 6;
 
-// Never let a media player request make us stream hundreds of megabytes or
-// gigabytes as one HTTP 206 response. Browsers commonly send ranges such as
-// bytes=0-1999999999 even when they only need the first few megabytes. A huge
-// response delays metadata/seek handling and can keep the old range alive for
-// many minutes. Returning a bounded 206 range lets the browser issue another
-// range request as soon as it needs more data.
-const MAX_HTTP_RANGE_SIZE = 8 * 1024 * 1024;
+const MAX_ACTIVE_MULTIPART_DOWNLOADS = 8;
 
 const CACHE_CONTROL = "public, max-age=31536000, immutable";
 
@@ -85,7 +81,7 @@ const TELEGRAM_MAX_BULK_IN_FLIGHT = 8;
 // Telegram appears to throttle bursts of upload.getFile calls (the whole
 // connection stalls for seconds). Set this to ~1000 / (safe requests per
 // second) once /api/paced shows which rate avoids the stalls.
-const TELEGRAM_BULK_GAP_MS = 250;
+const TELEGRAM_BULK_GAP_MS = 0;
 
 class TelegramScheduler {
     constructor(limit, lowLimit, lowGapMs = 0) {
@@ -2032,156 +2028,89 @@ async function streamFullDownload(client, fileId, onFatalError) {
 }
 
 async function streamRangeDownload(
-    client,
-    fileId,
-    fileSize,
-    start,
-    end,
-    onFatalError
+    client, fileId, fileSize, start, end, onFatalError
 ) {
-    // Start on a 1 MiB boundary so every request has a valid offset/limit.
-    const alignedStart =
-        Math.floor(start / TELEGRAM_FRAGMENT_SIZE) *
-        TELEGRAM_FRAGMENT_SIZE;
-
+    /*
+     * Video pipeline: keep several Telegram reads active at once, but emit
+     * them strictly in file order. This is the important difference from a
+     * serial "download a chunk, then give it to Firefox" implementation.
+     * Firefox can therefore consume while later Telegram reads are already
+     * in flight.
+     */
+    const abortController = new AbortController();
+    const signal = abortController.signal;
+    const alignedStart = Math.floor(start / TELEGRAM_FRAGMENT_SIZE) * TELEGRAM_FRAGMENT_SIZE;
     let nextOffset = alignedStart;
     let cancelled = false;
-    let firstByteChecked = false;
-    let prefetched = false;
-
-    // Ordered queue of in-flight chunk fetches (the read-ahead window).
+    let firstByte = true;
     const queue = [];
     const startedAt = Date.now();
 
-    const order = ++streamSeq;
+    async function readChunk(offset) {
+        const chunkSize = Math.min(TELEGRAM_FRAGMENT_SIZE, fileSize - offset);
+        if (chunkSize <= 0) return null;
 
-    // Always full 1 MiB aligned chunks so cache keys are stable.
-    function requestSizeAt() {
-        return TELEGRAM_FRAGMENT_SIZE;
-    }
+        const t0 = Date.now();
 
-    async function fetchChunk(offset, requestedSize) {
-        const queuedAt = Date.now();
-        let telegramStartedAt = 0;
-        let bytes = null;
+        try {
+            const bytes = await client.downloadChunk(fileId, {
+                offset,
+                chunkSize,
+                signal
+            });
 
-        for (let attempt = 0; ; attempt++) {
-            try {
-                telegramStartedAt = Date.now();
+            if (cancelled) return null;
 
-                bytes = await cachedChunk(
-                    client, fileId, offset, order, () => cancelled
+            if (!bytes || bytes.length === 0) {
+                throw new Error("Telegram returned no data at offset " + offset + ".");
+            }
+
+            if (bytes.length < chunkSize && offset + bytes.length < fileSize) {
+                throw new Error(
+                    "Telegram returned a short range at offset " + offset +
+                    " (requested " + chunkSize + ", received " + bytes.length + ")."
                 );
+            }
 
-                // Dropped as "cancelled" by a sibling waiter; retry.
-                if (bytes === null && !cancelled && attempt < 2) continue;
-
-                break;
-            } catch (error) {
-                if (cancelled) return null;
-
-                const message = error?.message || String(error);
-
-                if (!message.includes("timed out")) {
-                    throw error;
-                }
-
-                if (attempt >= 1) {
-                    throw new Error(message + " (connection stalled)");
-                }
-
-                console.log("retrying stalled telegram chunk:", JSON.stringify({
-                    fileId: String(fileId),
-                    offset,
-                    requestedSize,
-                    ...telegramScheduler.stats()
+            const ms = Date.now() - t0;
+            if (ms > SLOW_MS) {
+                console.log("slow video Telegram read:", JSON.stringify({
+                    fileId: String(fileId), offset, bytes: bytes.length, ms
                 }));
             }
+
+            return { offset, bytes };
+        } catch (error) {
+            if (cancelled || error?.name === "AbortError") return null;
+            throw error;
         }
-
-        if (cancelled || bytes === null) {
-            return null;
-        }
-
-        const finishedAt = Date.now();
-
-        if (finishedAt - queuedAt > SLOW_MS) {
-            console.log("slow telegram chunk:", JSON.stringify({
-                fileId: String(fileId),
-                offset,
-                requestedSize,
-                queueWait: telegramStartedAt - queuedAt,
-                telegram: finishedAt - telegramStartedAt,
-                ...telegramScheduler.stats()
-            }));
-        }
-
-        if (!bytes || bytes.length === 0) {
-            throw new Error("Telegram returned no data at offset " + offset + ".");
-        }
-
-        if (bytes.length < requestedSize && offset + bytes.length < fileSize) {
-            throw new Error(
-                "Telegram returned a short range at offset " + offset +
-                " (requested " + requestedSize + ", received " + bytes.length + ")."
-            );
-        }
-
-        return { offset, bytes };
     }
 
-    // Keep up to N reads in flight. As soon as the head of the queue is
-    // consumed, another read is started, so the pipe stays full instead of
-    // waiting for the slowest of a whole batch (the old Promise.all batch).
-    function topUp() {
+    function fill() {
         while (
             !cancelled &&
-            queue.length < TELEGRAM_PARALLEL_REQUESTS &&
+            queue.length < VIDEO_STREAM_WORKERS &&
             nextOffset <= end &&
             nextOffset < fileSize
         ) {
-            const size = requestSizeAt(nextOffset, end - nextOffset + 1);
-            const promise = fetchChunk(nextOffset, size);
-
-            promise.catch(() => {}); // avoid unhandled rejection if abandoned
-            queue.push(promise);
-            nextOffset += size;
+            const offset = nextOffset;
+            nextOffset += TELEGRAM_FRAGMENT_SIZE;
+            queue.push(readChunk(offset));
         }
-
-        prefetchAhead();
     }
 
-    // Warm the first chunks past this window so the browser's next range
-    // request (which starts at end + 1) hits the cache. Order 0 is lowest
-    // priority under newest-first scheduling, and a prefetch is never
-    // cancelled with this stream since the next range wants it.
-    function prefetchAhead() {
-        if (cancelled || prefetched) return;
-        if (nextOffset <= end || nextOffset >= fileSize) return;
-
-        prefetched = true;
-
-        for (
-            let i = 0;
-            i < 2 && nextOffset + i * TELEGRAM_FRAGMENT_SIZE < fileSize;
-            i++
-        ) {
-            cachedChunk(
-                client,
-                fileId,
-                nextOffset + i * TELEGRAM_FRAGMENT_SIZE,
-                0,
-                () => false
-            ).catch(() => {});
-        }
+    function cancel(reason) {
+        if (cancelled) return;
+        cancelled = true;
+        try { abortController.abort(reason); } catch {}
+        queue.length = 0;
     }
 
     return new ReadableStream({
         async pull(controller) {
             if (cancelled) return;
 
-            topUp();
-
+            fill();
             if (!queue.length) {
                 controller.close();
                 return;
@@ -2189,237 +2118,45 @@ async function streamRangeDownload(
 
             try {
                 const result = await queue.shift();
-
-                if (cancelled) return;
-
-                topUp();
+                if (cancelled || !result) return;
 
                 const chunkStart = result.offset;
-                const bytes = result.bytes;
-                const chunkEnd = chunkStart + bytes.length - 1;
-
+                const chunkEnd = chunkStart + result.bytes.length - 1;
                 const outputStart = Math.max(start, chunkStart);
                 const outputEnd = Math.min(end, chunkEnd);
 
                 if (outputEnd >= outputStart) {
-                    controller.enqueue(
-                        bytes.slice(
-                            outputStart - chunkStart,
-                            outputEnd - chunkStart + 1
-                        )
+                    const bytes = result.bytes.slice(
+                        outputStart - chunkStart,
+                        outputEnd - chunkStart + 1
                     );
-                }
 
-                if (!firstByteChecked) {
-                    firstByteChecked = true;
-                    const ttfb = Date.now() - startedAt;
-
-                    if (ttfb > SLOW_MS) {
-                        console.log("slow first byte:", JSON.stringify({
-                            fileId: String(fileId),
-                            start,
-                            end,
-                            ms: ttfb
-                        }));
+                    if (firstByte) {
+                        firstByte = false;
+                        const ttfb = Date.now() - startedAt;
+                        if (ttfb > SLOW_MS) {
+                            console.log("slow video first byte:", JSON.stringify({
+                                fileId: String(fileId), start, end, ms: ttfb
+                            }));
+                        }
                     }
+
+                    controller.enqueue(bytes);
                 }
 
-                if (!queue.length && nextOffset > end) {
+                fill();
+
+                if (nextOffset > end && queue.length === 0) {
                     controller.close();
                 }
             } catch (error) {
                 if (cancelled) return;
-
-                cancelled = true;
-
-                console.log("range download error:", JSON.stringify({
-                    fileId: String(fileId),
-                    start,
-                    end,
+                cancel("video stream failed");
+                console.log("video range stream error:", JSON.stringify({
+                    fileId: String(fileId), start, end,
                     elapsed: Date.now() - startedAt,
                     error: error?.message || String(error)
                 }));
-
-                controller.error(error);
-                onFatalError?.(error);
-            }
-        },
-
-        async cancel() {
-            // downloadChunk has no AbortSignal; in-flight reads finish but
-            // their results are dropped and nothing new is started.
-            cancelled = true;
-            queue.length = 0;
-            telegramScheduler.sweepCancelled();
-        }
-    });
-}
-
-async function streamMultipartRangeDownload(
-    client,
-    parts,
-    start,
-    end,
-    onFatalError,
-    registerDownload = null
-) {
-    const normalizedParts =
-        parts.map(part => ({
-            fileId: part.fileId,
-            fileSize: Number(part.fileSize)
-        }));
-
-    const segments = [];
-    let globalOffset = 0;
-
-    for (const part of normalizedParts) {
-        const partStart = globalOffset;
-        const partEnd =
-            globalOffset +
-            part.fileSize -
-            1;
-
-        if (end >= partStart && start <= partEnd) {
-            const overlapStart =
-                Math.max(start, partStart);
-            const overlapEnd =
-                Math.min(end, partEnd);
-
-            segments.push({
-                fileId: part.fileId,
-                fileSize: part.fileSize,
-                globalStart: overlapStart,
-                globalEnd: overlapEnd,
-                localStart:
-                    overlapStart - partStart,
-                localEnd:
-                    overlapEnd - partStart
-            });
-        }
-
-        globalOffset += part.fileSize;
-
-        if (globalOffset > end) {
-            break;
-        }
-    }
-
-    if (!segments.length) {
-        throw new Error(
-            "Multipart range starts beyond the available file."
-        );
-    }
-
-    let segmentIndex = 0;
-    let currentStream = null;
-    let currentReader = null;
-    let cancelled = false;
-    let unregister = null;
-
-    function cancel(reason) {
-        if (cancelled) {
-            return;
-        }
-
-        cancelled = true;
-
-        try {
-            currentReader?.cancel(reason);
-        } catch {}
-
-        try {
-            currentStream?.cancel(reason);
-        } catch {}
-    }
-
-    const stream = new ReadableStream({
-        async pull(controller) {
-            if (cancelled) {
-                return;
-            }
-
-            try {
-                while (
-                    segmentIndex <
-                    segments.length
-                ) {
-                    if (cancelled) {
-                        return;
-                    }
-
-                    const segment =
-                        segments[segmentIndex++];
-
-                    /*
-                     * Each Telegram part is an independent physical file.
-                     * A range that crosses a 2 GiB split is therefore streamed
-                     * as adjacent range streams, but each stream starts at the
-                     * exact local offset inside its own Telegram document.
-                     */
-                    currentStream =
-                        await streamRangeDownload(
-                            client,
-                            segment.fileId,
-                            segment.fileSize,
-                            segment.localStart,
-                            segment.localEnd,
-                            onFatalError
-                        );
-
-                    currentReader =
-                        currentStream.getReader();
-
-                    while (true) {
-                        if (cancelled) {
-                            return;
-                        }
-
-                        const result =
-                            await currentReader.read();
-
-                        if (result.done) {
-                            break;
-                        }
-
-                        controller.enqueue(
-                            result.value
-                        );
-                    }
-
-                    try {
-                        await currentReader.cancel();
-                    } catch {}
-
-                    currentReader = null;
-                    currentStream = null;
-                }
-
-                if (!cancelled) {
-                    controller.close();
-                    unregister?.();
-                    unregister = null;
-                }
-            } catch (error) {
-                if (cancelled) {
-                    return;
-                }
-
-                unregister?.();
-                unregister = null;
-
-                console.log(
-                    "media multipart range:",
-                    JSON.stringify({
-                        event: "error",
-                        requestedStart: start,
-                        requestedEnd: end,
-                        segments: segments.length,
-                        error:
-                            error?.message ||
-                            String(error)
-                    })
-                );
-
                 onFatalError?.(error);
                 controller.error(error);
             }
@@ -2427,18 +2164,117 @@ async function streamMultipartRangeDownload(
 
         async cancel(reason) {
             cancel(reason);
-            unregister?.();
-            unregister = null;
+        }
+    });
+}
+
+
+async function streamMultipartRangeDownload(
+    client, parts, start, end, onFatalError, registerDownload = null
+) {
+    // A multipart upload is one logical file. Translate the requested logical
+    // range into physical Telegram-document ranges and feed each document
+    // through the same concurrent read-ahead pipeline. Thus /media/<chat>/<id>
+    // works when <id> is ANY of the physical .part messages.
+    const normalized = parts.map(part => ({
+        fileId: part.fileId,
+        fileSize: Number(part.fileSize)
+    }));
+
+    const segments = [];
+    let global = 0;
+
+    for (const part of normalized) {
+        const partStart = global;
+        const partEnd = global + part.fileSize - 1;
+
+        if (end >= partStart && start <= partEnd) {
+            const a = Math.max(start, partStart);
+            const b = Math.min(end, partEnd);
+            segments.push({
+                fileId: part.fileId,
+                fileSize: part.fileSize,
+                localStart: a - partStart,
+                localEnd: b - partStart
+            });
+        }
+
+        global += part.fileSize;
+        if (global > end) break;
+    }
+
+    if (!segments.length) {
+        throw new Error("Multipart range starts beyond the available file.");
+    }
+
+    let cancelled = false;
+    let currentStream = null;
+    let currentReader = null;
+    let unregister = null;
+    let index = 0;
+
+    function cancel(reason) {
+        if (cancelled) return;
+        cancelled = true;
+        try { currentReader?.cancel(reason); } catch {}
+        try { currentStream?.cancel(reason); } catch {}
+        unregister?.();
+        unregister = null;
+    }
+
+    const stream = new ReadableStream({
+        async pull(controller) {
+            if (cancelled) return;
+
+            try {
+                while (index < segments.length) {
+                    if (cancelled) return;
+
+                    const segment = segments[index++];
+                    currentStream = await streamRangeDownload(
+                        client, segment.fileId, segment.fileSize,
+                        segment.localStart, segment.localEnd, onFatalError
+                    );
+                    currentReader = currentStream.getReader();
+
+                    const result = await currentReader.read();
+
+                    if (result.done) {
+                        try { await currentReader.cancel(); } catch {}
+                        currentReader = null;
+                        currentStream = null;
+                        continue;
+                    }
+
+                    controller.enqueue(result.value);
+                    return;
+                }
+
+                controller.close();
+                unregister?.();
+                unregister = null;
+            } catch (error) {
+                if (cancelled) return;
+                cancel("multipart video stream failed");
+                console.log("multipart video stream error:", JSON.stringify({
+                    requestedStart: start, requestedEnd: end,
+                    segments: segments.length,
+                    error: error?.message || String(error)
+                }));
+                onFatalError?.(error);
+                controller.error(error);
+            }
+        },
+
+        async cancel(reason) {
+            cancel(reason);
         }
     });
 
-    if (registerDownload) {
-        unregister =
-            registerDownload(cancel);
-    }
-
+    if (registerDownload) unregister = registerDownload(cancel);
     return stream;
 }
+
 
 async function handleImageViewer(
     request,
@@ -2759,11 +2595,9 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
             });
         }
 
-        // Keep one 206 bounded; the browser continues from effectiveEnd + 1.
-        const effectiveEnd = Math.min(
-            range.end,
-            range.start + MAX_HTTP_RANGE_SIZE - 1
-        );
+        // Stream the exact Range the browser requested. There is no artificial
+        // 8 MiB boundary; seeking cancels the stream and starts a new Range.
+        const effectiveEnd = range.end;
 
         const headers = mediaHeaders({
             mimeType,

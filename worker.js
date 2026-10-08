@@ -3009,24 +3009,22 @@ async function handleApi(
     // client. Use it before testing a video.
     if (path === "/api/mtcute-test") {
         const start = Date.now();
+
         try {
             const stub = getConnectionStub(env);
             const result = await stub.testMtcute();
 
             return json({
-                success: true,
-                mtcute: result,
+                success: result.ok,
+                phases: result.phases,
                 elapsedMs: Date.now() - start
-            });
+            }, result.ok ? 200 : 500);
         } catch (error) {
             return json({
                 success: false,
                 error: String(error?.message || error),
                 name: error?.name || "Error",
                 stack: error?.stack || null,
-                cause: error?.cause
-                    ? String(error.cause?.message || error.cause)
-                    : null,
                 elapsedMs: Date.now() - start
             }, 500);
         }
@@ -5328,12 +5326,108 @@ export class TelegramConnectionDO extends DurableObject {
         }, new CountQueuingStrategy({ highWaterMark: MTCUTE_STREAM_QUEUE_CHUNKS }));
     }
 
+    // Step-by-step health check. Errors thrown inside a Durable Object lose
+    // their stack when they cross RPC, so every phase is caught HERE and
+    // reported with its own stack, which points at the real culprit.
     async testMtcute() {
-        const client = await this.#ensureMtcuteClient();
+        const phases = [];
+
+        const run = async (phase, fn) => {
+            const started = Date.now();
+
+            try {
+                const info = await fn();
+
+                phases.push({
+                    phase,
+                    ok: true,
+                    ms: Date.now() - started,
+                    ...(info !== undefined ? { info } : {})
+                });
+
+                return true;
+            } catch (error) {
+                phases.push({
+                    phase,
+                    ok: false,
+                    ms: Date.now() - started,
+                    error: error?.message || String(error),
+                    name: error?.name || null,
+                    stack: String(error?.stack || "").split("\n").slice(0, 14),
+                    cause: error?.cause
+                        ? String(error.cause?.message || error.cause)
+                        : null
+                });
+
+                return false;
+            }
+        };
+
+        await run("secrets", async () => {
+            const [id, hash, session, bot] = await Promise.all([
+                this.env.API_ID.get(),
+                this.env.API_HASH.get(),
+                this.env.MTCUTE_SESSION?.get?.() ?? null,
+                this.env.MTCUTE_BOT_TOKEN?.get?.() ?? null
+            ]);
+
+            return {
+                apiId: Boolean(id),
+                apiHash: Boolean(hash),
+                session: Boolean(session),
+                botToken: Boolean(bot)
+            };
+        });
+
+        await run("wasm-module", async () => ({
+            type: Object.prototype.toString.call(mtcuteWasm),
+            isWebAssemblyModule:
+                typeof WebAssembly !== "undefined" &&
+                mtcuteWasm instanceof WebAssembly.Module
+        }));
+
+        await run("crypto-init", async () => {
+            const provider = new WebCryptoProvider({ wasmInput: mtcuteWasm });
+            await provider.initialize?.();
+            return "wasm crypto ready";
+        });
+
+        await run("raw-websocket", async () => {
+            // Bypasses mtcute: can this Worker open a client WebSocket to
+            // Telegram's web endpoint at all?
+            const ws = new WebSocket("wss://pluto.web.telegram.org/apiws", "binary");
+
+            await new Promise((resolve, reject) => {
+                const timer = setTimeout(
+                    () => reject(new Error("no open event after 8s")), 8000
+                );
+
+                ws.addEventListener("open", () => {
+                    clearTimeout(timer);
+                    resolve();
+                });
+
+                ws.addEventListener("error", () => {
+                    clearTimeout(timer);
+                    reject(new Error("WebSocket error event"));
+                });
+            });
+
+            try { ws.close(); } catch {}
+            return "opened";
+        });
+
+        await run("client-start", async () => {
+            const client = await this.#ensureMtcuteClient();
+
+            return {
+                clientType: client?.constructor?.name || "TelegramClient"
+            };
+        });
 
         return {
-            started: true,
-            clientType: client?.constructor?.name || "TelegramClient"
+            ok: phases.every(p => p.ok),
+            phases
         };
     }
 

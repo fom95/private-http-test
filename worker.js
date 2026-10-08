@@ -1362,37 +1362,70 @@ function parseRange(rangeHeader, size) {
 }
 
 function parseMultipartFilename(filename) {
-    const match =
-        // Accepts "name.mp4.part001_002" and the older "name.mp4.part1of3".
-        /^(.+)\.part(\d+)(?:of|_)(\d+)$/i.exec(
-            String(filename || "")
-        );
+    const name = String(filename || "");
 
-    if (!match) {
-        return null;
+    /*
+     * Current packager format:
+     *
+     *   MyVideo.part001.mp4
+     *   MyVideo.part002.mp4
+     *   MyVideo.part003.mp4
+     *
+     * Total is not encoded in the filename, so total will be null
+     * and getMultipartMediaInfo() will discover all matching parts.
+     */
+    let match =
+        /^(.+)\.part(\d+)\.([^.]+)$/i.exec(name);
+
+    if (match) {
+        const part = Number(match[2]);
+
+        if (
+            Number.isSafeInteger(part) &&
+            part >= 1
+        ) {
+            return {
+                originalName: match[1] + "." + match[3],
+                baseName: match[1],
+                extension: match[3],
+                part,
+                total: null
+            };
+        }
     }
 
-    const part =
-        Number(match[2]);
+    /*
+     * Also continue supporting the older explicit-total formats:
+     *
+     *   MyVideo.mp4.part001of003
+     *   MyVideo.mp4.part001_003
+     */
+    match =
+        /^(.+)\.part(\d+)(?:of|_)(\d+)$/i.exec(name);
 
-    const total =
-        Number(match[3]);
+    if (match) {
+        const part = Number(match[2]);
+        const total = Number(match[3]);
 
-    if (
-        !Number.isSafeInteger(part) ||
-        !Number.isSafeInteger(total) ||
-        part < 1 ||
-        total < 1 ||
-        part > total
-    ) {
-        return null;
+        if (
+            Number.isSafeInteger(part) &&
+            Number.isSafeInteger(total) &&
+            part >= 1 &&
+            total >= 1 &&
+            part <= total
+        ) {
+            return {
+                originalName: match[1],
+                baseName: match[1].replace(/\.[^.]+$/, ""),
+                extension:
+                    match[1].split(".").pop() || "",
+                part,
+                total
+            };
+        }
     }
 
-    return {
-        originalName: match[1],
-        part,
-        total
-    };
+    return null;
 }
 
 async function getMessageMediaInfo(
@@ -1495,31 +1528,72 @@ async function getMultipartMediaInfo(
 
     const targetMessage =
         existingMessage ||
-        await getMessage(client, env, numericChatId, numericMessageId);
+        await getMessage(
+            client,
+            env,
+            numericChatId,
+            numericMessageId
+        );
 
     const targetInfo =
         existingInfo ||
         await getMessageMediaInfo(
-            client, env, numericChatId, numericMessageId, targetMessage
+            client,
+            env,
+            numericChatId,
+            numericMessageId,
+            targetMessage
         );
 
-    const multipart = parseMultipartFilename(targetInfo.fileName);
+    const multipart =
+        parseMultipartFilename(targetInfo.fileName);
 
     if (!multipart) {
         return null;
     }
 
+    /*
+     * All parts are identified by:
+     *
+     *   baseName + ".partNNN." + extension
+     *
+     * Example:
+     *
+     *   MyVideo.part001.mp4
+     *   MyVideo.part002.mp4
+     *   MyVideo.part003.mp4
+     *
+     * The packager does not encode the total in the filename, so we
+     * discover the complete set from chat history.
+     */
+
     const found = new Map();
 
     function addMessageInfo(message, info) {
-        if (!message || !info?.fileId) return;
+        if (!message || !info?.fileId) {
+            return;
+        }
 
-        const parsed = parseMultipartFilename(info.fileName);
-        if (!parsed) return;
+        const parsed =
+            parseMultipartFilename(info.fileName);
 
+        if (!parsed) {
+            return;
+        }
+
+        /*
+         * The base name and extension must match.
+         *
+         * This prevents:
+         *
+         *   OtherVideo.part001.mp4
+         *
+         * from being accidentally included.
+         */
         if (
-            parsed.originalName !== multipart.originalName ||
-            parsed.total !== multipart.total
+            parsed.baseName !== multipart.baseName ||
+            parsed.extension.toLowerCase() !==
+                multipart.extension.toLowerCase()
         ) {
             return;
         }
@@ -1531,78 +1605,194 @@ async function getMultipartMediaInfo(
         });
     }
 
-    addMessageInfo(targetMessage, targetInfo);
+    /*
+     * Always include the message that was actually requested.
+     */
+    addMessageInfo(
+        targetMessage,
+        targetInfo
+    );
 
-    // Resolve the peer once up front so the parallel lookups below all hit
-    // the in-memory memo instead of racing through the cold path.
-    await prepareChatPeer(client, env, numericChatId);
+    /*
+     * Resolve the peer once before the lookups.
+     */
+    await prepareChatPeer(
+        client,
+        env,
+        numericChatId
+    );
 
-    // Parts are normally consecutive message IDs; fetch the missing ones
-    // in parallel instead of one Telegram round trip at a time.
-    const firstMessageId = numericMessageId - (multipart.part - 1);
-    const missing = [];
+    /*
+     * First try consecutive message IDs.
+     *
+     * This is fast because the packager's parts will normally have
+     * been uploaded consecutively.
+     */
+    const firstMessageId =
+        numericMessageId -
+        (multipart.part - 1);
 
-    for (let part = 1; part <= multipart.total; part++) {
-        if (!found.has(part)) missing.push(part);
-    }
+    /*
+     * If the filename explicitly contains the total, we know exactly
+     * how many parts to look for.
+     *
+     * Otherwise, scan forward/backward until the consecutive run ends.
+     */
+    if (multipart.total !== null) {
+        const missing = [];
 
-    await mapLimit(missing, 6, async part => {
-        const candidateId = firstMessageId + (part - 1);
-        if (candidateId <= 0) return;
-
-        try {
-            const message = await getMessage(client, env, numericChatId, candidateId);
-            const info = await getMessageMediaInfo(
-                client, env, numericChatId, candidateId, message
-            );
-            addMessageInfo(message, info);
-        } catch {
-            // Missing/non-media candidate; history fallback below.
+        for (
+            let part = 1;
+            part <= multipart.total;
+            part++
+        ) {
+            if (!found.has(part)) {
+                missing.push(part);
+            }
         }
-    });
 
-    if (found.size < multipart.total) {
+        await mapLimit(
+            missing,
+            6,
+            async part => {
+                const candidateId =
+                    firstMessageId +
+                    (part - 1);
+
+                if (candidateId <= 0) {
+                    return;
+                }
+
+                try {
+                    const message =
+                        await getMessage(
+                            client,
+                            env,
+                            numericChatId,
+                            candidateId
+                        );
+
+                    const info =
+                        await getMessageMediaInfo(
+                            client,
+                            env,
+                            numericChatId,
+                            candidateId,
+                            message
+                        );
+
+                    addMessageInfo(
+                        message,
+                        info
+                    );
+                } catch {
+                    // History fallback below.
+                }
+            }
+        );
+    } else {
+        /*
+         * Current packager format has no total.
+         *
+         * Search the recent history. This also means the parts do NOT
+         * have to remain consecutive message IDs.
+         */
         try {
-            const history = await client.getHistory(numericChatId, { limit: 100 });
+            const history =
+                await client.getHistory(
+                    numericChatId,
+                    { limit: 100 }
+                );
 
             for (const message of history || []) {
-                if (found.size >= multipart.total) break;
+                if (
+                    message.id ===
+                    numericMessageId
+                ) {
+                    continue;
+                }
 
-                const info = await getMessageMediaInfo(
-                    client, env, numericChatId, message.id, message
+                const info =
+                    await getMessageMediaInfo(
+                        client,
+                        env,
+                        numericChatId,
+                        message.id,
+                        message
+                    );
+
+                addMessageInfo(
+                    message,
+                    info
                 );
-                addMessageInfo(message, info);
             }
         } catch (error) {
             console.log(
-                "Multipart history fallback failed:",
-                error?.message || String(error)
+                "Multipart history scan failed:",
+                error?.message ||
+                    String(error)
             );
         }
     }
 
-    if (found.size !== multipart.total) {
+    /*
+     * We now know the complete set that exists in recent history.
+     *
+     * If the target was part 2 and parts 1/3 are also present, we have
+     * everything necessary to expose one logical video.
+     */
+    if (found.size === 0) {
+        return null;
+    }
+
+    /*
+     * For the explicit-total format, missing parts are an error.
+     */
+    if (
+        multipart.total !== null &&
+        found.size !== multipart.total
+    ) {
         throw new Error(
-            `Could not find all parts of multipart file "${multipart.originalName}". ` +
+            `Could not find all parts of multipart file ` +
+            `"${multipart.originalName}". ` +
             `Found ${found.size} of ${multipart.total}.`
         );
     }
 
-    const parts = Array.from(found.values()).sort((a, b) => a.part - b.part);
+    const parts =
+        Array.from(found.values())
+            .sort(
+                (a, b) =>
+                    a.part - b.part
+            );
 
-    for (let index = 0; index < parts.length; index++) {
-        if (parts[index].part !== index + 1) {
+    /*
+     * Make sure numbering is contiguous.
+     */
+    for (
+        let index = 0;
+        index < parts.length;
+        index++
+    ) {
+        if (
+            parts[index].part !==
+            index + 1
+        ) {
             throw new Error(
-                `Multipart file "${multipart.originalName}" is missing part ${index + 1}.`
+                `Multipart file "${multipart.originalName}" ` +
+                `is missing part ${index + 1}.`
             );
         }
 
         if (
-            !Number.isSafeInteger(Number(parts[index].fileSize)) ||
+            !Number.isSafeInteger(
+                Number(parts[index].fileSize)
+            ) ||
             Number(parts[index].fileSize) <= 0
         ) {
             throw new Error(
-                `Multipart file "${multipart.originalName}" has an invalid size for part ${index + 1}.`
+                `Multipart file "${multipart.originalName}" ` +
+                `has an invalid size for part ${index + 1}.`
             );
         }
     }
@@ -1610,21 +1800,37 @@ async function getMultipartMediaInfo(
     let totalSize = 0;
 
     for (const part of parts) {
-        totalSize += Number(part.fileSize);
+        totalSize +=
+            Number(part.fileSize);
 
-        if (!Number.isSafeInteger(totalSize)) {
+        if (
+            !Number.isSafeInteger(
+                totalSize
+            )
+        ) {
             throw new Error(
-                `Multipart file "${multipart.originalName}" is too large.`
+                `Multipart file "${multipart.originalName}" ` +
+                `is too large.`
             );
         }
     }
 
     return {
         multipart: true,
-        originalName: multipart.originalName,
-        totalParts: multipart.total,
-        fileSize: totalSize,
-        mimeType: parts[0].mimeType || "application/octet-stream",
+
+        originalName:
+            multipart.originalName,
+
+        totalParts:
+            parts.length,
+
+        fileSize:
+            totalSize,
+
+        mimeType:
+            parts[0].mimeType ||
+            "video/mp4",
+
         parts
     };
 }

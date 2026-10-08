@@ -1,4 +1,6 @@
 import { Client } from "@mtkruto/mtkruto";
+import { TelegramClient as MtcuteClient } from "@mtcute/web";
+import { MemoryStorage } from "@mtcute/core";
 import { DurableObject } from "cloudflare:workers";
 
 // Video streaming is deliberately separate from the /piece API.
@@ -9,6 +11,8 @@ import { DurableObject } from "cloudflare:workers";
 const TELEGRAM_CHUNK_SIZE = 1024 * 1024;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 const TELEGRAM_FRAGMENT_SIZE = 1024 * 1024;
+const MTCUTE_PART_SIZE_KB = 512;
+const MTCUTE_HIGH_WATER_MARK = 16 * 1024 * 1024;
 
 // Number of Telegram file reads kept ahead of the browser.
 const VIDEO_STREAM_WORKERS = 6;
@@ -710,6 +714,20 @@ function safeCachePut(ctx, cache, request, response) {
     } catch {
         // Ignore -- caching is never allowed to affect the real response.
     }
+}
+
+async function createMtcuteClient(env) {
+    const [apiIdRaw, apiHash, session, botToken] = await Promise.all([
+        env.API_ID.get(), env.API_HASH.get(),
+        env.MTCUTE_SESSION?.get?.() ?? Promise.resolve(null),
+        env.MTCUTE_BOT_TOKEN?.get?.() ?? Promise.resolve(null)
+    ]);
+    const apiId = Number(apiIdRaw);
+    if (!apiId || !apiHash) throw new Error("Telegram API credentials are not configured.");
+    if (!session && !botToken) throw new Error("MTCUTE_SESSION or MTCUTE_BOT_TOKEN must be configured for video streaming.");
+    const client = new MtcuteClient({ apiId, apiHash, storage: new MemoryStorage(), disableUpdates: true });
+    await client.start(botToken ? { botToken } : { session, sessionForce: true });
+    return client;
 }
 
 async function createClient(env) {
@@ -2027,254 +2045,133 @@ async function streamFullDownload(client, fileId, onFatalError) {
     });
 }
 
-async function streamRangeDownload(
-    client, fileId, fileSize, start, end, onFatalError
-) {
-    /*
-     * Video pipeline: keep several Telegram reads active at once, but emit
-     * them strictly in file order. This is the important difference from a
-     * serial "download a chunk, then give it to Firefox" implementation.
-     * Firefox can therefore consume while later Telegram reads are already
-     * in flight.
-     */
+async function streamMtcuteRangeDownload(mtClient, chatId, messageId, start, end, fileSize, onFatalError) {
+    if (end < start) throw new Error("Invalid media range.");
+
+    const messages = await mtClient.getMessages(Number(chatId), Number(messageId));
+    const message = messages?.[0];
+    const media = message?.media;
+    if (!message || !media) throw new Error(`mtcute could not resolve media for ${chatId}/${messageId}.`);
+
+    const alignedStart = Math.floor(start / TELEGRAM_OFFSET_ALIGNMENT) * TELEGRAM_OFFSET_ALIGNMENT;
+    const prefix = start - alignedStart;
+    const requestedLength = end - start + 1;
     const abortController = new AbortController();
-    const signal = abortController.signal;
-    const alignedStart = Math.floor(start / TELEGRAM_FRAGMENT_SIZE) * TELEGRAM_FRAGMENT_SIZE;
-    let nextOffset = alignedStart;
     let cancelled = false;
-    let firstByte = true;
-    const queue = [];
-    const startedAt = Date.now();
 
-    async function readChunk(offset) {
-        const chunkSize = Math.min(TELEGRAM_FRAGMENT_SIZE, fileSize - offset);
-        if (chunkSize <= 0) return null;
+    const source = mtClient.downloadAsStream(media, {
+        offset: alignedStart,
+        limit: prefix + requestedLength,
+        fileSize,
+        partSize: MTCUTE_PART_SIZE_KB,
+        highWaterMark: MTCUTE_HIGH_WATER_MARK,
+        abortSignal: abortController.signal,
+        stallTimeout: 60000
+    });
 
-        const t0 = Date.now();
-
-        try {
-            const bytes = await client.downloadChunk(fileId, {
-                offset,
-                chunkSize,
-                signal
-            });
-
-            if (cancelled) return null;
-
-            if (!bytes || bytes.length === 0) {
-                throw new Error("Telegram returned no data at offset " + offset + ".");
-            }
-
-            if (bytes.length < chunkSize && offset + bytes.length < fileSize) {
-                throw new Error(
-                    "Telegram returned a short range at offset " + offset +
-                    " (requested " + chunkSize + ", received " + bytes.length + ")."
-                );
-            }
-
-            const ms = Date.now() - t0;
-            if (ms > SLOW_MS) {
-                console.log("slow video Telegram read:", JSON.stringify({
-                    fileId: String(fileId), offset, bytes: bytes.length, ms
-                }));
-            }
-
-            return { offset, bytes };
-        } catch (error) {
-            if (cancelled || error?.name === "AbortError") return null;
-            throw error;
-        }
-    }
-
-    function fill() {
-        while (
-            !cancelled &&
-            queue.length < VIDEO_STREAM_WORKERS &&
-            nextOffset <= end &&
-            nextOffset < fileSize
-        ) {
-            const offset = nextOffset;
-            nextOffset += TELEGRAM_FRAGMENT_SIZE;
-            queue.push(readChunk(offset));
-        }
-    }
-
-    function cancel(reason) {
-        if (cancelled) return;
-        cancelled = true;
-        try { abortController.abort(reason); } catch {}
-        queue.length = 0;
-    }
+    const reader = source.getReader();
+    let skip = prefix;
+    let remaining = requestedLength;
 
     return new ReadableStream({
         async pull(controller) {
             if (cancelled) return;
-
-            fill();
-            if (!queue.length) {
-                controller.close();
-                return;
-            }
-
             try {
-                const result = await queue.shift();
-                if (cancelled || !result) return;
-
-                const chunkStart = result.offset;
-                const chunkEnd = chunkStart + result.bytes.length - 1;
-                const outputStart = Math.max(start, chunkStart);
-                const outputEnd = Math.min(end, chunkEnd);
-
-                if (outputEnd >= outputStart) {
-                    const bytes = result.bytes.slice(
-                        outputStart - chunkStart,
-                        outputEnd - chunkStart + 1
-                    );
-
-                    if (firstByte) {
-                        firstByte = false;
-                        const ttfb = Date.now() - startedAt;
-                        if (ttfb > SLOW_MS) {
-                            console.log("slow video first byte:", JSON.stringify({
-                                fileId: String(fileId), start, end, ms: ttfb
-                            }));
-                        }
+                while (true) {
+                    const result = await reader.read();
+                    if (result.done) {
+                        if (remaining > 0 && !cancelled) throw new Error(`mtcute stream ended ${remaining} bytes early.`);
+                        if (!cancelled) controller.close();
+                        return;
                     }
-
-                    controller.enqueue(bytes);
-                }
-
-                fill();
-
-                if (nextOffset > end && queue.length === 0) {
-                    controller.close();
+                    let bytes = result.value;
+                    if (skip) {
+                        if (bytes.length <= skip) { skip -= bytes.length; continue; }
+                        bytes = bytes.slice(skip); skip = 0;
+                    }
+                    if (bytes.length > remaining) bytes = bytes.slice(0, remaining);
+                    if (bytes.length) { remaining -= bytes.length; controller.enqueue(bytes); }
+                    if (remaining <= 0) {
+                        try { await reader.cancel(); } catch {}
+                        if (!cancelled) controller.close();
+                        return;
+                    }
+                    return;
                 }
             } catch (error) {
                 if (cancelled) return;
-                cancel("video stream failed");
-                console.log("video range stream error:", JSON.stringify({
-                    fileId: String(fileId), start, end,
-                    elapsed: Date.now() - startedAt,
-                    error: error?.message || String(error)
-                }));
+                cancelled = true;
+                try { abortController.abort(error); } catch {}
+                try { await reader.cancel(error); } catch {}
                 onFatalError?.(error);
                 controller.error(error);
             }
         },
-
         async cancel(reason) {
-            cancel(reason);
+            if (cancelled) return;
+            cancelled = true;
+            try { abortController.abort(reason); } catch {}
+            try { await reader.cancel(reason); } catch {}
         }
     });
 }
 
+async function streamRangeDownload(mtClient, chatId, messageId, fileSize, start, end, onFatalError) {
+    return streamMtcuteRangeDownload(mtClient, chatId, messageId, start, end, fileSize, onFatalError);
+}
 
-async function streamMultipartRangeDownload(
-    client, parts, start, end, onFatalError, registerDownload = null
-) {
-    // A multipart upload is one logical file. Translate the requested logical
-    // range into physical Telegram-document ranges and feed each document
-    // through the same concurrent read-ahead pipeline. Thus /media/<chat>/<id>
-    // works when <id> is ANY of the physical .part messages.
-    const normalized = parts.map(part => ({
-        fileId: part.fileId,
-        fileSize: Number(part.fileSize)
-    }));
-
+async function streamMultipartRangeDownload(mtClient, parts, start, end, onFatalError, registerDownload = null) {
+    const normalized = parts.map(part => ({ chatId: part.chatId, messageId: part.messageId, fileSize: Number(part.fileSize) }));
     const segments = [];
-    let global = 0;
-
+    let globalOffset = 0;
     for (const part of normalized) {
-        const partStart = global;
-        const partEnd = global + part.fileSize - 1;
-
+        const partStart = globalOffset;
+        const partEnd = globalOffset + part.fileSize - 1;
         if (end >= partStart && start <= partEnd) {
-            const a = Math.max(start, partStart);
-            const b = Math.min(end, partEnd);
-            segments.push({
-                fileId: part.fileId,
-                fileSize: part.fileSize,
-                localStart: a - partStart,
-                localEnd: b - partStart
-            });
+            const globalStart = Math.max(start, partStart);
+            const globalEnd = Math.min(end, partEnd);
+            segments.push({ chatId: part.chatId, messageId: part.messageId, fileSize: part.fileSize, localStart: globalStart - partStart, localEnd: globalEnd - partStart });
         }
-
-        global += part.fileSize;
-        if (global > end) break;
+        globalOffset += part.fileSize;
+        if (globalOffset > end) break;
     }
+    if (!segments.length) throw new Error("Multipart range starts beyond the available file.");
 
-    if (!segments.length) {
-        throw new Error("Multipart range starts beyond the available file.");
-    }
-
-    let cancelled = false;
-    let currentStream = null;
-    let currentReader = null;
-    let unregister = null;
-    let index = 0;
-
+    let cancelled = false, activeStream = null, activeReader = null, unregister = null;
     function cancel(reason) {
         if (cancelled) return;
         cancelled = true;
-        try { currentReader?.cancel(reason); } catch {}
-        try { currentStream?.cancel(reason); } catch {}
-        unregister?.();
-        unregister = null;
+        try { activeReader?.cancel(reason); } catch {}
+        try { activeStream?.cancel(reason); } catch {}
     }
-
     const stream = new ReadableStream({
         async pull(controller) {
             if (cancelled) return;
-
             try {
-                while (index < segments.length) {
+                for (const segment of segments) {
                     if (cancelled) return;
-
-                    const segment = segments[index++];
-                    currentStream = await streamRangeDownload(
-                        client, segment.fileId, segment.fileSize,
-                        segment.localStart, segment.localEnd, onFatalError
-                    );
-                    currentReader = currentStream.getReader();
-
-                    const result = await currentReader.read();
-
-                    if (result.done) {
-                        try { await currentReader.cancel(); } catch {}
-                        currentReader = null;
-                        currentStream = null;
-                        continue;
+                    activeStream = await streamRangeDownload(mtClient, segment.chatId, segment.messageId, segment.fileSize, segment.localStart, segment.localEnd, onFatalError);
+                    activeReader = activeStream.getReader();
+                    while (true) {
+                        if (cancelled) return;
+                        const result = await activeReader.read();
+                        if (result.done) break;
+                        controller.enqueue(result.value);
                     }
-
-                    controller.enqueue(result.value);
-                    return;
+                    try { await activeReader.cancel(); } catch {}
+                    activeReader = null; activeStream = null;
                 }
-
-                controller.close();
-                unregister?.();
-                unregister = null;
+                if (!cancelled) { controller.close(); unregister?.(); unregister = null; }
             } catch (error) {
                 if (cancelled) return;
-                cancel("multipart video stream failed");
-                console.log("multipart video stream error:", JSON.stringify({
-                    requestedStart: start, requestedEnd: end,
-                    segments: segments.length,
-                    error: error?.message || String(error)
-                }));
-                onFatalError?.(error);
-                controller.error(error);
+                unregister?.(); unregister = null; onFatalError?.(error); controller.error(error);
             }
         },
-
-        async cancel(reason) {
-            cancel(reason);
-        }
+        async cancel(reason) { cancel(reason); unregister?.(); unregister = null; }
     });
-
     if (registerDownload) unregister = registerDownload(cancel);
     return stream;
 }
-
 
 async function handleImageViewer(
     request,
@@ -2619,7 +2516,7 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
                 multipartInfo.parts, range.start, effectiveEnd
             )
             : await stub.downloadRangeStream(
-                fileId, fileSize, range.start, effectiveEnd
+                chatId, messageId, fileSize, range.start, effectiveEnd
             );
 
         timings.streamSetup = Date.now() - downloadStart;
@@ -2684,7 +2581,7 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
     // read-ahead streamer (same bytes, 200 response) instead of the serial
     // one-chunk-at-a-time iterator.
     const stream = await stub.downloadRangeStream(
-        fileId, fileSize, 0, fileSize - 1
+        chatId, messageId, fileSize, 0, fileSize - 1
     );
 
     timings.streamSetup = Date.now() - downloadStart;
@@ -4939,6 +4836,8 @@ function looksLikeConnectionError(error) {
 export class TelegramConnectionDO extends DurableObject {
     #client = null;
     #clientPromise = null;
+    #mtClient = null;
+    #mtClientPromise = null;
 
     #activeMultipartDownloads =
         new Map();
@@ -5102,6 +5001,13 @@ export class TelegramConnectionDO extends DurableObject {
         }
 
         return this.#clientPromise;
+    }
+
+    async #ensureMtcuteClient() {
+        if (!this.#mtClientPromise) {
+            this.#mtClientPromise = createMtcuteClient(this.env).then(client => { this.#mtClient = client; return client; }).catch(error => { this.#mtClientPromise = null; this.#mtClient = null; throw error; });
+        }
+        return this.#mtClientPromise;
     }
 
     // Used both when an RPC method's own call throws, and as the
@@ -5829,26 +5735,9 @@ export class TelegramConnectionDO extends DurableObject {
         );
     }
 
-    async downloadRangeStream(
-        fileId,
-        fileSize,
-        start,
-        end
-    ) {
-        const client =
-            await this.#ensureClient();
-
-        return streamRangeDownload(
-            client,
-            fileId,
-            fileSize,
-            start,
-            end,
-            error =>
-                this.#discardClientOnConnectionError(
-                    error
-                )
-        );
+    async downloadRangeStream(chatId, messageId, fileSize, start, end) {
+        const mtClient = await this.#ensureMtcuteClient();
+        return streamRangeDownload(mtClient, chatId, messageId, fileSize, start, end, error => console.log("mtcute stream error:", error?.message || String(error)));
     }
 
 
@@ -5857,8 +5746,7 @@ export class TelegramConnectionDO extends DurableObject {
         start,
         end
     ) {
-        const client =
-            await this.#ensureClient();
+        const mtClient = await this.#ensureMtcuteClient();
 
         /*
          * Register the cancellation callback INSIDE the Durable Object,
@@ -5873,7 +5761,7 @@ export class TelegramConnectionDO extends DurableObject {
          * to finish, but no further stale chunks are requested or enqueued.
          */
         return streamMultipartRangeDownload(
-            client,
+            mtClient,
             parts,
             start,
             end,

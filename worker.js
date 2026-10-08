@@ -1,17 +1,12 @@
 import { Client } from "@mtkruto/mtkruto";
 import {
     TelegramClient as MtcuteClient
-} from "@mtcute/core/client.js";
+} from "@mtcute/web";
 
 import {
     MemoryStorage
 } from "@mtcute/core";
 
-import {
-    WebCryptoProvider,
-    WebSocketTransport,
-    WebPlatform
-} from "@mtcute/web";
 import { DurableObject } from "cloudflare:workers";
 
 // Video streaming is deliberately separate from the /piece API.
@@ -728,71 +723,29 @@ function safeCachePut(ctx, cache, request, response) {
 }
 
 async function createMtcuteClient(env) {
-    const [
-        apiIdRaw,
-        apiHash,
-        session,
-        botToken
-    ] = await Promise.all([
-        env.API_ID.get(),
-        env.API_HASH.get(),
+    const [apiIdRaw, apiHash, session, botToken] = await Promise.all([
+        env.API_ID.get(), env.API_HASH.get(),
         env.MTCUTE_SESSION?.get?.() ?? Promise.resolve(null),
         env.MTCUTE_BOT_TOKEN?.get?.() ?? Promise.resolve(null)
     ]);
-
-    const apiId =
-        Number(apiIdRaw);
-
-    if (!apiId || !apiHash) {
-        throw new Error(
-            "Telegram API credentials are not configured."
-        );
-    }
-
-    if (!session && !botToken) {
-        throw new Error(
-            "MTCUTE_SESSION or MTCUTE_BOT_TOKEN must be configured for video streaming."
-        );
-    }
-
-    /*
-     * @mtcute/core is deliberately runtime-agnostic.
-     * Cloudflare does not provide a built-in mtcute runtime package,
-     * so explicitly provide the Web-compatible implementations.
-     *
-     * MemoryStorage is fine here because the authorization/session
-     * is supplied every time from the Cloudflare secret.
-     */
-    const storage =
-        new MemoryStorage();
-
-    const transport =
-        new WebSocketTransport();
-
-    const crypto =
-        new WebCryptoProvider();
-
-    const platform =
-        new WebPlatform();
-
-    const client =
-        new MtcuteClient({
-            apiId,
-            apiHash,
-
-            storage,
-            transport,
-            crypto,
-            platform,
-
-            disableUpdates: true
-        });
+    const apiId = Number(apiIdRaw);
+    if (!apiId || !apiHash) throw new Error("Telegram API credentials are not configured.");
+    if (!session && !botToken) throw new Error("MTCUTE_SESSION or MTCUTE_BOT_TOKEN must be configured for video streaming.");
+    // IMPORTANT: use the @mtcute/web high-level client here.
+    // @mtcute/core is intentionally runtime-agnostic and requires its
+    // transport/crypto/platform to be supplied by the caller. The web
+    // package supplies those implementations itself, while MemoryStorage
+    // keeps the session entirely in the Durable Object's memory.
+    const client = new MtcuteClient({
+        apiId,
+        apiHash,
+        storage: new MemoryStorage(),
+        disableUpdates: true
+    });
 
     await client.start(
         botToken
-            ? {
-                botToken
-            }
+            ? { botToken }
             : {
                 session,
                 sessionForce: true

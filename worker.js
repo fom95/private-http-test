@@ -13,6 +13,13 @@ import {
     WebPlatform
 } from "@mtcute/web";
 
+// Pre-compiled WASM module for mtcute's crypto (AES-IGE/CTR, sha, gunzip).
+// Workers can't compile WASM at runtime, and mtcute's default loader does
+// `new URL("../mtcute.wasm", import.meta.url)`, which throws
+// "Invalid URL string." inside a bundled Worker. wrangler turns a .wasm
+// import into a ready-to-use WebAssembly.Module.
+import mtcuteWasm from "@mtcute/wasm/mtcute.wasm";
+
 import { DurableObject } from "cloudflare:workers";
 
 // Video streaming is deliberately separate from the /piece API.
@@ -759,7 +766,7 @@ async function createMtcuteClient(env) {
         apiHash,
         storage: new MemoryStorage(),
         transport: () => new WebSocketTransport(),
-        crypto: new WebCryptoProvider(),
+        crypto: new WebCryptoProvider({ wasmInput: mtcuteWasm }),
         platform: new WebPlatform(),
         disableUpdates: true
     });

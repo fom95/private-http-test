@@ -759,13 +759,12 @@ async function createMtcuteClient(env) {
     // Cloudflare Workers is not one of mtcute's built-in runtimes, so
     // do NOT rely on @mtcute/web's environment detection here. Construct
     // the core client explicitly and provide every runtime dependency.
-    // The transport is a factory because mtcute creates a fresh transport
-    // for each Telegram DC connection.
+    // mtcute 0.32 takes a transport INSTANCE (not a factory).
     const client = new MtcuteClient({
         apiId,
         apiHash,
         storage: new MemoryStorage(),
-        transport: () => new WebSocketTransport(),
+        transport: new WebSocketTransport(),
         crypto: new WebCryptoProvider({ wasmInput: mtcuteWasm }),
         platform: new WebPlatform(),
         disableUpdates: true

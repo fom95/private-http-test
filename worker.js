@@ -3012,10 +3012,11 @@ async function handleApi(
 
         try {
             const stub = getConnectionStub(env);
-            const result = await stub.testMtcute();
+            const result = await stub.testMtcute(url.searchParams.get("step"));
 
             return json({
                 success: result.ok,
+                step: url.searchParams.get("step") || "all",
                 phases: result.phases,
                 elapsedMs: Date.now() - start
             }, result.ok ? 200 : 500);
@@ -5329,14 +5330,19 @@ export class TelegramConnectionDO extends DurableObject {
     // Step-by-step health check. Errors thrown inside a Durable Object lose
     // their stack when they cross RPC, so every phase is caught HERE and
     // reported with its own stack, which points at the real culprit.
-    async testMtcute() {
+    async testMtcute(only = null) {
         const phases = [];
 
         const run = async (phase, fn) => {
+            if (only && only !== phase) return true;
+
             const started = Date.now();
+            console.log("mtcute-test phase start:", phase);
 
             try {
                 const info = await fn();
+
+                console.log("mtcute-test phase ok:", phase);
 
                 phases.push({
                     phase,
@@ -5347,6 +5353,11 @@ export class TelegramConnectionDO extends DurableObject {
 
                 return true;
             } catch (error) {
+                console.log(
+                    "mtcute-test phase FAILED:", phase,
+                    error?.message || String(error), error?.stack || ""
+                );
+
                 phases.push({
                     phase,
                     ok: false,

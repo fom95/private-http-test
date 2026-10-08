@@ -1,11 +1,17 @@
 import { Client } from "@mtkruto/mtkruto";
 import {
     TelegramClient as MtcuteClient
-} from "@mtcute/web";
+} from "@mtcute/core/client.js";
 
 import {
     MemoryStorage
 } from "@mtcute/core";
+
+import {
+    WebCryptoProvider,
+    WebSocketTransport,
+    WebPlatform
+} from "@mtcute/web";
 
 import { DurableObject } from "cloudflare:workers";
 
@@ -731,15 +737,18 @@ async function createMtcuteClient(env) {
     const apiId = Number(apiIdRaw);
     if (!apiId || !apiHash) throw new Error("Telegram API credentials are not configured.");
     if (!session && !botToken) throw new Error("MTCUTE_SESSION or MTCUTE_BOT_TOKEN must be configured for video streaming.");
-    // IMPORTANT: use the @mtcute/web high-level client here.
-    // @mtcute/core is intentionally runtime-agnostic and requires its
-    // transport/crypto/platform to be supplied by the caller. The web
-    // package supplies those implementations itself, while MemoryStorage
-    // keeps the session entirely in the Durable Object's memory.
+    // Cloudflare Workers is not one of mtcute's built-in runtimes, so
+    // do NOT rely on @mtcute/web's environment detection here. Construct
+    // the core client explicitly and provide every runtime dependency.
+    // The transport is a factory because mtcute creates a fresh transport
+    // for each Telegram DC connection.
     const client = new MtcuteClient({
         apiId,
         apiHash,
         storage: new MemoryStorage(),
+        transport: () => new WebSocketTransport(),
+        crypto: new WebCryptoProvider(),
+        platform: new WebPlatform(),
         disableUpdates: true
     });
 
@@ -3404,6 +3413,30 @@ async function handleApi(
     const path =
         url.pathname;
 
+    // Explicit mtcute health check. This endpoint does not touch any media;
+    // it only proves that the Worker can construct and start the mtcute
+    // client. Use it before testing a video.
+    if (path === "/api/mtcute-test") {
+        const start = Date.now();
+        try {
+            const stub = getConnectionStub(env);
+            const result = await stub.testMtcute();
+
+            return json({
+                success: true,
+                mtcute: result,
+                elapsedMs: Date.now() - start
+            });
+        } catch (error) {
+            return json({
+                success: false,
+                error: error?.message || String(error),
+                name: error?.name || "Error",
+                elapsedMs: Date.now() - start
+            }, 500);
+        }
+    }
+
     if (path === "/api/chats") {
         const start =
             Date.now();
@@ -5501,6 +5534,15 @@ export class TelegramConnectionDO extends DurableObject {
 
             throw error;
         }
+    }
+
+    async testMtcute() {
+        const client = await this.#ensureMtcuteClient();
+
+        return {
+            started: true,
+            clientType: client?.constructor?.name || "TelegramClient"
+        };
     }
 
     async getChats() {

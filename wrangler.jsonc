@@ -23,6 +23,11 @@
       "binding": "AUTH_PASSWORD",
       "store_id": "c40cc3dcc6234fb98cab408bd2f302be",
       "secret_name": "AUTH_PASSWORD"
+    },
+    {
+      "binding": "MTCUTE_SESSION",
+      "store_id": "c40cc3dcc6234fb98cab408bd2f302be",
+      "secret_name": "MTCUTE_SESSION"
     }
   ],
 

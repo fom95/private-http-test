@@ -3430,8 +3430,12 @@ async function handleApi(
         } catch (error) {
             return json({
                 success: false,
-                error: error?.message || String(error),
+                error: String(error?.message || error),
                 name: error?.name || "Error",
+                stack: error?.stack || null,
+                cause: error?.cause
+                    ? String(error.cause?.message || error.cause)
+                    : null,
                 elapsedMs: Date.now() - start
             }, 500);
         }

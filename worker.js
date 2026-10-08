@@ -85,7 +85,7 @@ const TELEGRAM_MAX_BULK_IN_FLIGHT = 8;
 // Telegram appears to throttle bursts of upload.getFile calls (the whole
 // connection stalls for seconds). Set this to ~1000 / (safe requests per
 // second) once /api/paced shows which rate avoids the stalls.
-const TELEGRAM_BULK_GAP_MS = 0;
+const TELEGRAM_BULK_GAP_MS = 250;
 
 class TelegramScheduler {
     constructor(limit, lowLimit, lowGapMs = 0) {

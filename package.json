@@ -4,6 +4,7 @@
   "private": true,
   "dependencies": {
     "@mtcute/core": "^0.32.4",
+    "@mtcute/web": "^0.32.4",
     "@mtkruto/mtkruto": "npm:@jsr/mtkruto__mtkruto@^0.217.0"
   }
 }

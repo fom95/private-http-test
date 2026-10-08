@@ -1,6 +1,17 @@
 import { Client } from "@mtkruto/mtkruto";
-import { TelegramClient as MtcuteClient } from "@mtcute/web";
-import { MemoryStorage } from "@mtcute/core";
+import {
+    TelegramClient as MtcuteClient
+} from "@mtcute/core/client.js";
+
+import {
+    MemoryStorage
+} from "@mtcute/core";
+
+import {
+    WebCryptoProvider,
+    WebSocketTransport,
+    WebPlatform
+} from "@mtcute/web";
 import { DurableObject } from "cloudflare:workers";
 
 // Video streaming is deliberately separate from the /piece API.
@@ -2116,61 +2127,502 @@ async function streamMtcuteRangeDownload(mtClient, chatId, messageId, start, end
     });
 }
 
-async function streamRangeDownload(mtClient, chatId, messageId, fileSize, start, end, onFatalError) {
-    return streamMtcuteRangeDownload(mtClient, chatId, messageId, start, end, fileSize, onFatalError);
-}
+async function streamRangeDownload(
+    mtClient,
+    media,
+    start,
+    end,
+    options = {}
+) {
+    const {
+        abortSignal = null,
+        onError = null
+    } = options;
 
-async function streamMultipartRangeDownload(mtClient, parts, start, end, onFatalError, registerDownload = null) {
-    const normalized = parts.map(part => ({ chatId: part.chatId, messageId: part.messageId, fileSize: Number(part.fileSize) }));
-    const segments = [];
-    let globalOffset = 0;
-    for (const part of normalized) {
-        const partStart = globalOffset;
-        const partEnd = globalOffset + part.fileSize - 1;
-        if (end >= partStart && start <= partEnd) {
-            const globalStart = Math.max(start, partStart);
-            const globalEnd = Math.min(end, partEnd);
-            segments.push({ chatId: part.chatId, messageId: part.messageId, fileSize: part.fileSize, localStart: globalStart - partStart, localEnd: globalEnd - partStart });
+    const fileSize = Number(
+        media?.fileSize ??
+        media?.size ??
+        0
+    );
+
+    if (!Number.isSafeInteger(fileSize) || fileSize <= 0) {
+        throw new Error("Invalid Telegram media file size.");
+    }
+
+    start = Math.max(
+        0,
+        Math.min(
+            fileSize - 1,
+            Number(start)
+        )
+    );
+
+    end = Math.max(
+        start,
+        Math.min(
+            fileSize - 1,
+            Number(end)
+        )
+    );
+
+    const length =
+        end -
+        start +
+        1;
+
+    /*
+     * IMPORTANT:
+     *
+     * Do NOT split this into our old 1 MiB downloadChunk() requests.
+     *
+     * tgstreamer lets mtcute own the Telegram download pipeline and
+     * exposes that pipeline as the HTTP response stream. This allows
+     * mtcute to perform its own consecutive reads/read-ahead instead of
+     * making Firefox wait for our custom chunk scheduler.
+     *
+     * highWaterMark is deliberately larger than a single Telegram
+     * request so that the Web Stream has useful read-ahead.
+     */
+    const source =
+        mtClient.downloadAsStream(
+            media,
+            {
+                offset: start,
+                limit: length,
+
+                /*
+                 * 16 MiB of queued stream data gives Firefox enough
+                 * read-ahead without turning a seek into a giant
+                 * Telegram download.
+                 */
+                highWaterMark:
+                    16 * 1024 * 1024,
+
+                abortSignal
+            }
+        );
+
+    /*
+     * The source stream may yield chunks larger/smaller than the exact
+     * HTTP range requested. Keep the HTTP boundary exact.
+     */
+    const reader =
+        source.getReader();
+
+    let remaining =
+        length;
+
+    let closed = false;
+
+    const closeReader = async () => {
+        if (closed) {
+            return;
         }
-        globalOffset += part.fileSize;
-        if (globalOffset > end) break;
-    }
-    if (!segments.length) throw new Error("Multipart range starts beyond the available file.");
 
-    let cancelled = false, activeStream = null, activeReader = null, unregister = null;
-    function cancel(reason) {
-        if (cancelled) return;
-        cancelled = true;
-        try { activeReader?.cancel(reason); } catch {}
-        try { activeStream?.cancel(reason); } catch {}
-    }
-    const stream = new ReadableStream({
+        closed = true;
+
+        try {
+            await reader.cancel();
+        } catch {}
+    };
+
+    return new ReadableStream({
         async pull(controller) {
-            if (cancelled) return;
+            if (remaining <= 0) {
+                await closeReader();
+
+                controller.close();
+
+                return;
+            }
+
             try {
-                for (const segment of segments) {
-                    if (cancelled) return;
-                    activeStream = await streamRangeDownload(mtClient, segment.chatId, segment.messageId, segment.fileSize, segment.localStart, segment.localEnd, onFatalError);
-                    activeReader = activeStream.getReader();
-                    while (true) {
-                        if (cancelled) return;
-                        const result = await activeReader.read();
-                        if (result.done) break;
-                        controller.enqueue(result.value);
-                    }
-                    try { await activeReader.cancel(); } catch {}
-                    activeReader = null; activeStream = null;
+                const result =
+                    await reader.read();
+
+                if (result.done) {
+                    await closeReader();
+
+                    controller.close();
+
+                    return;
                 }
-                if (!cancelled) { controller.close(); unregister?.(); unregister = null; }
+
+                let chunk =
+                    result.value;
+
+                if (
+                    chunk.byteLength >
+                    remaining
+                ) {
+                    chunk =
+                        chunk.slice(
+                            0,
+                            remaining
+                        );
+                }
+
+                remaining -=
+                    chunk.byteLength;
+
+                controller.enqueue(
+                    chunk
+                );
+
+                if (remaining <= 0) {
+                    await closeReader();
+
+                    controller.close();
+                }
             } catch (error) {
-                if (cancelled) return;
-                unregister?.(); unregister = null; onFatalError?.(error); controller.error(error);
+                await closeReader();
+
+                try {
+                    onError?.(error);
+                } catch {}
+
+                controller.error(
+                    error
+                );
             }
         },
-        async cancel(reason) { cancel(reason); unregister?.(); unregister = null; }
+
+        async cancel(reason) {
+            /*
+             * This is extremely important for seeking.
+             *
+             * Firefox cancels the old Range stream when it seeks.
+             * Propagate that cancellation all the way down to mtcute
+             * instead of allowing the old Telegram download to continue.
+             */
+            await closeReader();
+
+            try {
+                abortSignal?.throwIfAborted?.();
+            } catch {}
+        }
     });
-    if (registerDownload) unregister = registerDownload(cancel);
-    return stream;
+}
+
+async function streamMultipartRangeDownload(
+    mtClient,
+    parts,
+    start,
+    end,
+    onError = null,
+    registerCancel = null
+) {
+    if (
+        !Array.isArray(parts) ||
+        parts.length === 0
+    ) {
+        throw new Error(
+            "Multipart media has no parts."
+        );
+    }
+
+    /*
+     * Normalize the logical file layout.
+     *
+     * Each part must have:
+     *
+     *   fileSize
+     *   media / location
+     *
+     * `start` and `end` refer to the concatenated logical file.
+     */
+    let logicalOffset = 0;
+
+    const normalized =
+        parts.map((part, index) => {
+            const size =
+                Number(
+                    part.fileSize ??
+                    part.size
+                );
+
+            if (
+                !Number.isSafeInteger(size) ||
+                size <= 0
+            ) {
+                throw new Error(
+                    `Invalid multipart size for part ${index + 1}.`
+                );
+            }
+
+            const item = {
+                ...part,
+                index,
+                start: logicalOffset,
+                end:
+                    logicalOffset +
+                    size -
+                    1,
+                size
+            };
+
+            logicalOffset +=
+                size;
+
+            return item;
+        });
+
+    const totalSize =
+        logicalOffset;
+
+    start = Math.max(
+        0,
+        Math.min(
+            totalSize - 1,
+            Number(start)
+        )
+    );
+
+    end = Math.max(
+        start,
+        Math.min(
+            totalSize - 1,
+            Number(end)
+        )
+    );
+
+    /*
+     * Abort controller belongs to THIS browser Range request.
+     *
+     * If Firefox seeks, the response stream gets cancelled and this
+     * controller immediately kills the old Telegram download.
+     */
+    const abortController =
+        new AbortController();
+
+    let currentReader = null;
+
+    let cancelled = false;
+
+    const unregister =
+        registerCancel?.(
+            reason => {
+                cancelled = true;
+
+                try {
+                    abortController.abort(
+                        reason instanceof Error
+                            ? reason
+                            : new Error(
+                                String(
+                                    reason ||
+                                    "Multipart stream cancelled."
+                                )
+                            )
+                    );
+                } catch {}
+
+                try {
+                    currentReader?.cancel(
+                        reason
+                    );
+                } catch {}
+            }
+        );
+
+    /*
+     * Find the first and last physical Telegram files touched by the
+     * requested logical HTTP range.
+     */
+    const selected = [];
+
+    for (const part of normalized) {
+        if (
+            part.end < start ||
+            part.start > end
+        ) {
+            continue;
+        }
+
+        const localStart =
+            Math.max(
+                0,
+                start -
+                part.start
+            );
+
+        const localEnd =
+            Math.min(
+                part.size - 1,
+                end -
+                part.start
+            );
+
+        selected.push({
+            part,
+            localStart,
+            localEnd
+        });
+    }
+
+    let partIndex = 0;
+
+    return new ReadableStream({
+        async pull(controller) {
+            if (cancelled) {
+                controller.close();
+
+                return;
+            }
+
+            while (
+                partIndex <
+                selected.length
+            ) {
+                if (cancelled) {
+                    controller.close();
+
+                    return;
+                }
+
+                const item =
+                    selected[
+                        partIndex
+                    ];
+
+                const requestedLength =
+                    item.localEnd -
+                    item.localStart +
+                    1;
+
+                /*
+                 * mtcute handles the actual Telegram download.
+                 *
+                 * Do NOT call downloadChunk() here.
+                 *
+                 * This is the part that makes the Worker behave like
+                 * tgstreamer rather than our old scheduler.
+                 */
+                const source =
+                    mtClient.downloadAsStream(
+                        item.part.media,
+                        {
+                            offset:
+                                item.localStart,
+
+                            limit:
+                                requestedLength,
+
+                            highWaterMark:
+                                16 *
+                                1024 *
+                                1024,
+
+                            abortSignal:
+                                abortController.signal
+                        }
+                    );
+
+                currentReader =
+                    source.getReader();
+
+                try {
+                    while (true) {
+                        if (cancelled) {
+                            await currentReader
+                                .cancel()
+                                .catch(() => {});
+
+                            controller.close();
+
+                            return;
+                        }
+
+                        const result =
+                            await currentReader.read();
+
+                        if (
+                            result.done
+                        ) {
+                            break;
+                        }
+
+                        if (
+                            !result.value ||
+                            result.value.byteLength === 0
+                        ) {
+                            continue;
+                        }
+
+                        controller.enqueue(
+                            result.value
+                        );
+
+                        /*
+                         * One pull produces one source chunk.
+                         *
+                         * This lets the browser's backpressure control
+                         * the Telegram pipeline instead of buffering the
+                         * entire HTTP range in the Worker.
+                         */
+                        return;
+                    }
+                } catch (error) {
+                    if (
+                        cancelled ||
+                        abortController.signal.aborted
+                    ) {
+                        controller.close();
+
+                        return;
+                    }
+
+                    try {
+                        onError?.(error);
+                    } catch {}
+
+                    controller.error(
+                        error
+                    );
+
+                    return;
+                } finally {
+                    try {
+                        await currentReader.cancel();
+                    } catch {}
+
+                    currentReader =
+                        null;
+                }
+
+                partIndex++;
+            }
+
+            controller.close();
+        },
+
+        async cancel(reason) {
+            cancelled = true;
+
+            try {
+                abortController.abort(
+                    reason instanceof Error
+                        ? reason
+                        : new Error(
+                            String(
+                                reason ||
+                                "HTTP stream cancelled."
+                            )
+                        )
+                );
+            } catch {}
+
+            try {
+                await currentReader?.cancel(
+                    reason
+                );
+            } catch {}
+
+            try {
+                unregister?.();
+            } catch {}
+        }
+    });
 }
 
 async function handleImageViewer(
@@ -5017,8 +5469,8 @@ export class TelegramConnectionDO extends DurableObject {
     // can't undo the failure the current caller already sees.
     #discardClientOnConnectionError(error) {
         if (looksLikeConnectionError(error)) {
-            this.#client = null;
-            this.#clientPromise = null;
+            this.#mtClient = null;
+            this.#mtClientPromise = null;
         }
     }
 
@@ -5735,10 +6187,93 @@ export class TelegramConnectionDO extends DurableObject {
         );
     }
 
-    async downloadRangeStream(chatId, messageId, fileSize, start, end) {
-        const mtClient = await this.#ensureMtcuteClient();
-        return streamRangeDownload(mtClient, chatId, messageId, fileSize, start, end, error => console.log("mtcute stream error:", error?.message || String(error)));
+    async downloadRangeStream(
+    chatId,
+    messageId,
+    fileSize,
+    start,
+    end
+) {
+    const mtClient =
+        await this.#ensureMtcuteClient();
+
+    /*
+     * Resolve the message ONCE.
+     *
+     * The resulting media object is what mtcute's downloader should
+     * consume. Do not turn this into repeated fileId/downloadChunk()
+     * calls.
+     */
+    const message =
+        await getMessage(
+            mtClient,
+            this.env,
+            chatId,
+            messageId
+        );
+
+    const media =
+        getMessageMedia(
+            message
+        );
+
+    if (!media) {
+        throw new Error(
+            "Message has no downloadable media."
+        );
     }
+
+    const actualSize =
+        Number(
+            media.fileSize ??
+            media.size ??
+            fileSize
+        );
+
+    if (
+        !Number.isSafeInteger(
+            actualSize
+        ) ||
+        actualSize <= 0
+    ) {
+        throw new Error(
+            "Unable to determine Telegram media size."
+        );
+    }
+
+    const abortController =
+        new AbortController();
+
+    const stream =
+        await streamRangeDownload(
+            mtClient,
+            {
+                ...media,
+                fileSize:
+                    actualSize
+            },
+            start,
+            end,
+            {
+                abortSignal:
+                    abortController.signal,
+
+                onError:
+                    error => {
+                        this.#discardClientOnConnectionError(
+                            error
+                        );
+                    }
+            }
+        );
+
+    /*
+     * Cancellation from the RPC response needs to reach mtcute.
+     *
+     * The returned ReadableStream's cancel() handles the normal path.
+     */
+    return stream;
+}
 
 
     async downloadMultipartRangeStream(
@@ -5746,33 +6281,26 @@ export class TelegramConnectionDO extends DurableObject {
         start,
         end
     ) {
-        const mtClient = await this.#ensureMtcuteClient();
-
-        /*
-         * Register the cancellation callback INSIDE the Durable Object,
-         * before the stream is returned through RPC.  The previous version
-         * registered after returning the stream and tried to call
-         * stream.cancel() on the RPC-transferred stream.  That does not
-         * reliably cancel the producer, which is why stale Range: 0-...
-         * downloads kept generating chunks during a seek.
-         *
-         * The callback below flips the producer's own cancellation flag and
-         * cancels its current reader.  The in-flight Telegram call is allowed
-         * to finish, but no further stale chunks are requested or enqueued.
-         */
+        const mtClient =
+            await this.#ensureMtcuteClient();
+    
         return streamMultipartRangeDownload(
             mtClient,
             parts,
             start,
             end,
-            error =>
+    
+            error => {
                 this.#discardClientOnConnectionError(
                     error
-                ),
-            register =>
-                this.#registerMultipartDownload(
+                );
+            },
+    
+            register => {
+                return this.#registerMultipartDownload(
                     register
-                )
+                );
+            }
         );
     }
 }

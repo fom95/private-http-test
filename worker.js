@@ -31,17 +31,16 @@ const TELEGRAM_CHUNK_SIZE = 1024 * 1024;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 const TELEGRAM_FRAGMENT_SIZE = 1024 * 1024;
 // ---- mtcute video streaming (modelled on tgstreamer) -----------------
-// tgstreamer patches mtcute so a download is sequential, keeps at most ~4 MB
-// buffered ahead of the HTTP client (backpressure), and drops its buffer when
-// the client disconnects. A stock mtcute iterator instead prefetches the
-// WHOLE requested range as fast as it can, which is what makes seeks slow
-// and memory-hungry. We get the same behaviour without patching node_modules
-// by never asking mtcute for more than one WINDOW at a time and only opening
-// the next window once the consumer is part-way through the current one.
+// tgstreamer opens one download per HTTP Range request starting at an
+// aligned offset, never passes `limit`/`fileSize` (mtcute only accepts a
+// limit equal to the file size or a divisor of 1 MB), slices the first
+// bytes itself, and aborts the download as soon as it has the bytes the
+// client asked for. Backpressure there comes from a `throttle` hook that
+// mtcute 0.32 no longer has; 0.32's downloadAsStream has `highWaterMark`
+// instead ("pause the download while this many bytes are buffered").
 const MTCUTE_PART_SIZE_KB = 512;                      // Telegram's max part size
-const MTCUTE_PART_BYTES = MTCUTE_PART_SIZE_KB * 1024;
-const MTCUTE_WINDOW_BYTES = 4 * 1024 * 1024;          // == tgstreamer's 4 MB cap; must be a multiple of the part size
-const MTCUTE_PREFETCH_AT = 0.5;                       // open the next window when this fraction of the current one is delivered
+const MTCUTE_PART_BYTES = MTCUTE_PART_SIZE_KB * 1024; // offsets are aligned to this
+const MTCUTE_HIGH_WATER_MARK = 4 * 1024 * 1024;       // tgstreamer's 4 MB buffer cap
 const MTCUTE_STALL_TIMEOUT_MS = 60000;
 const MTCUTE_STREAM_QUEUE_CHUNKS = 2;
 
@@ -2098,133 +2097,77 @@ async function streamFullDownload(client, fileId, onFatalError) {
 }
 
 // Yields exactly the bytes [start, end] (inclusive, relative to this file)
-// of one Telegram document, using mtcute, one WINDOW at a time.
-//
-// Windows are aligned to the part size, so mtcute never has to trim a
-// partial first chunk itself; we only trim the (at most one) leading
-// partial part of the very first window.
-async function* mtcuteSegmentIterator(mtClient, media, fileSize, start, end, signal) {
-    const opened = new Set();
+// of one Telegram document: one mtcute download, started at a part-aligned
+// offset, cancelled the moment we have what the client asked for.
+async function* mtcuteSegmentIterator(mtClient, media, _fileSize, start, end, signal) {
+    const alignedFrom =
+        Math.floor(start / MTCUTE_PART_BYTES) * MTCUTE_PART_BYTES;
 
-    const openWindow = from => {
-        const alignedFrom =
-            Math.floor(from / MTCUTE_PART_BYTES) * MTCUTE_PART_BYTES;
-        const skip = from - alignedFrom;
-        const take = Math.min(MTCUTE_WINDOW_BYTES - skip, end - from + 1);
+    let skip = start - alignedFrom;
+    let remaining = end - start + 1;
 
-        // tgstreamer's notes: never pass fileSize (mtcute's part-size logic
-        // throws "File is too large" above 2 GB; partSize is explicit here
-        // so it isn't needed), and keep `limit` a whole number of parts so
-        // mtcute never issues an odd-sized upload.getFile (LIMIT_INVALID).
-        // The limit is also clamped to the chunk that contains EOF.
-        const wanted = Math.ceil((skip + take) / MTCUTE_PART_BYTES) * MTCUTE_PART_BYTES;
-        const toEof =
-            Number.isSafeInteger(fileSize) && fileSize > alignedFrom
-                ? Math.ceil((fileSize - alignedFrom) / MTCUTE_PART_BYTES) * MTCUTE_PART_BYTES
-                : wanted;
+    // Per-segment controller so we can stop mtcute early without
+    // aborting the caller's (whole-response) signal.
+    const local = new AbortController();
 
-        const iterator = mtClient.downloadAsIterable(media, {
-            offset: alignedFrom,
-            limit: Math.min(wanted, toEof),
-            partSize: MTCUTE_PART_SIZE_KB,
-            stallTimeout: MTCUTE_STALL_TIMEOUT_MS,
-            abortSignal: signal
-        })[Symbol.asyncIterator]();
-
-        const win = { iterator, skip, take, from, firstRead: null };
-        opened.add(win);
-        return win;
+    const onAbort = () => {
+        try { local.abort(signal.reason); } catch {}
     };
 
-    // Start the first network read of a window without waiting for it.
-    const prime = win => {
-        win.firstRead = win.iterator.next();
-        win.firstRead.catch(() => {}); // surfaced when the window is consumed
-    };
+    if (signal) {
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+    }
 
-    const pull = win => {
-        if (win.firstRead) {
-            const pending = win.firstRead;
-            win.firstRead = null;
-            return pending;
-        }
+    const stream = mtClient.downloadAsStream(media, {
+        offset: alignedFrom,
+        partSize: MTCUTE_PART_SIZE_KB,
+        stallTimeout: MTCUTE_STALL_TIMEOUT_MS,
+        abortSignal: local.signal,
+        highWaterMark: MTCUTE_HIGH_WATER_MARK
+    });
 
-        return win.iterator.next();
-    };
-
-    const closeWindow = async win => {
-        opened.delete(win);
-        try { await win.iterator.return?.(); } catch {}
-    };
+    const reader = stream.getReader();
 
     try {
-        let current = openWindow(start);
-        let ahead = null;
+        while (remaining > 0) {
+            signal?.throwIfAborted?.();
 
-        while (current) {
-            let skip = current.skip;
-            let remaining = current.take;
-            const nextFrom = current.from + current.take;
+            const result = await reader.read();
 
-            while (remaining > 0) {
-                signal?.throwIfAborted?.();
-
-                const result = await pull(current);
-
-                if (result.done) {
-                    throw new Error(
-                        "mtcute stream ended " + remaining + " bytes early."
-                    );
-                }
-
-                let bytes = result.value;
-
-                if (skip) {
-                    if (bytes.length <= skip) {
-                        skip -= bytes.length;
-                        continue;
-                    }
-
-                    bytes = bytes.slice(skip);
-                    skip = 0;
-                }
-
-                if (bytes.length > remaining) {
-                    bytes = bytes.slice(0, remaining);
-                }
-
-                remaining -= bytes.length;
-
-                if (bytes.length) yield bytes;
-
-                // Keep exactly one window of read-ahead.
-                if (
-                    !ahead &&
-                    nextFrom <= end &&
-                    current.take - remaining >= current.take * MTCUTE_PREFETCH_AT
-                ) {
-                    ahead = openWindow(nextFrom);
-                    prime(ahead);
-                }
+            if (result.done) {
+                throw new Error(
+                    "mtcute stream ended " + remaining + " bytes early."
+                );
             }
 
-            await closeWindow(current);
+            let bytes = result.value;
 
-            if (ahead) {
-                current = ahead;
-                ahead = null;
-            } else if (nextFrom <= end) {
-                current = openWindow(nextFrom);
-            } else {
-                current = null;
+            if (skip) {
+                if (bytes.length <= skip) {
+                    skip -= bytes.length;
+                    continue;
+                }
+
+                bytes = bytes.slice(skip);
+                skip = 0;
             }
+
+            if (bytes.length > remaining) {
+                bytes = bytes.slice(0, remaining);
+            }
+
+            remaining -= bytes.length;
+
+            if (bytes.length) yield bytes;
         }
     } finally {
-        // Normal end, error, or the HTTP client went away: release every
-        // iterator we still hold so mtcute stops requesting from Telegram.
-        for (const win of [...opened]) {
-            closeWindow(win);
-        }
+        // Done, errored, or the HTTP client left: stop Telegram traffic now
+        // and drop whatever mtcute had buffered.
+        signal?.removeEventListener?.("abort", onAbort);
+
+        try { await reader.cancel(); } catch {}
+        try { local.abort(new Error("segment finished")); } catch {}
     }
 }
 

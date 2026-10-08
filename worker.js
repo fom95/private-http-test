@@ -728,16 +728,77 @@ function safeCachePut(ctx, cache, request, response) {
 }
 
 async function createMtcuteClient(env) {
-    const [apiIdRaw, apiHash, session, botToken] = await Promise.all([
-        env.API_ID.get(), env.API_HASH.get(),
+    const [
+        apiIdRaw,
+        apiHash,
+        session,
+        botToken
+    ] = await Promise.all([
+        env.API_ID.get(),
+        env.API_HASH.get(),
         env.MTCUTE_SESSION?.get?.() ?? Promise.resolve(null),
         env.MTCUTE_BOT_TOKEN?.get?.() ?? Promise.resolve(null)
     ]);
-    const apiId = Number(apiIdRaw);
-    if (!apiId || !apiHash) throw new Error("Telegram API credentials are not configured.");
-    if (!session && !botToken) throw new Error("MTCUTE_SESSION or MTCUTE_BOT_TOKEN must be configured for video streaming.");
-    const client = new MtcuteClient({ apiId, apiHash, storage: new MemoryStorage(), disableUpdates: true });
-    await client.start(botToken ? { botToken } : { session, sessionForce: true });
+
+    const apiId =
+        Number(apiIdRaw);
+
+    if (!apiId || !apiHash) {
+        throw new Error(
+            "Telegram API credentials are not configured."
+        );
+    }
+
+    if (!session && !botToken) {
+        throw new Error(
+            "MTCUTE_SESSION or MTCUTE_BOT_TOKEN must be configured for video streaming."
+        );
+    }
+
+    /*
+     * @mtcute/core is deliberately runtime-agnostic.
+     * Cloudflare does not provide a built-in mtcute runtime package,
+     * so explicitly provide the Web-compatible implementations.
+     *
+     * MemoryStorage is fine here because the authorization/session
+     * is supplied every time from the Cloudflare secret.
+     */
+    const storage =
+        new MemoryStorage();
+
+    const transport =
+        new WebSocketTransport();
+
+    const crypto =
+        new WebCryptoProvider();
+
+    const platform =
+        new WebPlatform();
+
+    const client =
+        new MtcuteClient({
+            apiId,
+            apiHash,
+
+            storage,
+            transport,
+            crypto,
+            platform,
+
+            disableUpdates: true
+        });
+
+    await client.start(
+        botToken
+            ? {
+                botToken
+            }
+            : {
+                session,
+                sessionForce: true
+            }
+    );
+
     return client;
 }
 

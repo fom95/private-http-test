@@ -1395,30 +1395,42 @@ function parseMultipartFilename(filename) {
     }
 
     /*
-     * Also continue supporting the older explicit-total formats:
-     *
-     *   MyVideo.mp4.part001of003
-     *   MyVideo.mp4.part001_003
+     * Explicit-total formats. Accept the suffix either at the very end
+     * (MyVideo.mp4.part001of003) or before a repeated trailing extension
+     * (MyVideo.mp4.part001of003.mp4). The latter occurs with uploaders that
+     * append the part marker and then preserve the media extension.
+     * Also support the underscore spelling (MyVideo.mp4.part001_003).
      */
     match =
-        /^(.+)\.part(\d+)(?:of|_)(\d+)$/i.exec(name);
+        /^(.+)\.part(\d+)(?:of|_)(\d+)(?:\.([^.]+))?$/i.exec(name);
 
     if (match) {
         const part = Number(match[2]);
         const total = Number(match[3]);
+        const prefix = match[1];
+        const prefixExtensionMatch = /\.([^.]+)$/.exec(prefix);
+        const trailingExtension = match[4] || "";
+        const extension =
+            trailingExtension || prefixExtensionMatch?.[1] || "";
+        const originalName = prefixExtensionMatch
+            ? prefix
+            : (trailingExtension ? `${prefix}.${trailingExtension}` : prefix);
+        const baseName = prefixExtensionMatch
+            ? prefix.slice(0, -(prefixExtensionMatch[0].length))
+            : prefix;
 
         if (
             Number.isSafeInteger(part) &&
             Number.isSafeInteger(total) &&
             part >= 1 &&
             total >= 1 &&
-            part <= total
+            part <= total &&
+            extension
         ) {
             return {
-                originalName: match[1],
-                baseName: match[1].replace(/\.[^.]+$/, ""),
-                extension:
-                    match[1].split(".").pop() || "",
+                originalName,
+                baseName,
+                extension,
                 part,
                 total
             };

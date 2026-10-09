@@ -41,7 +41,7 @@ const TELEGRAM_FRAGMENT_SIZE = 1024 * 1024;
 // instead ("pause the download while this many bytes are buffered").
 const MTCUTE_PART_SIZE_KB = 512;                      // Telegram's max part size
 const MTCUTE_PART_BYTES = MTCUTE_PART_SIZE_KB * 1024; // offsets are aligned to this
-const MTCUTE_HIGH_WATER_MARK = 128 * 1024;           // minimize read-ahead during seeks
+const MTCUTE_HIGH_WATER_MARK = 4 * 1024 * 1024;     // TgStreamer-style bounded read-ahead
 const MTCUTE_STALL_TIMEOUT_MS = 60000;
 const MTCUTE_STREAM_QUEUE_CHUNKS = 1;
 
@@ -4912,7 +4912,6 @@ export class TelegramConnectionDO extends DurableObject {
     #thumbPuts = 0;
     #telegramCooldownUntil = 0;
     #lastFloodWaitEvent = null;
-    #lastMtcuteStreamStartAt = 0;
 
     constructor(ctx, env) {
         super(ctx, env);
@@ -5260,23 +5259,14 @@ export class TelegramConnectionDO extends DurableObject {
         return new ReadableStream({
             pull: async controller => {
                 try {
-                    // Rapid scrubbing can make browsers issue many Range requests
-                    // before Telegram has finished cancelling the previous download.
-                    // A short, abort-aware start spacing lets obsolete seeks die before
-                    // they create another upload.getFile pipeline. Timers yield CPU.
-                    const spacingMs = 350;
-                    const delay = spacingMs - (Date.now() - this.#lastMtcuteStreamStartAt);
-                    if (delay > 0) {
-                        await new Promise(resolve => setTimeout(resolve, delay));
-                    }
+                    // Do not delay each pull: every pull corresponds to useful
+                    // downstream demand. A seek/disconnect aborts this iterator,
+                    // while the Durable Object keeps the MTProto client alive.
                     if (abort.signal.aborted) {
                         finish();
                         try { controller.close(); } catch {}
                         return;
                     }
-                    this.#checkTelegramCooldown();
-                    this.#lastMtcuteStreamStartAt = Date.now();
-
                     const result = await iterator.next();
 
                     if (result.done) {
@@ -5322,7 +5312,7 @@ export class TelegramConnectionDO extends DurableObject {
                         activeStreams: this.#activeMultipartDownloads.size,
                         name: error?.name || "Error",
                         message: String(error?.message || error || "").slice(0, 1000),
-                        action: "stream_failed_client_discarded"
+                        action: "stream_failed_client_preserved_unless_connection_error"
                     }));
                 }
             },

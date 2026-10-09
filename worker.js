@@ -52,6 +52,15 @@ const VIDEO_STREAM_WORKERS = 6;
 // New streams cancel the previous stream instead of allowing up to eight.
 const MAX_ACTIVE_MULTIPART_DOWNLOADS = 1;
 
+// A Durable Object has a CPU budget PER INVOCATION (30 s by default). One
+// open-ended browser request ("Range: bytes=N-") would keep a single RPC
+// stream alive for the whole rest of the file, so the decrypt/copy work of
+// the entire video piles up in one invocation until the DO is reset. Each
+// response is therefore capped; players simply ask for the next range, and
+// each new request starts with a fresh budget. Raise it if range boundaries
+// ever cause visible stutter, lower it if the CPU limit still triggers.
+const MAX_HTTP_RANGE_SIZE = 16 * 1024 * 1024;
+
 const CACHE_CONTROL = "public, max-age=31536000, immutable";
 
 // What the BROWSER is told for /media responses: always revalidate. The
@@ -71,7 +80,7 @@ const SLOW_MS = 5000;
 // video player's many Range requests don't each redo Telegram lookups.
 const MEDIA_CACHE_TTL_MS = 15 * 60 * 1000;
 const MEDIA_CACHE_MAX = 500;
-const THUMB_CACHE_MAX_ROWS = 5000;
+const THUMB_CACHE_MAX_ROWS = 10000;
 const THUMB_CACHE_MAX_BYTES = 1.5 * 1024 * 1024;
 
 // Un-versioned thumbnail rows (batch API) expire; versioned ones never need to.
@@ -282,6 +291,12 @@ const telegramScheduler = new TelegramScheduler(
     TELEGRAM_MAX_BULK_IN_FLIGHT,
     TELEGRAM_BULK_GAP_MS
 );
+
+// Thumbnails get their own small, paced lane. A page of 60 thumbnails used
+// to fire up to 8 upload.getFile calls at once, which is what produces
+// "flood wait ... upload.getFile" from Telegram (and then every download on
+// the account stalls for those seconds). Two at a time, 250 ms apart.
+const thumbScheduler = new TelegramScheduler(2, 2, 250);
 
 const TELEGRAM_CHUNK_TIMEOUT_MS = 60 * 1000;
 const TELEGRAM_BUFFER_TIMEOUT_MS = 60 * 1000;
@@ -2019,10 +2034,10 @@ function createMediaHeaders({
 // A fully-buffered body has no such coupling: cloning it is an instant
 // refcount, both readers are already-resolved data, and nothing holds the
 // Telegram connection open. Only use this for genuinely small files.
-async function bufferFullDownload(client, fileId) {
+async function bufferFullDownload(client, fileId, scheduler = telegramScheduler, priority = "high") {
     const queuedAt = Date.now();
 
-    return telegramScheduler.run(async () => {
+    return scheduler.run(async () => {
         const startedAt = Date.now();
         const chunks = [];
         let total = 0;
@@ -2068,7 +2083,7 @@ async function bufferFullDownload(client, fileId) {
         }
 
         return output;
-    }, "high", 0, TELEGRAM_BUFFER_TIMEOUT_MS);
+    }, priority, 0, TELEGRAM_BUFFER_TIMEOUT_MS);
 }
 
 async function streamFullDownload(client, fileId, onFatalError) {
@@ -2529,7 +2544,10 @@ async function handleDirectMediaRequest(request, env, url, ctx) {
 
         // Stream the exact Range the browser requested. There is no artificial
         // 8 MiB boundary; seeking cancels the stream and starts a new Range.
-        const effectiveEnd = range.end;
+        const effectiveEnd = Math.min(
+            range.end,
+            range.start + MAX_HTTP_RANGE_SIZE - 1
+        );
 
         const headers = mediaHeaders({
             mimeType,
@@ -3133,7 +3151,7 @@ async function handleApi(
         const thumbnails = {};
         let failures = 0;
 
-        await mapLimit(messageIds, 8, async messageId => {
+        await mapLimit(messageIds, 4, async messageId => {
             try {
                 const buffer = await stub.getThumbnailBuffer(chatId, messageId);
 
@@ -6131,7 +6149,11 @@ export class TelegramConnectionDO extends DurableObject {
     async getThumbnailBuffer(chatId, messageId) {
         const key = `t:${Number(chatId)}:${Number(messageId)}`;
 
-        return this.#bufferOnce(key, key, () =>
+        // Un-versioned entry: answers instantly, expires after a few minutes.
+        const fresh = this.#thumbGet(key);
+        if (fresh) return fresh;
+
+        return this.#bufferOnce(key, null, () =>
             this.#withClient(async client => {
                 const message = await getMessage(
                     client, this.env, chatId, messageId
@@ -6143,10 +6165,29 @@ export class TelegramConnectionDO extends DurableObject {
                     return null;
                 }
 
-                return bufferFullDownload(
-                    client,
-                    thumbs[thumbs.length - 1].fileId
-                );
+                const thumb = thumbs[thumbs.length - 1];
+
+                // Versioned entry: keyed by the thumbnail's unique id, so it
+                // never goes stale and never needs Telegram again. Without
+                // this every thumbnail was re-downloaded (upload.getFile)
+                // each time the un-versioned entry expired.
+                const versionedKey =
+                    key + ":" + String(thumb.fileUniqueId || thumb.fileId);
+
+                let bytes = this.#thumbGet(versionedKey);
+
+                if (!bytes) {
+                    bytes = await bufferFullDownload(
+                        client, thumb.fileId, thumbScheduler, "low"
+                    );
+
+                    if (bytes) this.#thumbPut(versionedKey, bytes);
+                }
+
+                // Refresh the short-lived entry so the next batch is instant.
+                if (bytes) this.#thumbPut(key, bytes);
+
+                return bytes;
             })
         );
     }

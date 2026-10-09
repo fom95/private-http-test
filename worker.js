@@ -2043,6 +2043,90 @@ async function streamFullDownload(client, fileId, onFatalError) {
     });
 }
 
+function cachedMtcuteChunk(client, media, offset, fileSize, order, isCancelled) {
+    // Do not use cachedChunk() here: that helper calls mtkruto's
+    // client.downloadChunk(fileId, ...). This stream uses an @mtcute/web
+    // client, whose supported download API is downloadAsStream(media, ...).
+    const key = `mtcute:${media.fileId}:${offset}`;
+    const hit = chunkCache.get(key);
+    if (hit) {
+        chunkCache.delete(key);
+        chunkCache.set(key, hit);
+        return Promise.resolve(hit);
+    }
+
+    let entry = chunkInflight.get(key);
+    if (entry) {
+        entry.waiters.add(isCancelled);
+        entry.order = Math.max(entry.order, order);
+        return entry.promise;
+    }
+
+    entry = { waiters: new Set([isCancelled]), order };
+    const current = entry;
+    let startedAt = 0;
+
+    entry.promise = telegramScheduler.run(async () => {
+        startedAt = Date.now();
+        const limit = Math.min(TELEGRAM_FRAGMENT_SIZE, fileSize - offset);
+        const source = await client.downloadAsStream(media, {
+            offset,
+            limit,
+            fileSize,
+            partSize: 1024,
+            highWaterMark: TELEGRAM_FRAGMENT_SIZE,
+            stallTimeout: 60000
+        });
+        const reader = source.getReader();
+        const pieces = [];
+        let total = 0;
+        try {
+            while (true) {
+                const result = await reader.read();
+                if (result.done) break;
+                if (result.value?.length) {
+                    pieces.push(result.value);
+                    total += result.value.length;
+                    if (total >= limit) break;
+                }
+            }
+        } finally {
+            try { await reader.cancel(); } catch {}
+            try { reader.releaseLock(); } catch {}
+        }
+
+        const bytes = new Uint8Array(total);
+        let at = 0;
+        for (const piece of pieces) {
+            const take = Math.min(piece.length, total - at);
+            bytes.set(piece.subarray(0, take), at);
+            at += take;
+            if (at >= total) break;
+        }
+        return bytes;
+    }, "low", () => current.order, TELEGRAM_CHUNK_TIMEOUT_MS,
+    () => [...current.waiters].every(f => f())).then(bytes => {
+        if (bytes?.length) {
+            recordChunkStat(Date.now() - startedAt, bytes.length);
+            chunkCache.set(key, bytes);
+            chunkCacheBytes += bytes.length;
+            while (chunkCacheBytes > CHUNK_CACHE_MAX_BYTES) {
+                const oldest = chunkCache.entries().next().value;
+                if (!oldest) break;
+                const [oldKey, old] = oldest;
+                chunkCache.delete(oldKey);
+                chunkCacheBytes -= old.length;
+            }
+        }
+        return bytes;
+    }).finally(() => {
+        if (chunkInflight.get(key) === current) chunkInflight.delete(key);
+    });
+
+    chunkInflight.set(key, entry);
+    return entry.promise;
+}
+
 async function streamMtcuteRangeDownload(mtClient, chatId, messageId, start, end, fileSize, onFatalError) {
     if (end < start) throw new Error("Invalid media range.");
 
@@ -2065,10 +2149,8 @@ async function streamMtcuteRangeDownload(mtClient, chatId, messageId, start, end
     const requestedEnd = Math.min(end, totalSize - 1);
     if (requestedStart > requestedEnd) throw new Error("Requested media range is outside the file.");
 
-    // downloadChunk/upload.getFile requires legal aligned requests. Reuse the
-    // Worker's 1 MiB fragment cache and deduplication so overlapping browser
-    // ranges (including the multiple requests some players issue on seek) do
-    // not download the same Telegram fragment twice.
+    // Fetch one 1 MiB mtcute stream segment at a time. Keep offsets aligned
+    // and reuse the in-flight/cache entry when browser ranges overlap.
     const alignedStart = Math.floor(requestedStart / TELEGRAM_FRAGMENT_SIZE) * TELEGRAM_FRAGMENT_SIZE;
     const initialSkip = requestedStart - alignedStart;
     const requestedLength = requestedEnd - requestedStart + 1;
@@ -2088,10 +2170,11 @@ async function streamMtcuteRangeDownload(mtClient, chatId, messageId, start, end
                 // fragments: a browser seek should not leave a read-ahead
                 // queue fetching bytes from the old playback position.
                 while (!cancelled && remaining > 0) {
-                    const bytes = await cachedChunk(
+                    const bytes = await cachedMtcuteChunk(
                         mtClient,
-                        media.fileId,
+                        media,
                         currentOffset,
+                        totalSize,
                         thisStreamOrder,
                         () => cancelled
                     );

@@ -10,6 +10,8 @@ import { DurableObject } from "cloudflare:workers";
 const TELEGRAM_CHUNK_SIZE = 1024 * 1024;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 const TELEGRAM_FRAGMENT_SIZE = 1024 * 1024;
+const MTCUTE_PART_SIZE_KB = 512;
+const MTCUTE_HIGH_WATER_MARK = 16 * 1024 * 1024;
 const MAX_ACTIVE_MULTIPART_DOWNLOADS = 8;
 
 const CACHE_CONTROL = "public, max-age=31536000, immutable";
@@ -2043,191 +2045,73 @@ async function streamFullDownload(client, fileId, onFatalError) {
     });
 }
 
-function cachedMtcuteChunk(client, media, offset, fileSize, order, isCancelled) {
-    // Do not use cachedChunk() here: that helper calls mtkruto's
-    // client.downloadChunk(fileId, ...). This stream uses an @mtcute/web
-    // client, whose supported download API is downloadAsStream(media, ...).
-    const key = `mtcute:${media.fileId}:${offset}`;
-    const hit = chunkCache.get(key);
-    if (hit) {
-        chunkCache.delete(key);
-        chunkCache.set(key, hit);
-        return Promise.resolve(hit);
-    }
-
-    let entry = chunkInflight.get(key);
-    if (entry) {
-        entry.waiters.add(isCancelled);
-        entry.order = Math.max(entry.order, order);
-        return entry.promise;
-    }
-
-    entry = { waiters: new Set([isCancelled]), order };
-    const current = entry;
-    let startedAt = 0;
-
-    entry.promise = telegramScheduler.run(async () => {
-        startedAt = Date.now();
-        const limit = Math.min(TELEGRAM_FRAGMENT_SIZE, fileSize - offset);
-        const source = await client.downloadAsStream(media, {
-            offset,
-            limit,
-            fileSize,
-            partSize: 1024,
-            highWaterMark: TELEGRAM_FRAGMENT_SIZE,
-            stallTimeout: 60000
-        });
-        const reader = source.getReader();
-        const pieces = [];
-        let total = 0;
-        try {
-            while (true) {
-                const result = await reader.read();
-                if (result.done) break;
-                if (result.value?.length) {
-                    pieces.push(result.value);
-                    total += result.value.length;
-                    if (total >= limit) break;
-                }
-            }
-        } finally {
-            try { await reader.cancel(); } catch {}
-            try { reader.releaseLock(); } catch {}
-        }
-
-        const bytes = new Uint8Array(total);
-        let at = 0;
-        for (const piece of pieces) {
-            const take = Math.min(piece.length, total - at);
-            bytes.set(piece.subarray(0, take), at);
-            at += take;
-            if (at >= total) break;
-        }
-        return bytes;
-    }, "low", () => current.order, TELEGRAM_CHUNK_TIMEOUT_MS,
-    () => [...current.waiters].every(f => f())).then(bytes => {
-        if (bytes?.length) {
-            recordChunkStat(Date.now() - startedAt, bytes.length);
-            chunkCache.set(key, bytes);
-            chunkCacheBytes += bytes.length;
-            while (chunkCacheBytes > CHUNK_CACHE_MAX_BYTES) {
-                const oldest = chunkCache.entries().next().value;
-                if (!oldest) break;
-                const [oldKey, old] = oldest;
-                chunkCache.delete(oldKey);
-                chunkCacheBytes -= old.length;
-            }
-        }
-        return bytes;
-    }).finally(() => {
-        if (chunkInflight.get(key) === current) chunkInflight.delete(key);
-    });
-
-    chunkInflight.set(key, entry);
-    return entry.promise;
-}
-
 async function streamMtcuteRangeDownload(mtClient, chatId, messageId, start, end, fileSize, onFatalError) {
     if (end < start) throw new Error("Invalid media range.");
 
-    // Resolve the Telegram file once per HTTP Range request. The actual byte
-    // reads below are deliberately sequential, matching tgstreamer's
-    // one-worker range streamer rather than mtcute's parallel read-ahead.
     const messages = await mtClient.getMessages(Number(chatId), Number(messageId));
     const message = messages?.[0];
     const media = message?.media;
-    if (!message || !media?.fileId) {
-        throw new Error(`mtcute could not resolve downloadable media for ${chatId}/${messageId}.`);
-    }
+    if (!message || !media) throw new Error(`mtcute could not resolve media for ${chatId}/${messageId}.`);
 
-    const totalSize = Number(media.fileSize ?? fileSize);
-    if (!Number.isSafeInteger(totalSize) || totalSize <= 0) {
-        throw new Error(`mtcute returned an invalid file size for ${chatId}/${messageId}.`);
-    }
-
-    const requestedStart = Math.max(0, start);
-    const requestedEnd = Math.min(end, totalSize - 1);
-    if (requestedStart > requestedEnd) throw new Error("Requested media range is outside the file.");
-
-    // Fetch one 1 MiB mtcute stream segment at a time. Keep offsets aligned
-    // and reuse the in-flight/cache entry when browser ranges overlap.
-    const alignedStart = Math.floor(requestedStart / TELEGRAM_FRAGMENT_SIZE) * TELEGRAM_FRAGMENT_SIZE;
-    const initialSkip = requestedStart - alignedStart;
-    const requestedLength = requestedEnd - requestedStart + 1;
-    const thisStreamOrder = ++streamSeq;
-    let currentOffset = alignedStart;
-    let skip = initialSkip;
-    let remaining = requestedLength;
+    const alignedStart = Math.floor(start / TELEGRAM_OFFSET_ALIGNMENT) * TELEGRAM_OFFSET_ALIGNMENT;
+    const prefix = start - alignedStart;
+    const requestedLength = end - start + 1;
+    const abortController = new AbortController();
     let cancelled = false;
-    let finished = false;
+
+    const source = mtClient.downloadAsStream(media, {
+        offset: alignedStart,
+        limit: prefix + requestedLength,
+        fileSize,
+        partSize: MTCUTE_PART_SIZE_KB,
+        highWaterMark: MTCUTE_HIGH_WATER_MARK,
+        abortSignal: abortController.signal,
+        stallTimeout: 60000
+    });
+
+    const reader = source.getReader();
+    let skip = prefix;
+    let remaining = requestedLength;
 
     return new ReadableStream({
         async pull(controller) {
-            if (cancelled || finished) return;
-
+            if (cancelled) return;
             try {
-                // One Telegram fragment at a time. Do not prefetch future
-                // fragments: a browser seek should not leave a read-ahead
-                // queue fetching bytes from the old playback position.
-                while (!cancelled && remaining > 0) {
-                    const bytes = await cachedMtcuteChunk(
-                        mtClient,
-                        media,
-                        currentOffset,
-                        totalSize,
-                        thisStreamOrder,
-                        () => cancelled
-                    );
-
-                    if (cancelled) return;
-                    if (!bytes || bytes.length === 0) {
-                        throw new Error(`Telegram returned no data at offset ${currentOffset}.`);
+                while (true) {
+                    const result = await reader.read();
+                    if (result.done) {
+                        if (remaining > 0 && !cancelled) throw new Error(`mtcute stream ended ${remaining} bytes early.`);
+                        if (!cancelled) controller.close();
+                        return;
                     }
-
-                    currentOffset += TELEGRAM_FRAGMENT_SIZE;
-
-                    if (skip >= bytes.length) {
-                        skip -= bytes.length;
-                        continue;
+                    let bytes = result.value;
+                    if (skip) {
+                        if (bytes.length <= skip) { skip -= bytes.length; continue; }
+                        bytes = bytes.slice(skip); skip = 0;
                     }
-
-                    const from = skip;
-                    skip = 0;
-                    const take = Math.min(bytes.length - from, remaining);
-                    if (take <= 0) continue;
-
-                    const output = bytes.subarray(from, from + take);
-                    remaining -= take;
-
-                    if (remaining === 0) {
-                        finished = true;
-                        controller.enqueue(output);
-                        controller.close();
-                    } else {
-                        controller.enqueue(output);
+                    if (bytes.length > remaining) bytes = bytes.slice(0, remaining);
+                    if (bytes.length) { remaining -= bytes.length; controller.enqueue(bytes); }
+                    if (remaining <= 0) {
+                        try { await reader.cancel(); } catch {}
+                        if (!cancelled) controller.close();
+                        return;
                     }
                     return;
                 }
-
-                if (!cancelled && remaining <= 0 && !finished) {
-                    finished = true;
-                    controller.close();
-                }
             } catch (error) {
                 if (cancelled) return;
-                finished = true;
+                cancelled = true;
+                try { abortController.abort(error); } catch {}
+                try { await reader.cancel(error); } catch {}
                 onFatalError?.(error);
                 controller.error(error);
             }
         },
-
-        async cancel() {
+        async cancel(reason) {
+            if (cancelled) return;
             cancelled = true;
-            finished = true;
-            // Queued chunks observe this flag and are skipped by the shared
-            // Telegram scheduler. An already-running Telegram RPC is allowed
-            // to finish; we do not falsely free its scheduler slot and create
-            // a burst of replacement requests while it is still in flight.
+            try { abortController.abort(reason); } catch {}
+            try { await reader.cancel(reason); } catch {}
         }
     });
 }

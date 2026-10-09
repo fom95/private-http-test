@@ -41,7 +41,7 @@ const TELEGRAM_FRAGMENT_SIZE = 1024 * 1024;
 // instead ("pause the download while this many bytes are buffered").
 const MTCUTE_PART_SIZE_KB = 512;                      // Telegram's max part size
 const MTCUTE_PART_BYTES = MTCUTE_PART_SIZE_KB * 1024; // offsets are aligned to this
-const MTCUTE_HIGH_WATER_MARK = 512 * 1024;           // keep read-ahead conservative
+const MTCUTE_HIGH_WATER_MARK = 128 * 1024;           // minimize read-ahead during seeks
 const MTCUTE_STALL_TIMEOUT_MS = 60000;
 const MTCUTE_STREAM_QUEUE_CHUNKS = 1;
 
@@ -402,6 +402,30 @@ function telegramRequestSize(offset, remaining) {
     return Math.min(want, align);
 }
 
+
+// Error messages use this prefix so a failure is visible as structured JSON in
+// Cloudflare Invocations even when console output is unavailable.
+const TG_DIAGNOSTIC_PREFIX = "TG_DIAGNOSTIC_JSON:";
+
+function diagnosticError(event) {
+    const error = new Error(TG_DIAGNOSTIC_PREFIX + JSON.stringify(event));
+    error.name = "TelegramDiagnosticError";
+    return error;
+}
+
+function floodWaitSeconds(error) {
+    const message = String(error?.message || error || "");
+    const patterns = [
+        /flood\s*wait[^\d]{0,40}(\d+)\s*seconds?/i,
+        /retry\s+in\s+(\d+)\s+seconds?/i,
+        /FLOOD_WAIT[_ ]?(\d+)/i
+    ];
+    for (const pattern of patterns) {
+        const match = pattern.exec(message);
+        if (match) return Math.max(1, Math.min(86400, Number(match[1]) || 1));
+    }
+    return 0;
+}
 
 function json(data, status = 200, extraHeaders = {}) {
     return new Response(JSON.stringify(data, null, 2), {
@@ -4886,6 +4910,9 @@ export class TelegramConnectionDO extends DurableObject {
     #bufferInflight = new Map();
     #sqlReady = false;
     #thumbPuts = 0;
+    #telegramCooldownUntil = 0;
+    #lastFloodWaitEvent = null;
+    #lastMtcuteStreamStartAt = 0;
 
     constructor(ctx, env) {
         super(ctx, env);
@@ -4900,6 +4927,13 @@ export class TelegramConnectionDO extends DurableObject {
                 "k TEXT PRIMARY KEY, data BLOB NOT NULL, ts INTEGER NOT NULL)"
             );
 
+            ctx.storage.sql.exec(
+                "CREATE TABLE IF NOT EXISTS stream_guard (k TEXT PRIMARY KEY, v INTEGER NOT NULL)"
+            );
+            const guardRows = ctx.storage.sql
+                .exec("SELECT v FROM stream_guard WHERE k = ?", "telegram_cooldown_until")
+                .toArray();
+            this.#telegramCooldownUntil = guardRows.length ? Number(guardRows[0].v) || 0 : 0;
             this.#sqlReady = true;
         } catch (error) {
             console.log(
@@ -5226,6 +5260,23 @@ export class TelegramConnectionDO extends DurableObject {
         return new ReadableStream({
             pull: async controller => {
                 try {
+                    // Rapid scrubbing can make browsers issue many Range requests
+                    // before Telegram has finished cancelling the previous download.
+                    // A short, abort-aware start spacing lets obsolete seeks die before
+                    // they create another upload.getFile pipeline. Timers yield CPU.
+                    const spacingMs = 350;
+                    const delay = spacingMs - (Date.now() - this.#lastMtcuteStreamStartAt);
+                    if (delay > 0) {
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                    }
+                    if (abort.signal.aborted) {
+                        finish();
+                        try { controller.close(); } catch {}
+                        return;
+                    }
+                    this.#checkTelegramCooldown();
+                    this.#lastMtcuteStreamStartAt = Date.now();
+
                     const result = await iterator.next();
 
                     if (result.done) {
@@ -5244,15 +5295,35 @@ export class TelegramConnectionDO extends DurableObject {
                         return;
                     }
 
-                    console.log(
-                        "mtcute stream error:",
-                        error?.message || String(error)
-                    );
+                    const message = String(error?.message || error || "");
+                    let floodEvent = this.#recordFloodWait(error);
+                    if (!floodEvent && message.startsWith(TG_DIAGNOSTIC_PREFIX)) {
+                        try {
+                            const existing = JSON.parse(message.slice(TG_DIAGNOSTIC_PREFIX.length));
+                            if (existing.event === "telegram_cooldown_active") floodEvent = existing;
+                        } catch {}
+                    }
+                    if (floodEvent) {
+                        // Do not destroy/reconnect the shared MTProto client for a
+                        // server-requested wait. Persist the cooldown so a DO reset
+                        // cannot immediately hammer Telegram again. The prefixed JSON
+                        // also appears in Cloudflare's exception/invocation details.
+                        controller.error(diagnosticError(floodEvent));
+                        return;
+                    }
 
                     for (const key of cacheKeys) this.#mtMediaCache.delete(key);
                     this.#discardMtcuteClient(error);
 
-                    controller.error(error);
+                    // The error itself is structured, rather than relying on logs.
+                    controller.error(diagnosticError({
+                        event: "telegram_stream_error",
+                        at: new Date().toISOString(),
+                        activeStreams: this.#activeMultipartDownloads.size,
+                        name: error?.name || "Error",
+                        message: String(error?.message || error || "").slice(0, 1000),
+                        action: "stream_failed_client_discarded"
+                    }));
                 }
             },
 
@@ -5582,7 +5653,65 @@ export class TelegramConnectionDO extends DurableObject {
     );
 }
 
+    #checkTelegramCooldown(chatId = null, messageId = null) {
+        const now = Date.now();
+        if (this.#telegramCooldownUntil <= now) {
+            if (this.#telegramCooldownUntil) {
+                this.#telegramCooldownUntil = 0;
+                this.#lastFloodWaitEvent = null;
+                try {
+                    if (this.#sqlReady) this.ctx.storage.sql.exec(
+                        "DELETE FROM stream_guard WHERE k = ?", "telegram_cooldown_until"
+                    );
+                } catch {}
+            }
+            return;
+        }
+
+        const waitSeconds = Math.max(1, Math.ceil((this.#telegramCooldownUntil - now) / 1000));
+        throw diagnosticError({
+            event: "telegram_cooldown_active",
+            at: new Date(now).toISOString(),
+            chatId: chatId == null ? null : String(chatId),
+            messageId: messageId == null ? null : Number(messageId),
+            waitSeconds,
+            cooldownUntil: new Date(this.#telegramCooldownUntil).toISOString(),
+            previousEvent: this.#lastFloodWaitEvent,
+            action: "request_rejected_before_telegram_io"
+        });
+    }
+
+    #recordFloodWait(error, chatId = null, messageId = null) {
+        const seconds = floodWaitSeconds(error);
+        if (!seconds) return null;
+
+        const now = Date.now();
+        this.#telegramCooldownUntil = Math.max(
+            this.#telegramCooldownUntil, now + seconds * 1000 + 1500
+        );
+        const event = {
+            event: "telegram_flood_wait",
+            at: new Date(now).toISOString(),
+            chatId: chatId == null ? null : String(chatId),
+            messageId: messageId == null ? null : Number(messageId),
+            waitSeconds: seconds,
+            cooldownUntil: new Date(this.#telegramCooldownUntil).toISOString(),
+            activeStreams: this.#activeMultipartDownloads.size,
+            error: String(error?.message || error || "").slice(0, 500),
+            action: "preserve_client_and_reject_new_media_requests_during_cooldown"
+        };
+        this.#lastFloodWaitEvent = event;
+        try {
+            if (this.#sqlReady) this.ctx.storage.sql.exec(
+                "INSERT OR REPLACE INTO stream_guard (k, v) VALUES (?, ?)",
+                "telegram_cooldown_until", this.#telegramCooldownUntil
+            );
+        } catch {}
+        return event;
+    }
+
     async resolveMedia(chatId, messageId, thumbnail = false) {
+        this.#checkTelegramCooldown(chatId, messageId);
         const key = `${chatId}:${messageId}:${thumbnail ? 1 : 0}`;
 
         const hit = this.#mediaCache.get(key);
@@ -6069,6 +6198,7 @@ export class TelegramConnectionDO extends DurableObject {
 
     // One browser Range request on a single-document file.
     async downloadRangeStream(chatId, messageId, fileSize, start, end) {
+        this.#checkTelegramCooldown(chatId, messageId);
         const mtClient = await this.#ensureMtcuteClient();
         const [media] = await this.#mtResolveMedia(chatId, [messageId]);
 
@@ -6096,6 +6226,7 @@ export class TelegramConnectionDO extends DurableObject {
     // concatenation of all parts; only the parts the range touches are
     // resolved, in a single getMessages call.
     async downloadMultipartRangeStream(chatId, parts, start, end) {
+        this.#checkTelegramCooldown(chatId, null);
         if (!Array.isArray(parts) || parts.length === 0) {
             throw new Error("Multipart media has no parts.");
         }
@@ -6580,10 +6711,24 @@ export default {
                 }
             );
         } catch (error) {
-            // Log the full error so it shows up in observability. Without
-            // this, a throw surfaces only as a bare 500 with no clue what
-            // failed -- which is exactly what made the shared-client bug
-            // so hard to pin down.
+            const message = String(error?.message || error || "");
+            if (message.startsWith(TG_DIAGNOSTIC_PREFIX)) {
+                const raw = message.slice(TG_DIAGNOSTIC_PREFIX.length);
+                let event = {};
+                try { event = JSON.parse(raw); } catch {}
+                const status = event.event === "telegram_cooldown_active" ? 429 : 503;
+                return new Response(JSON.stringify(event, null, 2), {
+                    status,
+                    headers: {
+                        "Content-Type": "application/json; charset=utf-8",
+                        "Cache-Control": "no-store",
+                        "Retry-After": String(Math.max(1, Number(event.waitSeconds) || 1)),
+                        "X-Telegram-Diagnostic": String(event.event || "error")
+                    }
+                });
+            }
+
+            // Keep structured exception details in the Cloudflare invocation.
             console.error(
                 "request failed:",
                 JSON.stringify({

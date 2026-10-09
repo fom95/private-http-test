@@ -23,10 +23,11 @@ import mtcuteWasm from "@mtcute/wasm/mtcute.wasm";
 import { DurableObject } from "cloudflare:workers";
 
 // Video streaming is deliberately separate from the /piece API.
-// Each browser Range request gets its own read-ahead pipeline, similar to
-// the behavior of the smooth local tgstreamer server: several Telegram
-// ranges are requested concurrently and yielded to the browser in order.
-// A seek cancels the old pipeline through AbortSignal immediately.
+// Follow TgStreamer’s conservative streaming behavior at the Worker layer:
+// one active HTTP media stream per Durable Object, strict cancellation on
+// seek/disconnect, aligned offsets, and bounded stream buffering. The mtcute
+// 0.32 API does not expose TgStreamer’s old throttle hook, so this Worker
+// cannot patch mtcute’s internal worker pool from this file alone.
 const TELEGRAM_CHUNK_SIZE = 1024 * 1024;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 const TELEGRAM_FRAGMENT_SIZE = 1024 * 1024;
@@ -40,14 +41,16 @@ const TELEGRAM_FRAGMENT_SIZE = 1024 * 1024;
 // instead ("pause the download while this many bytes are buffered").
 const MTCUTE_PART_SIZE_KB = 512;                      // Telegram's max part size
 const MTCUTE_PART_BYTES = MTCUTE_PART_SIZE_KB * 1024; // offsets are aligned to this
-const MTCUTE_HIGH_WATER_MARK = 4 * 1024 * 1024;       // tgstreamer's 4 MB buffer cap
+const MTCUTE_HIGH_WATER_MARK = 512 * 1024;           // keep read-ahead conservative
 const MTCUTE_STALL_TIMEOUT_MS = 60000;
-const MTCUTE_STREAM_QUEUE_CHUNKS = 2;
+const MTCUTE_STREAM_QUEUE_CHUNKS = 1;
 
 // Number of Telegram file reads kept ahead of the browser.
 const VIDEO_STREAM_WORKERS = 6;
 
-const MAX_ACTIVE_MULTIPART_DOWNLOADS = 8;
+// A seek must not leave several Telegram upload.getFile pipelines running.
+// New streams cancel the previous stream instead of allowing up to eight.
+const MAX_ACTIVE_MULTIPART_DOWNLOADS = 1;
 
 const CACHE_CONTROL = "public, max-age=31536000, immutable";
 
@@ -5253,7 +5256,7 @@ export class TelegramConnectionDO extends DurableObject {
                 }
             },
 
-            cancel: reason => {
+            cancel: async reason => {
                 finish();
 
                 try {
@@ -5264,7 +5267,11 @@ export class TelegramConnectionDO extends DurableObject {
                     );
                 } catch {}
 
-                Promise.resolve(iterator.return?.()).catch(() => {});
+                // Await iterator cleanup so mtcute has a chance to cancel its
+                // underlying download before the stream is considered closed.
+                try {
+                    await iterator.return?.();
+                } catch {}
             }
         }, new CountQueuingStrategy({ highWaterMark: MTCUTE_STREAM_QUEUE_CHUNKS }));
     }

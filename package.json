@@ -5,9 +5,10 @@
   "dependencies": {
     "@mtcute/core": "^0.32.4",
     "@mtcute/web": "^0.32.4",
+    "@mtcute/wasm": "^0.32.0",
     "@mtkruto/mtkruto": "npm:@jsr/mtkruto__mtkruto@^0.217.0"
   },
   "scripts": {
-  "postinstall": "node patch-mtcute.mjs"
-	}
+    "postinstall": "node patch-mtcute.mjs"
+  }
 }

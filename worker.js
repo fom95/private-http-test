@@ -10,8 +10,6 @@ import { DurableObject } from "cloudflare:workers";
 const TELEGRAM_CHUNK_SIZE = 1024 * 1024;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 const TELEGRAM_FRAGMENT_SIZE = 1024 * 1024;
-const MTCUTE_PART_SIZE_KB = 512;
-const MTCUTE_HIGH_WATER_MARK = 16 * 1024 * 1024;
 const MAX_ACTIVE_MULTIPART_DOWNLOADS = 8;
 
 const CACHE_CONTROL = "public, max-age=31536000, immutable";
@@ -1397,42 +1395,30 @@ function parseMultipartFilename(filename) {
     }
 
     /*
-     * Explicit-total formats. Accept the suffix either at the very end
-     * (MyVideo.mp4.part001of003) or before a repeated trailing extension
-     * (MyVideo.mp4.part001of003.mp4). The latter occurs with uploaders that
-     * append the part marker and then preserve the media extension.
-     * Also support the underscore spelling (MyVideo.mp4.part001_003).
+     * Also continue supporting the older explicit-total formats:
+     *
+     *   MyVideo.mp4.part001of003
+     *   MyVideo.mp4.part001_003
      */
     match =
-        /^(.+)\.part(\d+)(?:of|_)(\d+)(?:\.([^.]+))?$/i.exec(name);
+        /^(.+)\.part(\d+)(?:of|_)(\d+)$/i.exec(name);
 
     if (match) {
         const part = Number(match[2]);
         const total = Number(match[3]);
-        const prefix = match[1];
-        const prefixExtensionMatch = /\.([^.]+)$/.exec(prefix);
-        const trailingExtension = match[4] || "";
-        const extension =
-            trailingExtension || prefixExtensionMatch?.[1] || "";
-        const originalName = prefixExtensionMatch
-            ? prefix
-            : (trailingExtension ? `${prefix}.${trailingExtension}` : prefix);
-        const baseName = prefixExtensionMatch
-            ? prefix.slice(0, -(prefixExtensionMatch[0].length))
-            : prefix;
 
         if (
             Number.isSafeInteger(part) &&
             Number.isSafeInteger(total) &&
             part >= 1 &&
             total >= 1 &&
-            part <= total &&
-            extension
+            part <= total
         ) {
             return {
-                originalName,
-                baseName,
-                extension,
+                originalName: match[1],
+                baseName: match[1].replace(/\.[^.]+$/, ""),
+                extension:
+                    match[1].split(".").pop() || "",
                 part,
                 total
             };
@@ -2048,70 +2034,105 @@ async function streamFullDownload(client, fileId, onFatalError) {
 async function streamMtcuteRangeDownload(mtClient, chatId, messageId, start, end, fileSize, onFatalError) {
     if (end < start) throw new Error("Invalid media range.");
 
+    // Resolve the Telegram file once per HTTP Range request. The actual byte
+    // reads below are deliberately sequential, matching tgstreamer's
+    // one-worker range streamer rather than mtcute's parallel read-ahead.
     const messages = await mtClient.getMessages(Number(chatId), Number(messageId));
     const message = messages?.[0];
     const media = message?.media;
-    if (!message || !media) throw new Error(`mtcute could not resolve media for ${chatId}/${messageId}.`);
+    if (!message || !media?.fileId) {
+        throw new Error(`mtcute could not resolve downloadable media for ${chatId}/${messageId}.`);
+    }
 
-    const alignedStart = Math.floor(start / TELEGRAM_OFFSET_ALIGNMENT) * TELEGRAM_OFFSET_ALIGNMENT;
-    const prefix = start - alignedStart;
-    const requestedLength = end - start + 1;
-    const abortController = new AbortController();
-    let cancelled = false;
+    const totalSize = Number(media.fileSize ?? fileSize);
+    if (!Number.isSafeInteger(totalSize) || totalSize <= 0) {
+        throw new Error(`mtcute returned an invalid file size for ${chatId}/${messageId}.`);
+    }
 
-    const source = mtClient.downloadAsStream(media, {
-        offset: alignedStart,
-        limit: prefix + requestedLength,
-        fileSize,
-        partSize: MTCUTE_PART_SIZE_KB,
-        highWaterMark: MTCUTE_HIGH_WATER_MARK,
-        abortSignal: abortController.signal,
-        stallTimeout: 60000
-    });
+    const requestedStart = Math.max(0, start);
+    const requestedEnd = Math.min(end, totalSize - 1);
+    if (requestedStart > requestedEnd) throw new Error("Requested media range is outside the file.");
 
-    const reader = source.getReader();
-    let skip = prefix;
+    // downloadChunk/upload.getFile requires legal aligned requests. Reuse the
+    // Worker's 1 MiB fragment cache and deduplication so overlapping browser
+    // ranges (including the multiple requests some players issue on seek) do
+    // not download the same Telegram fragment twice.
+    const alignedStart = Math.floor(requestedStart / TELEGRAM_FRAGMENT_SIZE) * TELEGRAM_FRAGMENT_SIZE;
+    const initialSkip = requestedStart - alignedStart;
+    const requestedLength = requestedEnd - requestedStart + 1;
+    const thisStreamOrder = ++streamSeq;
+    let currentOffset = alignedStart;
+    let skip = initialSkip;
     let remaining = requestedLength;
+    let cancelled = false;
+    let finished = false;
 
     return new ReadableStream({
         async pull(controller) {
-            if (cancelled) return;
+            if (cancelled || finished) return;
+
             try {
-                while (true) {
-                    const result = await reader.read();
-                    if (result.done) {
-                        if (remaining > 0 && !cancelled) throw new Error(`mtcute stream ended ${remaining} bytes early.`);
-                        if (!cancelled) controller.close();
-                        return;
+                // One Telegram fragment at a time. Do not prefetch future
+                // fragments: a browser seek should not leave a read-ahead
+                // queue fetching bytes from the old playback position.
+                while (!cancelled && remaining > 0) {
+                    const bytes = await cachedChunk(
+                        mtClient,
+                        media.fileId,
+                        currentOffset,
+                        thisStreamOrder,
+                        () => cancelled
+                    );
+
+                    if (cancelled) return;
+                    if (!bytes || bytes.length === 0) {
+                        throw new Error(`Telegram returned no data at offset ${currentOffset}.`);
                     }
-                    let bytes = result.value;
-                    if (skip) {
-                        if (bytes.length <= skip) { skip -= bytes.length; continue; }
-                        bytes = bytes.slice(skip); skip = 0;
+
+                    currentOffset += TELEGRAM_FRAGMENT_SIZE;
+
+                    if (skip >= bytes.length) {
+                        skip -= bytes.length;
+                        continue;
                     }
-                    if (bytes.length > remaining) bytes = bytes.slice(0, remaining);
-                    if (bytes.length) { remaining -= bytes.length; controller.enqueue(bytes); }
-                    if (remaining <= 0) {
-                        try { await reader.cancel(); } catch {}
-                        if (!cancelled) controller.close();
-                        return;
+
+                    const from = skip;
+                    skip = 0;
+                    const take = Math.min(bytes.length - from, remaining);
+                    if (take <= 0) continue;
+
+                    const output = bytes.subarray(from, from + take);
+                    remaining -= take;
+
+                    if (remaining === 0) {
+                        finished = true;
+                        controller.enqueue(output);
+                        controller.close();
+                    } else {
+                        controller.enqueue(output);
                     }
                     return;
                 }
+
+                if (!cancelled && remaining <= 0 && !finished) {
+                    finished = true;
+                    controller.close();
+                }
             } catch (error) {
                 if (cancelled) return;
-                cancelled = true;
-                try { abortController.abort(error); } catch {}
-                try { await reader.cancel(error); } catch {}
+                finished = true;
                 onFatalError?.(error);
                 controller.error(error);
             }
         },
-        async cancel(reason) {
-            if (cancelled) return;
+
+        async cancel() {
             cancelled = true;
-            try { abortController.abort(reason); } catch {}
-            try { await reader.cancel(reason); } catch {}
+            finished = true;
+            // Queued chunks observe this flag and are skipped by the shared
+            // Telegram scheduler. An already-running Telegram RPC is allowed
+            // to finish; we do not falsely free its scheduler slot and create
+            // a burst of replacement requests while it is still in flight.
         }
     });
 }

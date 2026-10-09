@@ -3,6 +3,10 @@
   "main": "worker.js",
   "compatibility_date": "2026-09-14",
 
+  "limits": {
+    "cpu_ms": 300000
+  },
+
   "secrets_store_secrets": [
     {
       "binding": "API_ID",

@@ -8,6 +8,17 @@ const MAX_ACTIVE_MULTIPART_DOWNLOADS = 3;
 
 const CACHE_CONTROL = "public, max-age=31536000, immutable";
 
+/*
+ * Streamed media (video, and anything above MAX_BUFFERED_SIZE) must not
+ * be cached at Cloudflare's edge. The edge cache key ignores the Range
+ * header, so a cached 200 or 206 can be served for a *different* range
+ * later: the player then gets the wrong bytes (or a full 200 where it
+ * asked for a 206) and seeking silently clamps to whatever was already
+ * buffered. no-store keeps every range request flowing through this
+ * Worker, which is the only place that can serve the requested bytes.
+ */
+const STREAM_CACHE_CONTROL = "no-store";
+
 // Files at or under this size are downloaded into memory and served as a
 // single buffer, which makes them safely cacheable (see
 // bufferFullDownload). Anything larger is streamed and not cached.
@@ -1371,12 +1382,13 @@ function createMediaHeaders({
     size,
     filename,
     start = null,
-    end = null
+    end = null,
+    cacheControl = CACHE_CONTROL
 }) {
     const headers = {
         "Content-Type": mimeType || "application/octet-stream",
         "Accept-Ranges": "bytes",
-        "Cache-Control": CACHE_CONTROL,
+        "Cache-Control": cacheControl,
         "Access-Control-Allow-Origin": "*",
         "Content-Disposition": `inline; filename="${String(filename || "media").replace(/["\\]/g, "_")}"`
     };
@@ -1690,10 +1702,23 @@ async function streamRangeDownload(
                     currentOffset +
                     1;
 
+                /*
+                 * MTKruto's downloadChunk() rejects any chunkSize that
+                 * is not a multiple of 1024 (its validateChunkSize).
+                 * Round the request UP to the Telegram/MTProto offset
+                 * alignment so the final partial chunk of a file (or of
+                 * one part of a multipart file) never throws. The extra
+                 * bytes are sliced off again below, so the caller still
+                 * receives exactly [start, end].
+                 */
                 const requestSize =
                     Math.min(
                         TELEGRAM_CHUNK_SIZE,
-                        remaining
+                        Math.ceil(
+                            remaining /
+                            TELEGRAM_OFFSET_ALIGNMENT
+                        ) *
+                        TELEGRAM_OFFSET_ALIGNMENT
                     );
 
                 const telegramStarted =
@@ -1913,6 +1938,20 @@ async function streamMultipartRangeDownload(
                         return;
                     }
 
+                    /*
+                     * globalOffset is the ABSOLUTE start of the current
+                     * part in the logical file, not a count of bytes
+                     * already sent. Once the part that contains `end`
+                     * has been consumed, globalOffset jumps past `end`
+                     * and the loop must stop -- otherwise the next parts
+                     * are streamed too, and the response body ends up
+                     * longer than its Content-Length (which corrupts
+                     * every range that finishes inside a part).
+                     */
+                    if (globalOffset > end) {
+                        break;
+                    }
+
                     const part =
                         parts[partIndex];
 
@@ -1965,9 +2004,7 @@ async function streamMultipartRangeDownload(
                     currentReader = null;
 
                     globalOffset +=
-                        localEnd -
-                        localStart +
-                        1;
+                        partSize;
 
                     partIndex++;
 
@@ -2554,7 +2591,7 @@ async function handleDirectMediaRequest(
                     "Accept-Ranges":
                         "bytes",
                     "Cache-Control":
-                        CACHE_CONTROL,
+                        STREAM_CACHE_CONTROL,
                     "Access-Control-Allow-Origin":
                         "*"
                 }
@@ -2570,7 +2607,9 @@ async function handleDirectMediaRequest(
                 start:
                     range.start,
                 end:
-                    range.end
+                    range.end,
+                cacheControl:
+                    STREAM_CACHE_CONTROL
             });
 
         if (
@@ -2641,12 +2680,27 @@ async function handleDirectMediaRequest(
             Date.now() -
             totalStart;
 
+        /*
+         * Match the caching policy of the corresponding GET: tiny
+         * thumbnail/small-file responses are buffered and safe to cache,
+         * everything streamed must not be stored at the edge.
+         */
+        const headBufferable =
+            !multipartInfo &&
+            (thumbnail ||
+                fileSize <=
+                    MAX_BUFFERED_SIZE);
+
         const headers =
             createMediaHeaders({
                 mimeType,
                 size:
                     fileSize,
-                filename
+                filename,
+                cacheControl:
+                    headBufferable
+                        ? CACHE_CONTROL
+                        : STREAM_CACHE_CONTROL
             });
 
         addTimingHeader(
@@ -2688,7 +2742,9 @@ async function handleDirectMediaRequest(
                 mimeType,
                 size:
                     fileSize,
-                filename
+                filename,
+                cacheControl:
+                    STREAM_CACHE_CONTROL
             });
 
         addTimingHeader(
@@ -2775,7 +2831,9 @@ async function handleDirectMediaRequest(
             mimeType,
             size:
                 fileSize,
-            filename
+            filename,
+            cacheControl:
+                STREAM_CACHE_CONTROL
         });
 
     addTimingHeader(

@@ -3,6 +3,48 @@ import { DurableObject } from "cloudflare:workers";
 
 const TELEGRAM_CHUNK_SIZE = 256 * 1024;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
+const TELEGRAM_MIN_CHUNK_SIZE = 4096;
+const TELEGRAM_MAX_REQUEST_SIZE = 1024 * 1024;
+
+/*
+ * Telegram's upload.getFile (without the `precise` flag) only accepts a
+ * request when ALL of these hold:
+ *
+ *   - offset is divisible by 4 KB;
+ *   - limit is divisible by 4 KB;
+ *   - 1 MiB is divisible by limit, i.e. limit must be a power of two
+ *     between 4 KB and 1 MiB;
+ *   - offset and offset + limit - 1 fall inside the same 1 MiB block.
+ *
+ * A request that breaks any of them is not answered: the DC stays silent
+ * and MTKruto's retry loop waits forever, which looked like the media
+ * stream hanging. MTKruto itself only validates the 1 KB rule, so callers
+ * have to pick a legal limit here.
+ *
+ * Returns the largest legal limit that fits both the bytes still wanted
+ * and the rest of the current 1 MiB block.
+ */
+function telegramChunkSize(offset, remaining) {
+    const blockRemaining =
+        TELEGRAM_MAX_REQUEST_SIZE -
+        (offset % TELEGRAM_MAX_REQUEST_SIZE);
+
+    const wanted =
+        Math.min(
+            TELEGRAM_CHUNK_SIZE,
+            remaining,
+            blockRemaining
+        );
+
+    let size =
+        TELEGRAM_MIN_CHUNK_SIZE;
+
+    while (size * 2 <= wanted) {
+        size *= 2;
+    }
+
+    return size;
+}
 
 const MAX_ACTIVE_MULTIPART_DOWNLOADS = 3;
 
@@ -1704,21 +1746,20 @@ async function streamRangeDownload(
 
                 /*
                  * MTKruto's downloadChunk() rejects any chunkSize that
-                 * is not a multiple of 1024 (its validateChunkSize).
-                 * Round the request UP to the Telegram/MTProto offset
-                 * alignment so the final partial chunk of a file (or of
-                 * one part of a multipart file) never throws. The extra
-                 * bytes are sliced off again below, so the caller still
-                 * receives exactly [start, end].
+                 * is not a multiple of 1024 (its validateChunkSize),
+                 * but Telegram's upload.getFile is stricter still: it
+                 * requires the limit to be a power of two that divides
+                 * 1 MiB, and it requires the request to stay inside one
+                 * 1 MiB block. Any other limit is silently ignored and
+                 * the download hangs. telegramChunkSize() picks a legal
+                 * value; the extra bytes it may read are sliced off
+                 * below, so the caller still receives exactly
+                 * [start, end].
                  */
                 const requestSize =
-                    Math.min(
-                        TELEGRAM_CHUNK_SIZE,
-                        Math.ceil(
-                            remaining /
-                            TELEGRAM_OFFSET_ALIGNMENT
-                        ) *
-                        TELEGRAM_OFFSET_ALIGNMENT
+                    telegramChunkSize(
+                        currentOffset,
+                        remaining
                     );
 
                 const telegramStarted =
@@ -3018,8 +3059,8 @@ async function handlePieceRequest(
         actualLength
     ) {
         const requestLength =
-            Math.min(
-                TELEGRAM_CHUNK_SIZE,
+            telegramChunkSize(
+                currentOffset,
                 actualLength -
                     downloaded
             );

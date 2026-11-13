@@ -1,7 +1,10 @@
 import { Client } from "@mtkruto/mtkruto";
 import { DurableObject } from "cloudflare:workers";
 
-const TELEGRAM_CHUNK_SIZE = 256 * 1024;
+// One upload.getFile request per megabyte. Larger than the old 256 KB on
+// purpose: Telegram's flood limit counts requests, and a player needs
+// ~1 MB/s, so 256 KB chunks meant far more requests than playback needs.
+const TELEGRAM_CHUNK_SIZE = 1024 * 1024;
 const TELEGRAM_OFFSET_ALIGNMENT = 4096;
 const TELEGRAM_MIN_CHUNK_SIZE = 4096;
 const TELEGRAM_MAX_REQUEST_SIZE = 1024 * 1024;
@@ -1710,12 +1713,23 @@ async function streamRangeDownload(
     end,
     onFatalError
 ) {
+    /*
+     * Start on a TELEGRAM_CHUNK_SIZE boundary, not merely a 4 KB one.
+     *
+     * client.download() issues several upload.getFile requests in
+     * parallel, at offset + i * chunkSize. Telegram only answers a
+     * request when it fits inside a single 1 MiB block, so with a 1 MiB
+     * chunkSize every one of those offsets has to be 1 MiB aligned.
+     * Aligning to 4 KB here would make every parallel request straddle
+     * a block boundary and hang; the extra bytes are sliced off below,
+     * so the caller still gets exactly [start, end].
+     */
     const alignedStart =
         Math.floor(
             start /
-            TELEGRAM_OFFSET_ALIGNMENT
+            TELEGRAM_CHUNK_SIZE
         ) *
-        TELEGRAM_OFFSET_ALIGNMENT;
+        TELEGRAM_CHUNK_SIZE;
 
     let currentOffset =
         alignedStart;
@@ -1728,18 +1742,59 @@ async function streamRangeDownload(
     let bytesSent = 0;
     let telegramWait = 0;
     let processingTime = 0;
+    let disposed = false;
 
     /*
      * Set when the client (browser) drops the response, e.g. the player
-     * aborts the old range as soon as the user seeks. downloadChunk()
-     * cannot be interrupted, so a pull() may still be awaiting Telegram
-     * when this flips. If that pull then tried to enqueue or close a
-     * cancelled stream, workerd throws "This ReadableStream is closed";
-     * looksLikeConnectionError() matches the word "closed" and the DO
-     * would discard its healthy Telegram client, making the NEXT seek
-     * pay for a full reconnect (about 10 seconds).
+     * aborts the old range as soon as the user seeks. A pull() may still
+     * be awaiting Telegram when this flips; if it then tried to enqueue
+     * or close the cancelled stream, workerd throws "This ReadableStream
+     * is closed", which looksLikeConnectionError() would mistake for a
+     * dead Telegram client and discard -- making the NEXT seek pay for a
+     * full reconnect (about 10 seconds).
      */
     let cancelled = false;
+
+    /*
+     * ONE download iterator for the whole response.
+     *
+     * Previously each pull() called client.downloadChunk(), and that
+     * helper always fans out to four parallel upload.getFile requests
+     * (MTKruto's download pool), then drops three of them. At the old
+     * 256 KiB chunk size that was ~16 Telegram requests per megabyte.
+     * Playback only needs ~1 MB/s, so the Worker asked Telegram for
+     * roughly 16 requests every second, tripped its flood limit every
+     * 10-30 seconds, and playback stalled while #handleError() slept
+     * and retried.
+     *
+     * client.download() keeps a rolling pool of four requests and
+     * yields them in order, issuing one new request per chunk consumed.
+     * With a 1 MiB chunk that is ~1 request per megabyte, well under
+     * the flood limit, and seek cancellation aborts the in-flight
+     * requests instead of leaving them to complete.
+     */
+    const iterator =
+        client.download(
+            fileId,
+            {
+                offset:
+                    alignedStart,
+                chunkSize:
+                    TELEGRAM_CHUNK_SIZE
+            }
+        );
+
+    async function dispose() {
+        if (disposed) {
+            return;
+        }
+
+        disposed = true;
+
+        try {
+            await iterator.return?.();
+        } catch {}
+    }
 
     function report(
         event,
@@ -1773,68 +1828,46 @@ async function streamRangeDownload(
     return new ReadableStream({
         async pull(controller) {
             if (cancelled) {
-                return;
-            }
-
-            if (
-                currentOffset > end
-            ) {
-                controller.close();
-
-                report("complete");
-
+                await dispose();
                 return;
             }
 
             try {
-                const remaining =
-                    end -
-                    currentOffset +
-                    1;
-
-                /*
-                 * MTKruto's downloadChunk() rejects any chunkSize that
-                 * is not a multiple of 1024 (its validateChunkSize),
-                 * but Telegram's upload.getFile is stricter still: it
-                 * requires the limit to be a power of two that divides
-                 * 1 MiB, and it requires the request to stay inside one
-                 * 1 MiB block. Any other limit is silently ignored and
-                 * the download hangs. telegramChunkSize() picks a legal
-                 * value; the extra bytes it may read are sliced off
-                 * below, so the caller still receives exactly
-                 * [start, end].
-                 */
-                const requestSize =
-                    telegramChunkSize(
-                        currentOffset,
-                        remaining
-                    );
-
                 const telegramStarted =
                     Date.now();
 
-                const bytes =
-                    await client.downloadChunk(
-                        fileId,
-                        {
-                            offset:
-                                currentOffset,
-                            chunkSize:
-                                requestSize
-                        }
-                    );
+                const result =
+                    await iterator.next();
 
                 telegramWait +=
                     Date.now() -
                     telegramStarted;
 
-                /*
-                 * The response may have been cancelled while Telegram was
-                 * answering. Do not touch the controller in that case.
-                 */
                 if (cancelled) {
+                    await dispose();
                     return;
                 }
+
+                const processStarted =
+                    Date.now();
+
+                if (result.done) {
+                    /*
+                     * Telegram says the file is over. That should only
+                     * happen at fileSize, which the caller has already
+                     * clipped `end` to, so simply finish the response.
+                     */
+                    controller.close();
+
+                    report("complete");
+
+                    await dispose();
+
+                    return;
+                }
+
+                const bytes =
+                    result.value;
 
                 if (
                     !bytes ||
@@ -1846,9 +1879,6 @@ async function streamRangeDownload(
                         "."
                     );
                 }
-
-                const processStarted =
-                    Date.now();
 
                 const chunkStart =
                     currentOffset;
@@ -1918,8 +1948,6 @@ async function streamRangeDownload(
                         {
                             chunk:
                                 chunks,
-                            requestedBytes:
-                                requestSize,
                             receivedBytes:
                                 bytes.length,
                             offset:
@@ -1941,6 +1969,8 @@ async function streamRangeDownload(
                     controller.close();
 
                     report("complete");
+
+                    await dispose();
                 }
             } catch (error) {
                 /*
@@ -1948,6 +1978,7 @@ async function streamRangeDownload(
                  * be mistaken for a broken Telegram connection.
                  */
                 if (cancelled) {
+                    await dispose();
                     return;
                 }
 
@@ -1963,6 +1994,8 @@ async function streamRangeDownload(
                 controller.error(
                     error
                 );
+
+                await dispose();
 
                 onFatalError?.(error);
             }
@@ -1980,11 +2013,12 @@ async function streamRangeDownload(
                 }
             );
 
-            // Client lives in the Durable Object and is reused across
-            // many streams -- nothing to close here. The in-flight
-            // downloadChunk() still finishes on its own (it is not
-            // interruptible); the cancelled flag above stops its result
-            // from touching this stream.
+            /*
+             * Returning the iterator aborts MTKruto's in-flight
+             * upload.getFile requests, so an aborted seek does not
+             * keep hammering Telegram in the background.
+             */
+            await dispose();
         }
     });
 }

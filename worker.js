@@ -1529,6 +1529,14 @@ async function streamFullDownload(
     let processingTime = 0;
     let released = false;
 
+    /*
+     * Set when the browser aborts the response (seek, navigation, modal
+     * close). See the pull()/cancel() guards below: touching a cancelled
+     * stream's controller throws, and the resulting "closed" message
+     * would make the DO throw away a perfectly good Telegram client.
+     */
+    let cancelled = false;
+
     // The client now lives in the Durable Object and is reused across
     // many streams over its lifetime, so a finished/cancelled/errored
     // stream must NOT disconnect it -- only release this stream's own
@@ -1571,6 +1579,11 @@ async function streamFullDownload(
 
     return new ReadableStream({
         async pull(controller) {
+            if (cancelled) {
+                await disconnect();
+                return;
+            }
+
             const pullStarted =
                 Date.now();
 
@@ -1584,6 +1597,18 @@ async function streamFullDownload(
                 telegramWait +=
                     Date.now() -
                     telegramStarted;
+
+                /*
+                 * The client may have aborted the response while the
+                 * iterator was busy. Never enqueue/close a cancelled
+                 * stream: workerd throws "This ReadableStream is
+                 * closed", which looksLikeConnectionError() would
+                 * mistake for a dead Telegram client and discard.
+                 */
+                if (cancelled) {
+                    await disconnect();
+                    return;
+                }
 
                 if (result.done) {
                     controller.close();
@@ -1634,6 +1659,11 @@ async function streamFullDownload(
                     );
                 }
             } catch (error) {
+                if (cancelled) {
+                    await disconnect();
+                    return;
+                }
+
                 report(
                     "error",
                     {
@@ -1652,6 +1682,8 @@ async function streamFullDownload(
         },
 
         async cancel(reason) {
+            cancelled = true;
+
             report(
                 "cancel",
                 {
@@ -1697,6 +1729,18 @@ async function streamRangeDownload(
     let telegramWait = 0;
     let processingTime = 0;
 
+    /*
+     * Set when the client (browser) drops the response, e.g. the player
+     * aborts the old range as soon as the user seeks. downloadChunk()
+     * cannot be interrupted, so a pull() may still be awaiting Telegram
+     * when this flips. If that pull then tried to enqueue or close a
+     * cancelled stream, workerd throws "This ReadableStream is closed";
+     * looksLikeConnectionError() matches the word "closed" and the DO
+     * would discard its healthy Telegram client, making the NEXT seek
+     * pay for a full reconnect (about 10 seconds).
+     */
+    let cancelled = false;
+
     function report(
         event,
         extra = {}
@@ -1728,6 +1772,10 @@ async function streamRangeDownload(
 
     return new ReadableStream({
         async pull(controller) {
+            if (cancelled) {
+                return;
+            }
+
             if (
                 currentOffset > end
             ) {
@@ -1779,6 +1827,14 @@ async function streamRangeDownload(
                 telegramWait +=
                     Date.now() -
                     telegramStarted;
+
+                /*
+                 * The response may have been cancelled while Telegram was
+                 * answering. Do not touch the controller in that case.
+                 */
+                if (cancelled) {
+                    return;
+                }
 
                 if (
                     !bytes ||
@@ -1887,6 +1943,14 @@ async function streamRangeDownload(
                     report("complete");
                 }
             } catch (error) {
+                /*
+                 * A cancelled stream must not be errored, and must not
+                 * be mistaken for a broken Telegram connection.
+                 */
+                if (cancelled) {
+                    return;
+                }
+
                 report(
                     "error",
                     {
@@ -1905,6 +1969,8 @@ async function streamRangeDownload(
         },
 
         async cancel(reason) {
+            cancelled = true;
+
             report(
                 "cancel",
                 {
@@ -1915,7 +1981,10 @@ async function streamRangeDownload(
             );
 
             // Client lives in the Durable Object and is reused across
-            // many streams -- nothing to close here.
+            // many streams -- nothing to close here. The in-flight
+            // downloadChunk() still finishes on its own (it is not
+            // interruptible); the cancelled flag above stops its result
+            // from touching this stream.
         }
     });
 }
@@ -2028,6 +2097,15 @@ async function streamMultipartRangeDownload(
 
                         const result =
                             await currentReader.read();
+
+                        /*
+                         * The read may have been interrupted by a
+                         * cancellation; touching the controller now
+                         * would throw.
+                         */
+                        if (cancelled) {
+                            return;
+                        }
 
                         if (result.done) {
                             break;
@@ -5005,6 +5083,23 @@ function looksLikeConnectionError(error) {
             error ||
             ""
         ).toLowerCase();
+
+    /*
+     * Aborting a response (a seek, navigation, closing the modal) can make
+     * workerd throw while writing to the now-cancelled stream:
+     * "This ReadableStream is closed" / "Invalid state: Controller is
+     * already closed". Those mention "closed" but have nothing to do with
+     * Telegram, and discarding the client for them costs the next request
+     * a full reconnect.
+     */
+    if (
+        message.includes("readablestream") ||
+        message.includes("stream is closed") ||
+        message.includes("controller is already closed") ||
+        message.includes("invalid state")
+    ) {
+        return false;
+    }
 
     return (
         message.includes("disconnect") ||

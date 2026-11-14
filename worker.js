@@ -1,5 +1,147 @@
-import { Client } from "@mtkruto/mtkruto";
+import { Client, setLoggingProvider } from "@mtkruto/mtkruto";
 import { DurableObject } from "cloudflare:workers";
+
+const sleep = ms =>
+    new Promise(resolve => setTimeout(resolve, ms));
+
+/*
+ * Workers logs are not reachable from outside (no `wrangler tail`
+ * without an authenticated CLI), so the media path keeps the last
+ * handful of download problems in memory and exposes them through
+ * /api/diag. This is what makes "the seek stalled for nine seconds"
+ * explainable instead of guesswork.
+ */
+const TELEGRAM_EVENT_LIMIT = 60;
+
+const telegramEvents = [];
+
+function describeError(error) {
+    return {
+        name:
+            error?.name ||
+            error?.constructor?.name ||
+            "Error",
+        message:
+            String(
+                error?.message ??
+                error ??
+                ""
+            ).slice(0, 300)
+    };
+}
+
+function recordTelegramEvent(
+    event,
+    data = {}
+) {
+    try {
+        telegramEvents.push({
+            at: new Date().toISOString(),
+            event,
+            ...data
+        });
+
+        while (
+            telegramEvents.length >
+            TELEGRAM_EVENT_LIMIT
+        ) {
+            telegramEvents.shift();
+        }
+    } catch {}
+}
+
+/*
+ * MTKruto retries a failed download request on its own, but the wait
+ * starts at one second and grows to 3, 5, 7 ... seconds. One transient
+ * upload.getFile failure therefore freezes a media response for 4, 9
+ * or 16 seconds -- which is exactly how long a "failed" seek used to
+ * hang before the player gave up on it.
+ *
+ * These are the failures worth retrying immediately (a few hundred
+ * milliseconds) instead of seconds later. Anything Telegram describes
+ * as permanent, and flood waits (which come with their own delay and
+ * are handled by MTKruto before this runs), are left alone.
+ */
+function isTransientMediaError(error) {
+    const text =
+        `${error?.name ?? ""} ${error?.message ?? error ?? ""}`
+            .toLowerCase();
+
+    if (text.includes("flood")) {
+        return false;
+    }
+
+    return !(
+        text.includes("file_reference") ||
+        text.includes("file_id_invalid") ||
+        text.includes("file_invalid") ||
+        text.includes("offset_invalid") ||
+        text.includes("limit_invalid") ||
+        text.includes("time_too") ||
+        text.includes("auth_key") ||
+        text.includes("session_revoked") ||
+        text.includes("user_deactivated") ||
+        text.includes("chat_forbidden") ||
+        text.includes("channel_private")
+    );
+}
+
+/*
+ * MTKruto's own warnings are the only place a flood wait becomes
+ * visible ("sleeping for N because of: FLOOD_WAIT_N"). Mirror anything
+ * that looks like a download problem into the ring buffer, then keep
+ * logging normally so Worker observability is unchanged.
+ */
+let loggingProviderInstalled = false;
+
+function installLoggingProvider() {
+    if (loggingProviderInstalled) {
+        return;
+    }
+
+    loggingProviderInstalled = true;
+
+    const interesting =
+        /flood|retrying|sleeping|timeout|connection|socket|closed|network|abort/i;
+
+    const capture = (level, args) => {
+        try {
+            const text = args
+                .map(arg =>
+                    typeof arg === "string"
+                        ? arg
+                        : describeError(arg).message
+                )
+                .join(" ");
+
+            if (interesting.test(text)) {
+                recordTelegramEvent(
+                    "mtkruto." + level,
+                    {
+                        message:
+                            text.slice(0, 300)
+                    }
+                );
+            }
+        } catch {}
+    };
+
+    const forward = level => (...args) => {
+        capture(level, args);
+
+        try {
+            console[level]?.(...args);
+        } catch {}
+    };
+
+    setLoggingProvider({
+        error: forward("error"),
+        warn: forward("warn"),
+        info: forward("log"),
+        debug: forward("log"),
+        log: forward("log")
+    });
+}
 
 // One upload.getFile request per megabyte. Larger than the old 256 KB on
 // purpose: Telegram's flood limit counts requests, and a player needs
@@ -447,6 +589,60 @@ async function createClient(env) {
             persistCache:
                 false
         });
+
+    installLoggingProvider();
+
+    /*
+     * A media request that fails once is retried by MTKruto on a one,
+     * three, five, seven second ladder. For a video that is far too
+     * slow: the player is waiting for its first seek byte, and after a
+     * few seconds it gives the seek up and drops back to the buffered
+     * position. Poll a broken request quickly instead (0.25 s growing
+     * to 2 s, six attempts) so it resumes as soon as the outage ends
+     * rather than after the rest of the current ladder step. Whatever
+     * is still failing is handed back to MTKruto unchanged.
+     */
+    client.invoke.use(
+        async (
+            { error, function: fn, n },
+            next
+        ) => {
+            if (fn?._ !== "upload.getFile") {
+                return next();
+            }
+
+            const described =
+                describeError(error);
+
+            recordTelegramEvent(
+                "upload.getFile.error",
+                {
+                    attempt: n,
+                    error: described,
+                    transient:
+                        isTransientMediaError(
+                            error
+                        )
+                }
+            );
+
+            if (
+                n < 6 &&
+                isTransientMediaError(error)
+            ) {
+                await sleep(
+                    Math.min(
+                        250 * (n + 1),
+                        2000
+                    )
+                );
+
+                return true;
+            }
+
+            return next();
+        }
+    );
 
     await client.start();
 
@@ -1435,6 +1631,10 @@ function createMediaHeaders({
         "Accept-Ranges": "bytes",
         "Cache-Control": cacheControl,
         "Access-Control-Allow-Origin": "*",
+        // Lets the gallery read responseStatus/transferSize for media
+        // requests from Resource Timing, which is otherwise zeroed for
+        // cross-origin responses.
+        "Timing-Allow-Origin": "*",
         "Content-Disposition": `inline; filename="${String(filename || "media").replace(/["\\]/g, "_")}"`
     };
 
@@ -1843,6 +2043,27 @@ async function streamRangeDownload(
                     Date.now() -
                     telegramStarted;
 
+                if (
+                    Date.now() -
+                        telegramStarted >
+                    2000
+                ) {
+                    recordTelegramEvent(
+                        "stream.slowChunk",
+                        {
+                            requestedStart:
+                                start,
+                            offset:
+                                currentOffset,
+                            waitMs:
+                                Date.now() -
+                                telegramStarted,
+                            chunk:
+                                chunks + 1
+                        }
+                    );
+                }
+
                 if (cancelled) {
                     await dispose();
                     return;
@@ -1988,6 +2209,23 @@ async function streamRangeDownload(
                         error:
                             error?.message ||
                             String(error)
+                    }
+                );
+
+                recordTelegramEvent(
+                    "stream.error",
+                    {
+                        requestedStart:
+                            start,
+                        requestedEnd:
+                            end,
+                        offset:
+                            currentOffset,
+                        chunks,
+                        error:
+                            describeError(
+                                error
+                            )
                     }
                 );
 
@@ -2203,6 +2441,22 @@ async function streamMultipartRangeDownload(
                             error?.message ||
                             String(error)
                     })
+                );
+
+                recordTelegramEvent(
+                    "multipart.error",
+                    {
+                        requestedStart:
+                            start,
+                        requestedEnd:
+                            end,
+                        partIndex,
+                        globalOffset,
+                        error:
+                            describeError(
+                                error
+                            )
+                    }
                 );
 
                 controller.error(
@@ -3352,6 +3606,19 @@ async function handleApi(
 ) {
     const path =
         url.pathname;
+
+    if (path === "/api/diag") {
+        const stub =
+            getConnectionStub(env);
+
+        const diagnostics =
+            await stub.getDiagnostics();
+
+        return json({
+            success: true,
+            diagnostics
+        });
+    }
 
     if (path === "/api/chats") {
         const start =
@@ -5255,13 +5522,43 @@ export class TelegramConnectionDO extends DurableObject {
 
     async #ensureClient() {
         if (!this.#clientPromise) {
+            const createdAt =
+                Date.now();
+
+            recordTelegramEvent(
+                "client.create"
+            );
+
             this.#clientPromise =
                 createClient(this.env)
                     .then(client => {
                         this.#client = client;
+
+                        recordTelegramEvent(
+                            "client.ready",
+                            {
+                                tookMs:
+                                    Date.now() -
+                                    createdAt
+                            }
+                        );
+
                         return client;
                     })
                     .catch(error => {
+                        recordTelegramEvent(
+                            "client.failed",
+                            {
+                                tookMs:
+                                    Date.now() -
+                                    createdAt,
+                                error:
+                                    describeError(
+                                        error
+                                    )
+                            }
+                        );
+
                         this.#clientPromise = null;
                         this.#client = null;
                         throw error;
@@ -5278,9 +5575,30 @@ export class TelegramConnectionDO extends DurableObject {
     // can't undo the failure the current caller already sees.
     #discardClientOnConnectionError(error) {
         if (looksLikeConnectionError(error)) {
+            recordTelegramEvent(
+                "client.discarded",
+                {
+                    error:
+                        describeError(
+                            error
+                        )
+                }
+            );
+
             this.#client = null;
             this.#clientPromise = null;
         }
+    }
+
+    async getDiagnostics() {
+        return {
+            now:
+                new Date().toISOString(),
+            clientReady:
+                Boolean(this.#client),
+            events:
+                telegramEvents.slice()
+        };
     }
 
     async #withClient(fn) {
